@@ -23,24 +23,20 @@ import type {
 } from '../api/types';
 
 /**
- * Runs: everything the scheduler executes, on one page.
+ * What the scheduler executes, as three pages over one machine.
  *
- * Schedules, workflows and jobs are one machine seen from three sides: a
- * schedule fires either a job (a row in an outbox table that a backend runs at
- * a path) or a workflow run, and every step of a workflow run is itself a job.
- * Three pages meant one failure showed up three times. Here:
+ * A schedule fires either a job (a row in an outbox table that a backend runs
+ * at a path) or a workflow run, and every step of a workflow run is itself a
+ * job. One component draws all three pages, each its own slice:
  *
- *  - the numbers: running, waiting, done per minute, failed;
- *  - schedules: what fires, when next, and how its last fires went;
- *  - runs: one list of what executed. A workflow run is one row and its step
- *    jobs live inside it; a job of its own (from a schedule, the app or a
- *    durable instance) is one row;
- *  - queues: each outbox table's pace against its concurrency.
+ *  - Schedules: what fires, when next, and how its last fires went;
+ *  - Workflows: workflow runs, one row each, their step jobs inside;
+ *  - Runs: jobs of their own (from a schedule, the app or a durable
+ *    instance), the numbers over them and each queue's pace.
  *
- * A run, job or schedule opens in a sheet. The sheet is in the URL
- * (`?open=run:<id>`, `job:<id>`, `schedule:<name>`), so it survives a refresh
- * and the old `/jobs/:id`, `/workflows/:id` and `/schedules/:name` links land
- * on it.
+ * A run, job or schedule opens in a sheet on whichever page you are on. The
+ * sheet is in the URL (`?open=run:<id>`, `job:<id>`, `schedule:<name>`), so it
+ * survives a refresh, and a schedule's fire opens its run in place.
  */
 
 const POLL_MS = 5_000;
@@ -237,7 +233,12 @@ function fallbackRuns(setRuns: (r: WorkflowRun[]) => void, load: () => Promise<v
 /* The page                                                             */
 /* ------------------------------------------------------------------ */
 
-export function Runs() {
+export type RunsView = 'schedules' | 'workflows' | 'runs';
+
+const VIEW_TITLE: Record<RunsView, string> = { schedules: 'Schedules', workflows: 'Workflows', runs: 'Runs' };
+
+export function Runs(props: { view: RunsView }) {
+  const view = props.view;
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams<{ open?: string; status?: string; table?: string; kind?: string; schedule?: string }>();
   const jobs = useJobs();
@@ -270,9 +271,8 @@ export function Runs() {
     void refetchSchedules();
   };
 
-  // Filters start from the link that brought us here: `/jobs?status=failed`.
+  // Filters start from the link that brought us here: `/runs?status=failed`.
   const initial: FilterValue = {};
-  if (params.kind === 'job' || params.kind === 'workflow') initial.kind = [params.kind];
   if (params.status) initial.status = [params.status === 'pending' ? 'waiting' : params.status === 'processing' ? 'running' : params.status];
   if (params.table) initial.table = [params.table];
   if (params.schedule) initial.schedule = [params.schedule];
@@ -314,9 +314,11 @@ export function Runs() {
     return jobQuery() && f?.ok ? f.value.jobs : jobs.page()?.jobs ?? [];
   };
 
-  /** Everything that executed: workflow runs, and jobs that are not a step of one. */
+  /** What this page lists: workflow runs on Workflows; on Runs, jobs that are not a step of one. */
   const items = createMemo<Item[]>(() => {
-    const out: Item[] = wf.runs().map(runItem);
+    if (view === 'workflows') return wf.runs().map(runItem);
+    if (view !== 'runs') return [];
+    const out: Item[] = [];
     for (const j of jobList()) if (j.origin?.kind !== 'workflow') out.push(jobItem(j, now()));
     return out;
   });
@@ -324,7 +326,6 @@ export function Runs() {
   const visible = createMemo(() => {
     const q = search().trim().toLowerCase();
     return items().filter((i) =>
-      (!pick('kind').length || pick('kind').includes(i.kind)) &&
       (!pick('status').length || pick('status').includes(i.status)) &&
       (!pick('origin').length || pick('origin').includes(i.origin)) &&
       (!pick('schedule').length || pick('schedule').includes(i.schedule ?? '')) &&
@@ -363,7 +364,6 @@ export function Runs() {
   const totals = () => jobs.page()?.totals;
   /** The sampler's last hour, one point per sample, behind every figure's strip. */
   const samples = () => totals()?.samples ?? [];
-  const failedRuns = () => wf.runs().filter((r) => r.status === 'failed' && (time(r.finished_at) ?? 0) > now() - 3_600_000).length;
   const tables = () => jobs.page()?.tables ?? [];
 
   const open = (key: string) => setParams({ open: key });
@@ -375,7 +375,7 @@ export function Runs() {
   return (
     <>
       <PageHead
-        title="Runs"
+        title={VIEW_TITLE[view]}
         actions={
           <span class="cap lx-live" classList={{ on: !jobs.error() }}>
             <span class="lx-pulse" />
@@ -390,12 +390,12 @@ export function Runs() {
 
       <div class="fx-page">
         {/* the numbers ======================================================= */}
+        <Show when={view === 'runs'}>
         <section class="fx-row" style={{ 'grid-template-columns': 'repeat(4, minmax(0, 1fr))' }}>
           <FxCell label="Running">
             <div class="fx-big">{count((i) => i.status === 'running')}</div>
             <div class="fx-sub cap">
-              <span><b>{count((i) => i.kind === 'workflow' && i.status === 'running')}</b> workflows</span>
-              <span><b>{count((i) => i.kind === 'job' && i.status === 'running')}</b> jobs</span>
+              <span>across <b>{tables().length}</b> queues</span>
               <Show when={totals()?.stalled}><span class="warn"><b>{totals()!.stalled}</b> stalled</span></Show>
             </div>
             <Barcode values={samples().map((x) => x.processing)} />
@@ -412,20 +412,20 @@ export function Runs() {
           </FxCell>
           <FxCell label="Failed" meta={<span>last hour</span>}>
             <div class="fx-big">
-              <span classList={{ bad: (totals()?.counts.failed ?? 0) + failedRuns() > 0 }}>{(totals()?.counts.failed ?? 0) + failedRuns()}</span>
+              <span classList={{ bad: (totals()?.counts.failed ?? 0) > 0 }}>{totals()?.counts.failed ?? 0}</span>
             </div>
             <div class="fx-sub cap">
-              <span><b>{totals()?.counts.failed ?? 0}</b> jobs</span>
-              <span><b>{failedRuns()}</b> workflows</span>
-              <Show when={(totals()?.counts.failed ?? 0) + failedRuns() > 0}>
+              <Show when={(totals()?.counts.failed ?? 0) > 0}>
                 <button class="fx-link cap" onClick={() => setFilters({ status: ['failed'] })}>show</button>
               </Show>
             </div>
             <Barcode values={samples().map((x) => x.failed)} bad={samples().map((x) => x.failed > 0)} />
           </FxCell>
         </section>
+        </Show>
 
         {/* what fires ======================================================== */}
+        <Show when={view === 'schedules'}>
         <section class="fx-row" id="schedules">
           <FxCell label="Schedules" meta={<span><b>{schedules().length}</b> · next <b>{(() => {
             const n = schedules().filter((s) => !s.paused && s.next_fire_at).sort((a, b) => a.next_fire_at!.localeCompare(b.next_fire_at!))[0];
@@ -476,24 +476,22 @@ export function Runs() {
             </Show>
           </FxCell>
         </section>
+        </Show>
 
         {/* what ran ========================================================== */}
+        <Show when={view !== 'schedules'}>
         <section class="fx-row">
-          <FxCell label="Runs" meta={<span><b>{formatCount(visible().length)}</b>{filtering() ? ` of ${formatCount(items().length)}` : ''}</span>}>
+          <FxCell label={view === 'workflows' ? 'Workflow runs' : 'Jobs'} meta={<span><b>{formatCount(visible().length)}</b>{filtering() ? ` of ${formatCount(items().length)}` : ''}</span>}>
             <div class="inc-filters">
               <FilterMenu
                 value={filters()}
                 onChange={(v) => { setFilters(v); setShown(40); }}
                 fields={[
                   { key: 'status', label: 'Status', options: STATUSES.filter((s) => count((i) => i.status === s)).map((s) => ({ value: s, label: s, count: count((i) => i.status === s), tone: toneOf(s) === 'run' ? '' : toneOf(s) })) },
-                  { key: 'kind', label: 'Kind', options: [
-                    { value: 'workflow', label: 'workflow run', count: count((i) => i.kind === 'workflow') },
-                    { value: 'job', label: 'job', count: count((i) => i.kind === 'job') },
-                  ] },
                   { key: 'origin', label: 'Started by', options: (['schedule', 'app', 'durable', 'manual', 'rerun'] as Origin[])
                     .filter((o) => count((i) => i.origin === o)).map((o) => ({ value: o, label: o === 'app' ? 'the app' : o, count: count((i) => i.origin === o) })) },
                   { key: 'schedule', label: 'Schedule', single: true, options: schedules().map((s) => ({ value: s.name, label: s.name, count: count((i) => i.schedule === s.name) })) },
-                  { key: 'table', label: 'Queue', single: true, options: tables().map((t) => ({ value: t.table, label: t.table, count: count((i) => i.table === t.table) })) },
+                  ...(view === 'runs' ? [{ key: 'table', label: 'Queue', single: true, options: tables().map((t) => ({ value: t.table, label: t.table, count: count((i) => i.table === t.table) })) }] : []),
                 ]}
               />
               <div class="inc-find">
@@ -529,9 +527,10 @@ export function Runs() {
             </Show>
           </FxCell>
         </section>
+        </Show>
 
         {/* where jobs wait ==================================================== */}
-        <Show when={tables().length}>
+        <Show when={view === 'runs' && tables().length}>
           <section class="fx-row">
             <FxCell label="Queues" meta={<button class="fx-link cap" onClick={() => void clearJobs({ all: true }, refreshAll)}>clear finished</button>}>
               <table class="fx-list rn-queues">
@@ -629,7 +628,6 @@ function RunRow(props: {
         <span class="fx-who">
           <Sq tone={toneOf(i().status)} />
           <span style={{ color: 'var(--ink)' }}>{i().name}</span>
-          <span class="rn-kind cap">{i().kind === 'workflow' ? 'workflow' : 'job'}</span>
         </span>
         <span class="vw-meta cap"><span>{i().sub}</span></span>
       </td>
@@ -1022,20 +1020,30 @@ function ScheduleSheet(props: {
 }
 
 /* ------------------------------------------------------------------ */
-/* The old addresses, landing on the new page                           */
+/* The old addresses                                                    */
 /* ------------------------------------------------------------------ */
 
-/** `/jobs?status=failed` and friends: the list, filtered the same way. */
-export function RunsRedirect(props: { kind?: 'job' | 'workflow' }) {
+/** `/jobs?status=failed` and friends: Runs, filtered the same way. */
+export function RunsRedirect() {
   const loc = useLocation();
-  const q = new URLSearchParams(loc.search);
-  if (props.kind && !q.has('kind') && !q.has('status') && !q.has('table')) q.set('kind', props.kind);
-  return <Navigate href={`/runs${q.toString() ? `?${q}` : ''}`} />;
+  return <Navigate href={`/runs${loc.search}`} />;
 }
 
-/** `/jobs/:id`, `/workflows/:id`, `/schedules/:name`: the list with that one open. */
+/** `/runs`, except that an old `/runs?kind=workflow` link belongs on Workflows. */
+export function RunsPage() {
+  const loc = useLocation();
+  const q = new URLSearchParams(loc.search);
+  if (q.get('kind') === 'workflow') {
+    q.delete('kind');
+    return <Navigate href={`/workflows${q.toString() ? `?${q}` : ''}`} />;
+  }
+  return <Runs view="runs" />;
+}
+
+/** `/jobs/:id`, `/workflows/:id`, `/schedules/:name`: their page, with that one open. */
 export function RunsOpen(props: { kind: 'job' | 'run' | 'schedule' }) {
   const params = useParams();
   const key = () => decodeParam(params.id ?? params.name);
-  return <Navigate href={`/runs?open=${encodeURIComponent(`${props.kind}:${key()}`)}`} />;
+  const page = props.kind === 'schedule' ? '/schedules' : props.kind === 'run' ? '/workflows' : '/runs';
+  return <Navigate href={`${page}?open=${encodeURIComponent(`${props.kind}:${key()}`)}`} />;
 }

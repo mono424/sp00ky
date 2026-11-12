@@ -35,6 +35,8 @@ const NAV_PATHS: Record<string, string> = {
   '/backends': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0',
   '/views': 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0',
   '/runs': 'M3 3h6v6H3z M15 15h6v6h-6z M6 9v9h9 M9 6h9v9',
+  '/schedules': 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2',
+  '/workflows': 'M6 3a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M18 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M9 6h7.5a3 3 0 0 1 0 6h-9a3 3 0 0 0 0 6H15',
   '/backups': 'M4 4h16v5H4z M6 9v12h12V9 M9 13h6',
   '/incidents': 'M12 3 2 21h20L12 3z M12 9v5 M12 17v1',
   '/logs': 'M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5',
@@ -80,7 +82,9 @@ const RAIL_ICONS: Record<string, { f: string; s?: string }> = {
   '/ssps': { f: 'M4.5 3h15A1.5 1.5 0 0 1 21 4.5v5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 9.5v-5A1.5 1.5 0 0 1 4.5 3z M4.5 13h15a1.5 1.5 0 0 1 1.5 1.5v5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 19.5v-5A1.5 1.5 0 0 1 4.5 13z M6 6.1v1.8h4V6.1z M6 16.1v1.8h4v-1.8z M16 6.1v1.8h2V6.1z M16 16.1v1.8h2v-1.8z' },
   '/backends': { f: 'M11.5 2.6a1.2 1.2 0 0 1 1 0l8.6 4.3c.7.4.7 1.4 0 1.8l-8.6 4.3a1.2 1.2 0 0 1-1 0L2.9 8.7c-.7-.4-.7-1.4 0-1.8z M4.6 11.3l6.9 3.5c.3.2.7.2 1 0l6.9-3.5 1.7.9c.7.4.7 1.4 0 1.8l-8.6 4.3a1.2 1.2 0 0 1-1 0L2.9 14c-.7-.4-.7-1.4 0-1.8z M4.6 16.4l6.9 3.5c.3.2.7.2 1 0l6.9-3.5 1.7.9c.7.4.7 1.4 0 1.8l-8.6 4.3a1.2 1.2 0 0 1-1 0l-8.6-4.3c-.7-.4-.7-1.4 0-1.8z' },
   '/views': { f: 'M12 4.5c5.6 0 9.6 5.2 10 7.5-.4 2.3-4.4 7.5-10 7.5S2.4 14.3 2 12c.4-2.3 4.4-7.5 10-7.5z M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4z M12 10.2a1.8 1.8 0 1 1 0 3.6 1.8 1.8 0 0 1 0-3.6z' },
-  '/runs': { f: 'M6 2.5a3.2 3.2 0 1 1 0 6.4 3.2 3.2 0 0 1 0-6.4z M18 15.1a3.2 3.2 0 1 1 0 6.4 3.2 3.2 0 0 1 0-6.4z', s: 'M9.5 5.7h7a3.15 3.15 0 0 1 0 6.3h-9a3.15 3.15 0 0 0 0 6.3h5' },
+  '/workflows': { f: 'M6 2.5a3.2 3.2 0 1 1 0 6.4 3.2 3.2 0 0 1 0-6.4z M18 15.1a3.2 3.2 0 1 1 0 6.4 3.2 3.2 0 0 1 0-6.4z', s: 'M9.5 5.7h7a3.15 3.15 0 0 1 0 6.3h-9a3.15 3.15 0 0 0 0 6.3h5' },
+  '/runs': { f: 'M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20z M9.8 7.6v8.8l7-4.4z' },
+  '/schedules': { f: 'M7 2.5h1.8V4.5h6.4V2.5H17v2h1.5A2.5 2.5 0 0 1 21 7v11.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 18.5V7a2.5 2.5 0 0 1 2.5-2.5H7z M5 9.5v9a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5v-9z M7.5 12h3v3h-3z' },
   '/database': { f: 'M12 2c4.4 0 8 1.4 8 3.2S16.4 8.4 12 8.4 4 7 4 5.2 7.6 2 12 2z M4 7.9c1.7 1.3 4.7 2 8 2s6.3-.7 8-2v4c0 1.8-3.6 3.2-8 3.2S4 13.7 4 11.9z M4 14.6c1.7 1.3 4.7 2 8 2s6.3-.7 8-2v4.2c0 1.8-3.6 3.2-8 3.2s-8-1.4-8-3.2z' },
   '/users': { f: 'M12 2.8a4.6 4.6 0 1 1 0 9.2 4.6 4.6 0 0 1 0-9.2z M3.8 20.2c0-3.9 3.7-6.6 8.2-6.6s8.2 2.7 8.2 6.6v.3a.7.7 0 0 1-.7.7H4.5a.7.7 0 0 1-.7-.7z' },
   '/members': { f: 'M9 3a4.2 4.2 0 1 1 0 8.4A4.2 4.2 0 0 1 9 3z M1.8 19.6c0-3.6 3.2-6 7.2-6s7.2 2.4 7.2 6v.7a.7.7 0 0 1-.7.7H2.5a.7.7 0 0 1-.7-.7z M15.6 3.5a4 4 0 0 1 0 7.4 5.6 5.6 0 0 0 0-7.4z M17.4 13.8c2.8.6 4.8 2.7 4.8 5.6v.9a.7.7 0 0 1-.7.7h-3.8c.2-.3.3-.7.3-1.1v-.8c0-2.1-.2-3.6-.6-5.3z' },
@@ -206,6 +210,8 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
       // views are registered".
       count: o?.presence?.ready ? formatCount(o.presence.totals.views) : undefined,
     },
+    { href: '/schedules', label: 'Schedules', group: 'Automation' },
+    { href: '/workflows', label: 'Workflows', group: 'Automation' },
     {
       href: '/runs',
       label: 'Runs',
@@ -689,23 +695,85 @@ export function FrameSkeleton(props: { console?: boolean }) {
   const links = (): NavLink[] =>
     workspace ? WORKSPACE_LINKS : projectNav(!!props.console).filter((l) => l.group !== 'Settings');
   return (
+    <Show when={props.console} fallback={<AdminFrameSkeleton links={links()} />}>
+      {/* The console's rail as it will paint: same classes, icons, folds and width. */}
+      <div class="shell settled" classList={{ 'rail-min': railMin() }}>
+        <header class="mobile-bar">
+          <span class="burger" aria-hidden="true"><span /><span /><span /></span>
+          <Logo />
+        </header>
+        <nav class="sidebar cx-rail" aria-hidden="true">
+          <div class="cx-brand">
+            <Logo />
+            <span class="rail-tools">
+              <span class="rail-tool">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                  <path d="M10.5 3.5a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M20.5 20.5l-5-5" />
+                </svg>
+              </span>
+              <span class="rail-tool rail-min-btn">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                  <rect x="3" y="4" width="18" height="16" rx="3" />
+                  <path d="M9.5 4v16" />
+                </svg>
+              </span>
+            </span>
+          </div>
+          <div class="nav">
+            <For each={sectionsOf(links())}>
+              {(section) => (
+                <div class="nav-section" classList={{ 'cx-quick': !section.group, folded: !!section.group && railFolded().includes(section.group) }}>
+                  <Show when={section.group}>
+                    <span class="rail-head">
+                      <span>{section.group}</span>
+                      <Tri dir={railFolded().includes(section.group!) ? 'right' : 'down'} />
+                    </span>
+                  </Show>
+                  <Show when={!section.group || !railFolded().includes(section.group)}>
+                    <For each={section.links}>
+                      {(link) => (
+                        <span class="nav-link">
+                          <span class="row" style={{ gap: '10px' }}>
+                            <RailIcon href={link.href} icon={link.icon} />
+                            <span class="nav-label">{link.label}</span>
+                          </span>
+                        </span>
+                      )}
+                    </For>
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+          <div class="sb-foot cx-foot">
+            <span class="cx-me">
+              <span class="cx-face"><span class="cx-uav sk" /></span>
+              <span class="cx-wsw-text"><span class="sk sk-cap" style={{ width: '72px' }} /><span class="sk sk-cap" style={{ width: '52px' }} /></span>
+            </span>
+          </div>
+        </nav>
+        <div class="main-frame">
+          <main class="main">
+            <PageSkeleton />
+          </main>
+        </div>
+      </div>
+    </Show>
+  );
+}
+
+/** The scheduler-hosted /admin frame while it loads. */
+function AdminFrameSkeleton(props: { links: NavLink[] }) {
+  return (
     <div class="shell settled">
       <header class="mobile-bar">
         <span class="burger" aria-hidden="true"><span /><span /><span /></span>
         <Logo />
       </header>
       <nav class="sidebar" aria-hidden="true">
-        <Show
-          when={props.console}
-          fallback={
-            <div class="sb-me">
-              <span class="sb-me-btn"><span class="sb-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span>
-            </div>
-          }
-        >
-          <div class="cx-brand"><Logo /><span class="cap">console</span></div>
-          <div class="cx-rail-head"><span class="cx-prow"><span class="fx-sq idle" /><span class="sk sk-cap" style={{ width: '96px' }} /></span></div>
-        </Show>
+        <div class="sb-me">
+          <span class="sb-me-btn"><span class="sb-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span>
+        </div>
         <div class="sb-jump cap">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
             <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
@@ -714,7 +782,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
           <kbd>⌘K</kbd>
         </div>
         <div class="nav">
-          <For each={sectionsOf(links())}>
+          <For each={sectionsOf(props.links)}>
             {(section) => (
               <div class="nav-section">
                 <Show when={section.group}>
@@ -731,13 +799,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
             )}
           </For>
         </div>
-        <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
-          <Show when={props.console}>
-            <span class="cx-me">
-              <span class="cx-face sk" />
-              <span class="cx-wsw-text"><span class="sk sk-cap" style={{ width: '72px' }} /><span class="sk sk-cap" style={{ width: '52px' }} /></span>
-            </span>
-          </Show>
+        <div class="sb-foot">
           <div class="sb-ver cap" />
         </div>
       </nav>

@@ -8,7 +8,7 @@ import { readStash, writeStash } from './lib/stash';
 import { Overview } from './routes/Overview';
 import { Ssps } from './routes/Ssps';
 import { Backends, BackendDetailView } from './routes/Backends';
-import { Runs, RunsOpen, RunsRedirect } from './routes/Runs';
+import { Runs, RunsOpen, RunsRedirect, RunsPage } from './routes/Runs';
 import { Backups } from './routes/Backups';
 import { Logs } from './routes/Logs';
 import { ViewDetail, Views } from './routes/Views';
@@ -159,15 +159,15 @@ export function ProjectApp(props: {
           <Route path="/ssps" component={() => <Ssps data={overview()} refresh={poll} />} />
           <Route path="/backends" component={() => <Backends overview={overview()} />} />
           <Route path="/backends/:name" component={() => <BackendDetailView overview={overview()} />} />
-          {/* Schedules, workflows and jobs are one page now; their old
-              addresses land on it, filtered or with the thing open. */}
-          <Route path="/runs" component={Runs} />
-          <Route path="/jobs" component={() => <RunsRedirect kind="job" />} />
-          <Route path="/jobs/:id" component={() => <RunsOpen kind="job" />} />
-          <Route path="/workflows" component={() => <RunsRedirect kind="workflow" />} />
-          <Route path="/workflows/:id" component={() => <RunsOpen kind="run" />} />
-          <Route path="/schedules" component={() => <RunsRedirect />} />
+          {/* Schedules, workflows and jobs: one component, three pages. A
+              thing's own address opens its page with it in a sheet. */}
+          <Route path="/schedules" component={() => <Runs view="schedules" />} />
           <Route path="/schedules/:name" component={() => <RunsOpen kind="schedule" />} />
+          <Route path="/workflows" component={() => <Runs view="workflows" />} />
+          <Route path="/workflows/:id" component={() => <RunsOpen kind="run" />} />
+          <Route path="/runs" component={RunsPage} />
+          <Route path="/jobs" component={RunsRedirect} />
+          <Route path="/jobs/:id" component={() => <RunsOpen kind="job" />} />
           <Route path="/backups" component={() => <Backups overview={overview()} refresh={poll} />} />
           <Route path="/views" component={Views} />
           <Route path="/views/:key" component={ViewDetail} />

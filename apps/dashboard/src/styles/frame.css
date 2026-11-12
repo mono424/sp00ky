@@ -7176,3 +7176,17 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
 /* the rail head lines up with the page bar: inset 4 + border 1 + half of its 51px content = 30.5 */
 @media (min-width: 861px) { .cx-rail .cx-brand { height: 61px; } }
 
+
+/* ---- one left edge and one right edge down the rail ----
+   Left: the wordmark, nav icons, group headings and the account picture
+   all start at 19px. Right: the counts, the width toggle and the account
+   chevron end at 241px. The account card is as wide as a nav pill. */
+@media (min-width: 861px) {
+  .cx-rail .cx-brand { padding: 0 12px 0 19px; }
+  .cx-rail .sb-foot.cx-foot { padding-left: 8px; padding-right: 8px; }
+  .cx-rail .cx-me { padding-left: 10px; padding-right: 10px; }
+
+  /* folded to icons: the toggle sits on the page bar's line, search under it */
+  .rail-min .cx-rail .cx-brand { padding: 16.5px 0 8px; gap: 6px; height: auto; }
+}
+@media (min-width: 861px) { .rail-min .cx-rail .rail-tools { gap: 6px; } }

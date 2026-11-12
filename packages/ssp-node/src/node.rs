@@ -2600,10 +2600,13 @@ pub async fn ttl_cleanup_sweep_gated(
     // gates the eager release paths in `fn::query::unsubscribe` and
     // `fn::query::leave`; the latter releases through this sweep by pulling
     // `lastActiveAt` back, so a page's pagehide reaches the view here.
+    //
+    // `reaping` is a row whose edges this sweep has started to remove (see
+    // `strip_large_view_edges`), whatever its `lastActiveAt` says by now.
     let rows: Vec<String> = match db
         .query(
             "SELECT VALUE (<string>id + '|' + <string>(auth_id OR '')) \
-             FROM _00_query WHERE lastActiveAt + ttl < time::now()",
+             FROM _00_query WHERE lastActiveAt + ttl < time::now() OR reaping = true",
             &[],
         )
         .await
@@ -2621,6 +2624,7 @@ pub async fn ttl_cleanup_sweep_gated(
     };
 
     let count = rows.len();
+    let strip_deadline = web_time::Instant::now() + TTL_STRIP_BUDGET;
     let mut cleaned: std::collections::HashSet<String> = std::collections::HashSet::new();
     for row in rows {
         let mut parts = row.splitn(2, '|');
@@ -2630,7 +2634,7 @@ pub async fn ttl_cleanup_sweep_gated(
             continue;
         }
         let raw = id.strip_prefix("_00_query:").unwrap_or(id).to_string();
-        cleanup_expired_query(db, processor, telemetry, &raw, &auth_id, ref_mode, gate).await;
+        cleanup_expired_query(db, processor, telemetry, &raw, &auth_id, ref_mode, gate, strip_deadline).await;
         if !auth_id.is_empty() {
             cleaned.insert(auth_id);
         }
@@ -2650,8 +2654,144 @@ pub async fn ttl_cleanup_sweep_gated(
     count
 }
 
+/// Edges one statement of the sweep removes. Deleting a `_00_query` row purges
+/// its edges inside that one statement, about 100 microseconds each on an idle
+/// laptop and several times that on a loaded database. A view of 39,121 rows
+/// outlived the SSP's 15 s call timeout, which does not end the statement on
+/// the server, so the next sweep started another beside it. They stacked every
+/// 75 s until SurrealDB sat at its CPU cap and ran out of memory, every 20
+/// minutes, with nobody online (whitepawn, 2026-11-03). A view this big loses
+/// its edges in batches first, each committed, so progress survives a failure.
+const TTL_EDGE_BATCH: usize = 1_000;
+
+/// Where a failing batch stops shrinking. Failing at this size means the
+/// database is unwell, not that the batch is too big: leave it to the next sweep.
+const TTL_EDGE_BATCH_MIN: usize = 50;
+
+/// How long one sweep may spend removing edges. Whatever is left waits for the
+/// next one, so a huge view cannot hold up the timer (on Cloudflare, the one
+/// alarm every other timer shares). A strip resumes where it stopped.
+const TTL_STRIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What an expired row's edges allow next.
+enum EdgeStrip {
+    /// Few enough edges remain for the row's own DELETE to purge them.
+    Ready,
+    /// A heartbeat got there first and nothing was removed. The row stays.
+    Refreshed,
+    /// Edges remain. The row is `reaping` and the next sweep carries on.
+    Unfinished,
+}
+
+/// Remove a large expired view's edges in batches, ahead of its row's DELETE.
+///
+/// `reaping` commits the row to deletion before the first edge goes. A heartbeat
+/// landing after that cannot save it: `lastActiveAt` would say the view is live
+/// while part of its membership is gone, and nothing would ever put it back,
+/// since `repair_stranded_view` only heals a view with no edges at all. Deleting
+/// the row anyway is what converges, because the client re-registers a row it
+/// finds gone and gets a full publish. The flag lives on the row so this holds
+/// across sweeps and SSP restarts.
+///
+/// `$q->(table LIMIT n)` and not `SELECT VALUE id FROM $q->table LIMIT n`: the
+/// second reads every edge of the view before it applies the limit (1.2 s at
+/// 39,121 edges against 15 ms on 3.3.5), so a smaller batch would not make it
+/// any cheaper.
+async fn strip_large_view_edges(
+    db: &dyn Db,
+    query_id: &str,
+    list_ref: &str,
+    deadline: web_time::Instant,
+) -> EdgeStrip {
+    let qid = [("qid", json!(query_id))];
+
+    // Nearly every view ends here. A failed probe does too: the DELETE that
+    // follows is bounded by its own TIMEOUT and reports the problem.
+    let probe = format!(
+        "RETURN array::len(type::record('_00_query', $qid)->({list_ref} LIMIT {TTL_EDGE_BATCH}))"
+    );
+    match db.query(&probe, &qid).await {
+        Ok(r) if r.first().and_then(Value::as_u64).unwrap_or(0) >= TTL_EDGE_BATCH as u64 => {}
+        Ok(_) => return EdgeStrip::Ready,
+        Err(e) => {
+            debug!(query_id = %query_id, error = %e, "TTL cleanup: edge probe failed");
+            return EdgeStrip::Ready;
+        }
+    }
+    if web_time::Instant::now() >= deadline {
+        return EdgeStrip::Unfinished;
+    }
+
+    let claim = "UPDATE type::record('_00_query', $qid) SET reaping = true \
+                 WHERE reaping = true OR lastActiveAt + ttl < time::now() \
+                 RETURN VALUE id TIMEOUT 5s";
+    match query_retrying(db, claim, &qid).await {
+        Ok(r) if r.first().and_then(Value::as_array).is_some_and(|ids| !ids.is_empty()) => {}
+        Ok(_) => return EdgeStrip::Refreshed,
+        Err(e) => {
+            warn!(query_id = %query_id, error = %e, "TTL cleanup: claiming a large view failed");
+            return EdgeStrip::Unfinished;
+        }
+    }
+
+    let (outcome, removed) = match delete_edges_in_batches(db, query_id, list_ref, deadline).await {
+        (Ok(true), removed) => (EdgeStrip::Ready, removed),
+        (Ok(false), removed) => (EdgeStrip::Unfinished, removed),
+        (Err(e), removed) => {
+            warn!(query_id = %query_id, removed, error = %e, "TTL cleanup: edge batch failed, the next sweep resumes");
+            (EdgeStrip::Unfinished, removed)
+        }
+    };
+    info!(query_id = %query_id, removed, "TTL cleanup: removed edges of a large view");
+    outcome
+}
+
+/// Delete `query_id`'s edges a batch at a time, each batch its own committed
+/// statement with a server-side TIMEOUT, until none are left (`Ok(true)`),
+/// the deadline passes (`Ok(false)`), or a batch fails at the smallest size.
+/// A failing batch is halved first. The first batch goes whatever the
+/// deadline says, so a sweep that spent its budget still removes the few
+/// edges a small view has. Returns the edges removed either way.
+async fn delete_edges_in_batches(
+    db: &dyn Db,
+    query_id: &str,
+    list_ref: &str,
+    deadline: web_time::Instant,
+) -> (Result<bool, crate::ports::DbError>, u64) {
+    let qid = [("qid", json!(query_id))];
+    let mut batch = TTL_EDGE_BATCH;
+    let mut removed = 0u64;
+    let mut first = true;
+    loop {
+        if !std::mem::take(&mut first) && web_time::Instant::now() >= deadline {
+            return (Ok(false), removed);
+        }
+        let strip = format!(
+            "LET $ids = type::record('_00_query', $qid)->({list_ref} LIMIT {batch}); \
+             DELETE $ids RETURN NONE TIMEOUT 5s; \
+             RETURN array::len($ids);"
+        );
+        match query_retrying(db, &strip, &qid).await {
+            Ok(r) => {
+                let n = r.get(2).and_then(Value::as_u64).unwrap_or(0);
+                removed += n;
+                if n < batch as u64 {
+                    return (Ok(true), removed);
+                }
+            }
+            Err(e) if batch > TTL_EDGE_BATCH_MIN => {
+                batch = (batch / 2).max(TTL_EDGE_BATCH_MIN);
+                debug!(query_id = %query_id, batch, error = %e, "TTL cleanup: shrinking the edge batch");
+            }
+            Err(e) => return (Err(e), removed),
+        }
+    }
+}
+
 /// Delete one expired query iff its TTL is still expired (guards a heartbeat
-/// racing the sweep), plus its edges + circuit view.
+/// racing the sweep) or its edges are already going, plus its edges + circuit
+/// view.
+#[allow(clippy::too_many_arguments)]
 async fn cleanup_expired_query(
     db: &dyn Db,
     processor: &Arc<RwLock<Circuit>>,
@@ -2660,14 +2800,30 @@ async fn cleanup_expired_query(
     auth_id: &str,
     ref_mode: ssp_protocol::RefMode,
     gate: Option<&tokio::sync::Mutex<()>>,
+    strip_deadline: web_time::Instant,
 ) {
     let list_ref = crate::tables::list_ref_table(ref_mode, auth_id);
 
+    match strip_large_view_edges(db, query_id, &list_ref, strip_deadline).await {
+        EdgeStrip::Ready => {}
+        EdgeStrip::Refreshed => {
+            debug!(query_id = %query_id, "TTL cleanup: query refreshed, skipping");
+            return;
+        }
+        EdgeStrip::Unfinished => return,
+    }
+
     // Conditional delete; `RETURN array::len(...)` reads back the count.
+    //
+    // TIMEOUT sits inside the SSP's own call timeout on purpose: that one only
+    // stops the SSP waiting, while this one ends the statement on the server,
+    // cascade included, with nothing committed. The next sweep then retries
+    // alone instead of joining the attempts still running.
     let deleted: i64 = match query_retrying(
         db,
         "LET $d = (DELETE type::record('_00_query', $qid) \
-         WHERE lastActiveAt + ttl < time::now() RETURN BEFORE); \
+         WHERE reaping = true OR lastActiveAt + ttl < time::now() \
+         RETURN BEFORE TIMEOUT 10s); \
          RETURN array::len($d);",
         &[("qid", json!(query_id))],
     )
@@ -2716,9 +2872,17 @@ async fn cleanup_expired_query(
         }
     }
 
-    let edge_delete = format!("DELETE type::record('_00_query', $qid)->{list_ref}");
-    if let Err(e) = query_retrying(db, &edge_delete, &[("qid", json!(query_id))]).await {
-        warn!(query_id = %query_id, error = %e, "TTL cleanup: edge delete failed (retries exhausted)");
+    // Usually nothing is left: the row's DELETE purged its edges. A view the
+    // event could not unregister may have published more since, so this goes
+    // in bounded batches too, never one unbounded statement.
+    match delete_edges_in_batches(db, query_id, &list_ref, strip_deadline).await {
+        (Ok(true), _) => {}
+        (Ok(false), removed) => {
+            warn!(query_id = %query_id, removed, "TTL cleanup: edges left after the sweep's time budget")
+        }
+        (Err(e), removed) => {
+            warn!(query_id = %query_id, removed, error = %e, "TTL cleanup: edge delete failed (retries exhausted)")
+        }
     }
 
     // Release, don't destroy: an expired row is one holder leaving, and the

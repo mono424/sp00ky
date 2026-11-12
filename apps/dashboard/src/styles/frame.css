@@ -7190,3 +7190,12 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
   .rail-min .cx-rail .cx-brand { padding: 16.5px 0 8px; gap: 6px; height: auto; }
 }
 @media (min-width: 861px) { .rail-min .cx-rail .rail-tools { gap: 6px; } }
+
+/* ---- skeleton bars sized by the text they stand in for (components/Skeleton.tsx) ---- */
+/* The wrapper sits on the baseline like the text it replaces (its zero-width
+   space is that text), and the bar hangs from the top of the line, so a bar
+   never makes its line taller than the words would. */
+.sk-w { display: inline-block; width: 6em; max-width: 100%; vertical-align: baseline; }
+.sk-t { display: inline-block; width: 100%; height: 0.72em; vertical-align: top; margin-top: 0.22em; border-radius: 3px !important; }
+.sk-b { display: block; width: 100%; height: 120px; border-radius: 4px !important; }
+.sk-w + .sk-w { margin-left: 0.6em; }

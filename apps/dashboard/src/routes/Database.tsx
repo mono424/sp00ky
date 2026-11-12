@@ -5,6 +5,8 @@ import { confirm, toast } from '../components/Actions';
 import { PageHead } from '../components/Chrome';
 import { CopyText, DataError, FieldInput, Pager, ValueCell, enc, useCanWrite } from '../components/DataParts';
 import { Sheet, SheetSection, Sq } from '../components/Frame';
+import { Sk } from '../components/Skeleton';
+import { DatabaseSkeleton, TableDataSkeleton } from '../skeletons/Database';
 import {
   FILTER_OPS,
   baseKind,
@@ -82,6 +84,7 @@ export function Database() {
   return (
     <>
       <PageHead title="Database" actions={pageTitle(false)} />
+      <Show when={list()} fallback={<DatabaseSkeleton table={params.table} />}>
       <div class="dx-page dx-split">
         <aside class="dx-side">
           <div class="dx-side-find">
@@ -124,6 +127,7 @@ export function Database() {
           </Show>
         </div>
       </div>
+      </Show>
     </>
   );
 }
@@ -281,7 +285,7 @@ function TableView(props: { table: string; tables: ReadonlySet<string>; canWrite
       <div class="dx-bar">
         <div class="dx-bar-title">
           <b>{props.table}</b>
-          <Show when={detail()}>
+          <Show when={detail()} fallback={<Show when={!detailResult()}><span class="cap"><Sk w="7em" /></span></Show>}>
             {(d) => (
               <span class="cap">
                 {d().kind === 'relation' ? 'relation' : d().schemafull ? 'schemafull' : 'schemaless'}
@@ -312,7 +316,8 @@ function TableView(props: { table: string; tables: ReadonlySet<string>; canWrite
       </Show>
 
       <Show when={tab() === 'structure'} fallback={
-        <>
+        // The first page of rows decides the columns: until then, the grid's shape.
+        <Show when={pageResult.latest} fallback={<TableDataSkeleton />}>
           <FilterBar fields={filterable()} kinds={kinds()} filters={filters()} onChange={applyFilters} />
           <Show when={pageResult.latest && !pageResult.latest.ok}>
             <div class="dx-pad"><DataError message={(pageResult.latest as { ok: false; message: string }).message} /></div>
@@ -398,7 +403,7 @@ function TableView(props: { table: string; tables: ReadonlySet<string>; canWrite
               onLimit={(n) => { setStart(0); setLimit(n); }}
             />
           </div>
-        </>
+        </Show>
       }>
         <Show when={detail()}>{(d) => <Structure table={d()} />}</Show>
       </Show>

@@ -7,6 +7,7 @@
 import { For, Show, createMemo, createResource, createSignal, onCleanup, type JSX } from 'solid-js';
 import { PageHead } from '../components/Chrome';
 import { FxCell } from '../components/Frame';
+import { AudienceSkeleton } from '../skeletons/Audience';
 import { useOverview } from '../ProjectApp';
 import { consoleApi, type Workspace, type WorkspaceProject } from './cloud';
 import { ago } from './chrome';
@@ -126,6 +127,8 @@ export function Audience(props: Ctx) {
           </span>
         }
       />
+      {/* The first report draws the page's shape; a range change keeps the old one, dimmed. */}
+      <Show when={data.error || data.latest} fallback={<AudienceSkeleton />}>
       <div class="fx-page" classList={{ 'bt-stale': data.loading && !!data.latest }}>
         <Show when={data.error}>
           <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{String(data.error?.message ?? data.error)}</span></div></FxCell></section>
@@ -225,6 +228,7 @@ export function Audience(props: Ctx) {
           )}
         </Show>
       </div>
+      </Show>
     </>
   );
 }

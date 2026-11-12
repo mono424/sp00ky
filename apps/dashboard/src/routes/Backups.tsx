@@ -21,6 +21,7 @@ import type {
   Overview,
   RestoreStatus,
 } from '../api/types';
+import { BackupsSkeleton } from '../skeletons/Backups';
 
 /**
  * Backups: when the last one was taken, how many are kept, when the next one
@@ -176,7 +177,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
         <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{error()}</span></div></FxCell></section>
       </Show>
 
-      <Show when={!error() && data()} fallback={<Show when={!error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+      <Show when={!error() && data()} fallback={<Show when={!error()}><BackupsSkeleton /></Show>}>
         {(d) => (
           <div class="fx-page">
             <Show when={!d().s3.configured}>

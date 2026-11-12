@@ -9,6 +9,7 @@ import { DayTicks, FxCell, Gauge, Sheet, SheetSection, Sq, memText, useCloudServ
 import { formatBytes, formatCount, formatDuration, formatUptime } from '../lib/format';
 import { sspTone } from '../lib/status';
 import type { Overview, SspEntity } from '../api/types';
+import { SspsSkeleton } from '../skeletons/Ssps';
 
 /**
  * The sync processors, for any number of them.
@@ -64,7 +65,7 @@ export function Ssps(props: { data: Overview | undefined; refresh: () => void })
         }
       />
 
-      <Show when={props.data} fallback={<div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div>}>
+      <Show when={props.data} fallback={<SspsSkeleton />}>
         {(d) => (
           <div class="fx-page">
             <Show when={(d().operations ?? []).some((o) => o.status === 'running')}>

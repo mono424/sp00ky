@@ -48,6 +48,14 @@ import {
 } from './hostPlan';
 import { isUnlocked, loadValues, unlock } from './vault';
 import { BuildTimeBox } from './builds';
+import { DeploymentsListSkeleton, DeploymentsTopSkeleton } from '../skeletons/Deployments';
+import {
+  SettingsDatabaseSkeleton,
+  SettingsDomainsSkeleton,
+  SettingsEnvSkeleton,
+  SettingsGitSkeleton,
+  SettingsScaleSkeleton,
+} from '../skeletons/Settings';
 import { GitHubMark } from './onboarding';
 import {
   DEFAULT_CONFIG,
@@ -70,6 +78,9 @@ interface Ctx {
 }
 
 const pid = (p: WorkspaceProject) => encodeURIComponent(p.id);
+
+/** A resource has answered (or failed) at least once; a refetch keeps it so. */
+const settled = (r: { state: string }) => r.state !== 'unresolved' && r.state !== 'pending';
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -295,6 +306,8 @@ export function Deployments(props: Ctx) {
   });
   const urls = createMemo(() => endpoints(status(), domains()));
   const main = createMemo(() => mainOf(urls()));
+  // The addresses decide the preview and the domain list, so all three wait together.
+  const ready = () => settled(data) && settled(status) && settled(domains);
   const linked = () => link()?.status === 'linked';
   const commitUrl = (sha: string) => {
     const l = link();
@@ -427,99 +440,101 @@ export function Deployments(props: Ctx) {
           <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{message(data.error)}</span></div></FxCell></section>
         </Show>
 
-        {/* Production: what a visitor sees, where, and what made it. */}
-        <section class="fx-row cx-prod">
-          <FxCell label="Preview" meta={<PreviewToggle />} class="cx-prod-shot">
-            <Preview target={main()} loading={status.loading || domains.loading} />
-          </FxCell>
-          <FxCell
-            label="Production"
-            meta={
-              <Show when={live()?.live_from}>
-                <span title={`live since ${formatStamp(live()!.live_from)}`}>up {ago(live()!.live_from).replace(/ ago$/, '')}</span>
-              </Show>
-            }
-          >
-            <div class="cx-main">
-              <span class="cap">{main()?.custom ? 'Domain' : 'URL'}</span>
-              <Show
-                when={main()}
-                fallback={<span class="cx-main-none">{status.loading ? 'Loading' : 'No public address yet'}</span>}
-              >
-                {(m) => (
-                  <a class="cx-main-url" href={m().url} target="_blank" rel="noopener noreferrer">
-                    {m().host}<span class="cx-arrow">↗</span>
-                  </a>
-                )}
-              </Show>
-              <Show when={urls().length > 1}>
-                <div class="cx-alts">
-                  <For each={urls().slice(1, 3)}>
-                    {(u) => <a href={u.url} target="_blank" rel="noopener noreferrer">{u.host}</a>}
-                  </For>
-                  <Show when={urls().length > 3}>
-                    <button class="cx-more" onClick={showUrls}>+{urls().length - 3} more</button>
-                  </Show>
-                </div>
-              </Show>
-            </div>
-            <Show
-              when={live()}
-              fallback={<div class="fx-empty cap">{data.loading ? 'Loading' : rolling() ? `v${rolling()!.version} is rolling out` : 'Nothing is live yet'}</div>}
+        <Show when={ready()} fallback={<DeploymentsTopSkeleton />}>
+          {/* Production: what a visitor sees, where, and what made it. */}
+          <section class="fx-row cx-prod">
+            <FxCell label="Preview" meta={<PreviewToggle />} class="cx-prod-shot">
+              <Preview target={main()} loading={status.loading || domains.loading} />
+            </FxCell>
+            <FxCell
+              label="Production"
+              meta={
+                <Show when={live()?.live_from}>
+                  <span title={`live since ${formatStamp(live()!.live_from)}`}>up {ago(live()!.live_from).replace(/ ago$/, '')}</span>
+                </Show>
+              }
             >
-              {(d) => (
-                <>
-                  <div class="cx-facts">
-                    <div>
-                      <span class="cap">Status</span>
-                      <b class={`cx-st ${state(d()).tone}`}><Sq tone={state(d()).tone} />{state(d()).label}<small>v{d().version ?? '?'}</small></b>
-                    </div>
-                    <div>
-                      <span class="cap">Created</span>
-                      <b title={formatStamp(d().created_at)}>
-                        {ago(d().created_at)}
-                        <Show when={d().actor ?? d().build?.commit_author}><small>by {d().actor ?? d().build?.commit_author}</small></Show>
-                      </b>
-                    </div>
-                    <div>
-                      <span class="cap">Rolled out in</span>
-                      <b>{took(d())}</b>
-                    </div>
-                  </div>
-                  <div class="cx-commit">
-                    <Show when={d().build} fallback={<span>{origin(d())} <span class="dim">{what(d())}</span></span>}>
-                      {(b) => (
-                        <span>
-                          <Show when={linked() && link()?.branch}><span class="cx-branch"><BranchIcon />{link()!.branch}</span>{' '}</Show>
-                          <Sha sha={b().commit_sha} href={commitUrl(b().commit_sha)} />{' '}
-                          <span class="dim">{firstLine(b().commit_message)}</span>
-                        </span>
-                      )}
+              <div class="cx-main">
+                <span class="cap">{main()?.custom ? 'Domain' : 'URL'}</span>
+                <Show
+                  when={main()}
+                  fallback={<span class="cx-main-none">No public address yet</span>}
+                >
+                  {(m) => (
+                    <a class="cx-main-url" href={m().url} target="_blank" rel="noopener noreferrer">
+                      {m().host}<span class="cx-arrow">↗</span>
+                    </a>
+                  )}
+                </Show>
+                <Show when={urls().length > 1}>
+                  <div class="cx-alts">
+                    <For each={urls().slice(1, 3)}>
+                      {(u) => <a href={u.url} target="_blank" rel="noopener noreferrer">{u.host}</a>}
+                    </For>
+                    <Show when={urls().length > 3}>
+                      <button class="cx-more" onClick={showUrls}>+{urls().length - 3} more</button>
                     </Show>
                   </div>
-                  <div class="cx-kv">
-                    <For each={images(d())} fallback={<div><span class="cap">Images</span><b>defaults</b></div>}>
-                      {([role, tag]) => (
-                        <div><span class="cap">{role}</span><b>{tag}</b></div>
-                      )}
-                    </For>
-                  </div>
-                </>
-              )}
-            </Show>
-          </FxCell>
-        </section>
-
-        <Show when={health().length}>
-          <section class="fx-row cx-strip" style={{ 'grid-template-columns': `repeat(${health().length}, minmax(0, 1fr))` }}>
-            <For each={health()}>
-              {(h) => (
-                <FxCell label={h.label} meta={<Sq tone={h.tone} />}>
-                  <div class="cx-stat" classList={{ warn: h.tone === 'warn' }}>{h.value}<small>{h.unit}</small></div>
-                </FxCell>
-              )}
-            </For>
+                </Show>
+              </div>
+              <Show
+                when={live()}
+                fallback={<div class="fx-empty cap">{rolling() ? `v${rolling()!.version} is rolling out` : 'Nothing is live yet'}</div>}
+              >
+                {(d) => (
+                  <>
+                    <div class="cx-facts">
+                      <div>
+                        <span class="cap">Status</span>
+                        <b class={`cx-st ${state(d()).tone}`}><Sq tone={state(d()).tone} />{state(d()).label}<small>v{d().version ?? '?'}</small></b>
+                      </div>
+                      <div>
+                        <span class="cap">Created</span>
+                        <b title={formatStamp(d().created_at)}>
+                          {ago(d().created_at)}
+                          <Show when={d().actor ?? d().build?.commit_author}><small>by {d().actor ?? d().build?.commit_author}</small></Show>
+                        </b>
+                      </div>
+                      <div>
+                        <span class="cap">Rolled out in</span>
+                        <b>{took(d())}</b>
+                      </div>
+                    </div>
+                    <div class="cx-commit">
+                      <Show when={d().build} fallback={<span>{origin(d())} <span class="dim">{what(d())}</span></span>}>
+                        {(b) => (
+                          <span>
+                            <Show when={linked() && link()?.branch}><span class="cx-branch"><BranchIcon />{link()!.branch}</span>{' '}</Show>
+                            <Sha sha={b().commit_sha} href={commitUrl(b().commit_sha)} />{' '}
+                            <span class="dim">{firstLine(b().commit_message)}</span>
+                          </span>
+                        )}
+                      </Show>
+                    </div>
+                    <div class="cx-kv">
+                      <For each={images(d())} fallback={<div><span class="cap">Images</span><b>defaults</b></div>}>
+                        {([role, tag]) => (
+                          <div><span class="cap">{role}</span><b>{tag}</b></div>
+                        )}
+                      </For>
+                    </div>
+                  </>
+                )}
+              </Show>
+            </FxCell>
           </section>
+
+          <Show when={health().length}>
+            <section class="fx-row cx-strip" style={{ 'grid-template-columns': `repeat(${health().length}, minmax(0, 1fr))` }}>
+              <For each={health()}>
+                {(h) => (
+                  <FxCell label={h.label} meta={<Sq tone={h.tone} />}>
+                    <div class="cx-stat" classList={{ warn: h.tone === 'warn' }}>{h.value}<small>{h.unit}</small></div>
+                  </FxCell>
+                )}
+              </For>
+            </section>
+          </Show>
         </Show>
 
         <Show when={rolling() || pendingBuild()}>
@@ -553,125 +568,127 @@ export function Deployments(props: Ctx) {
 
         <BuildTimeBox project={props.project} />
 
-        <Show when={urls().length}>
-          <section class="fx-row">
-            <div class="fx-cell" ref={urlsCell} style={{ 'scroll-margin-top': '64px' }}>
-              <div class="fx-head">
-                <span class="cap">Domains</span>
-                <span class="fx-meta cap">
-                  <span>{urls().length} {urls().length === 1 ? 'address' : 'addresses'}</span>
-                  <A href="/settings/domains">Add a domain</A>
-                </span>
+        <Show when={ready()} fallback={<DeploymentsListSkeleton />}>
+          <Show when={urls().length}>
+            <section class="fx-row">
+              <div class="fx-cell" ref={urlsCell} style={{ 'scroll-margin-top': '64px' }}>
+                <div class="fx-head">
+                  <span class="cap">Domains</span>
+                  <span class="fx-meta cap">
+                    <span>{urls().length} {urls().length === 1 ? 'address' : 'addresses'}</span>
+                    <A href="/settings/domains">Add a domain</A>
+                  </span>
+                </div>
+                <div class="cx-urls">
+                  <For each={allUrls() ? urls() : urls().slice(0, URL_ROWS)}>
+                    {(u) => (
+                      <div class="cx-url" classList={{ main: u === main() }}>
+                        <a class="cx-url-host" href={u.url} target="_blank" rel="noopener noreferrer">
+                          <span>{u.host}</span>
+                          <Show when={u === main()}><span class="cx-chip live">main</span></Show>
+                        </a>
+                        <span class="cx-url-serves">{u.serves}</span>
+                        <span class="cap cx-url-kind">{u.custom ? 'custom domain' : 'sp00ky url'}</span>
+                        <span class={`cx-st ${u.tone}`}><Sq tone={u.tone} />{u.status}</span>
+                        <span class="cx-url-acts">
+                          <button
+                            class="btn btn-sm"
+                            onClick={() => {
+                              void navigator.clipboard?.writeText(u.url);
+                              toast('ok', 'Copied', u.url);
+                            }}
+                          >
+                            Copy
+                          </button>
+                          <a class="btn btn-sm" href={u.url} target="_blank" rel="noopener noreferrer">Open ↗</a>
+                        </span>
+                      </div>
+                    )}
+                  </For>
+                  <Show when={urls().length > URL_ROWS}>
+                    <button class="cx-showall cap" onClick={() => setAllUrls(!allUrls())}>
+                      {allUrls() ? 'Show fewer' : `Show all ${urls().length}`}
+                    </button>
+                  </Show>
+                </div>
               </div>
-              <div class="cx-urls">
-                <For each={allUrls() ? urls() : urls().slice(0, URL_ROWS)}>
-                  {(u) => (
-                    <div class="cx-url" classList={{ main: u === main() }}>
-                      <a class="cx-url-host" href={u.url} target="_blank" rel="noopener noreferrer">
-                        <span>{u.host}</span>
-                        <Show when={u === main()}><span class="cx-chip live">main</span></Show>
-                      </a>
-                      <span class="cx-url-serves">{u.serves}</span>
-                      <span class="cap cx-url-kind">{u.custom ? 'custom domain' : 'sp00ky url'}</span>
-                      <span class={`cx-st ${u.tone}`}><Sq tone={u.tone} />{u.status}</span>
-                      <span class="cx-url-acts">
-                        <button
-                          class="btn btn-sm"
-                          onClick={() => {
-                            void navigator.clipboard?.writeText(u.url);
-                            toast('ok', 'Copied', u.url);
-                          }}
-                        >
-                          Copy
-                        </button>
-                        <a class="btn btn-sm" href={u.url} target="_blank" rel="noopener noreferrer">Open ↗</a>
-                      </span>
-                    </div>
-                  )}
+            </section>
+          </Show>
+
+          <section class="fx-row">
+            <FxCell label="History" meta={<span>{list().length} {list().length === 1 ? 'version' : 'versions'}</span>}>
+              <div class="cx-deps">
+                <For
+                  each={allHistory() ? list() : list().slice(0, HISTORY_ROWS)}
+                  fallback={<div class="cx-dep-empty dim">No deployments yet</div>}
+                >
+                  {(d) => {
+                    const s = state(d);
+                    const who = d.actor ?? d.build?.commit_author;
+                    return (
+                      <div class="cx-dep" classList={{ live: d.live, run: s.tone === 'run', failed: s.tone === 'bad' }}>
+                        <div class="cx-dep-v">
+                          <b>v{d.version ?? '?'}</b>
+                          <span class="cap">{origin(d)}</span>
+                        </div>
+                        <div class="cx-dep-st">
+                          <span class={`cx-st ${s.tone}`}><Sq tone={s.tone} />{s.label}</span>
+                          <span class="cap">{took(d)}</span>
+                        </div>
+                        <div class="cx-dep-what" title={d.error ?? undefined}>
+                          <span class="t">{what(d)}</span>
+                          <span class="m">
+                            <Show when={d.build}>
+                              {(b) => (
+                                <>
+                                  <Show when={linked() && link()?.branch}><span class="cx-branch"><BranchIcon />{link()!.branch}</span></Show>
+                                  <Sha sha={b().commit_sha} href={commitUrl(b().commit_sha)} />
+                                </>
+                              )}
+                            </Show>
+                            <Show
+                              when={d.error}
+                              fallback={
+                                <Show when={!d.build}>
+                                  <span>{images(d).map(([k, v]) => `${k} ${v}`).join(' · ') || 'default images'}</span>
+                                </Show>
+                              }
+                            >
+                              <span class="warn">{d.error}</span>
+                            </Show>
+                          </span>
+                        </div>
+                        <div class="cx-dep-when">
+                          <span title={formatStamp(d.created_at)}>{ago(d.created_at)}</span>
+                          <span class="cx-who-by">{who ? `by ${who}` : ''}</span>
+                        </div>
+                        <div class="cx-dep-act">
+                          <Show when={d.live}><span class="cx-chip live">current</span></Show>
+                          <Show when={canRollBack(d)}>
+                            <button
+                              class="btn btn-sm cx-rb"
+                              classList={{ pin: rollbackTarget() === d }}
+                              disabled={busy()}
+                              title={busy() ? 'A deploy is in progress' : `Bring back the apps of v${d.version}`}
+                              onClick={() => void rollback(d)}
+                            >
+                              Roll back
+                            </button>
+                          </Show>
+                        </div>
+                      </div>
+                    );
+                  }}
                 </For>
-                <Show when={urls().length > URL_ROWS}>
-                  <button class="cx-showall cap" onClick={() => setAllUrls(!allUrls())}>
-                    {allUrls() ? 'Show fewer' : `Show all ${urls().length}`}
+                <Show when={list().length > HISTORY_ROWS}>
+                  <button class="cx-showall cap" onClick={() => setAllHistory(!allHistory())}>
+                    {allHistory() ? 'Show fewer' : `Show all ${list().length}`}
                   </button>
                 </Show>
               </div>
-            </div>
+            </FxCell>
           </section>
         </Show>
-
-        <section class="fx-row">
-          <FxCell label="History" meta={<span>{list().length} {list().length === 1 ? 'version' : 'versions'}</span>}>
-            <div class="cx-deps">
-              <For
-                each={allHistory() ? list() : list().slice(0, HISTORY_ROWS)}
-                fallback={<div class="cx-dep-empty dim">{data.loading ? 'Loading' : 'No deployments yet'}</div>}
-              >
-                {(d) => {
-                  const s = state(d);
-                  const who = d.actor ?? d.build?.commit_author;
-                  return (
-                    <div class="cx-dep" classList={{ live: d.live, run: s.tone === 'run', failed: s.tone === 'bad' }}>
-                      <div class="cx-dep-v">
-                        <b>v{d.version ?? '?'}</b>
-                        <span class="cap">{origin(d)}</span>
-                      </div>
-                      <div class="cx-dep-st">
-                        <span class={`cx-st ${s.tone}`}><Sq tone={s.tone} />{s.label}</span>
-                        <span class="cap">{took(d)}</span>
-                      </div>
-                      <div class="cx-dep-what" title={d.error ?? undefined}>
-                        <span class="t">{what(d)}</span>
-                        <span class="m">
-                          <Show when={d.build}>
-                            {(b) => (
-                              <>
-                                <Show when={linked() && link()?.branch}><span class="cx-branch"><BranchIcon />{link()!.branch}</span></Show>
-                                <Sha sha={b().commit_sha} href={commitUrl(b().commit_sha)} />
-                              </>
-                            )}
-                          </Show>
-                          <Show
-                            when={d.error}
-                            fallback={
-                              <Show when={!d.build}>
-                                <span>{images(d).map(([k, v]) => `${k} ${v}`).join(' · ') || 'default images'}</span>
-                              </Show>
-                            }
-                          >
-                            <span class="warn">{d.error}</span>
-                          </Show>
-                        </span>
-                      </div>
-                      <div class="cx-dep-when">
-                        <span title={formatStamp(d.created_at)}>{ago(d.created_at)}</span>
-                        <span class="cx-who-by">{who ? `by ${who}` : ''}</span>
-                      </div>
-                      <div class="cx-dep-act">
-                        <Show when={d.live}><span class="cx-chip live">current</span></Show>
-                        <Show when={canRollBack(d)}>
-                          <button
-                            class="btn btn-sm cx-rb"
-                            classList={{ pin: rollbackTarget() === d }}
-                            disabled={busy()}
-                            title={busy() ? 'A deploy is in progress' : `Bring back the apps of v${d.version}`}
-                            onClick={() => void rollback(d)}
-                          >
-                            Roll back
-                          </button>
-                        </Show>
-                      </div>
-                    </div>
-                  );
-                }}
-              </For>
-              <Show when={list().length > HISTORY_ROWS}>
-                <button class="cx-showall cap" onClick={() => setAllHistory(!allHistory())}>
-                  {allHistory() ? 'Show fewer' : `Show all ${list().length}`}
-                </button>
-              </Show>
-            </div>
-          </FxCell>
-        </section>
         <Show when={cx?.limited()}>
           <section class="fx-row"><FxCell><p class="cx-note">This project's live dashboard is not available; restarts here go through Sp00ky Cloud.</p></FxCell></section>
         </Show>
@@ -992,7 +1009,7 @@ function EnvTab(props: Ctx) {
   };
 
   return (
-    <>
+    <Show when={settled(rows)} fallback={<SettingsEnvSkeleton />}>
       <section class="fx-row">
         <FxCell>
           <Show
@@ -1018,7 +1035,7 @@ function EnvTab(props: Ctx) {
           <table class="fx-list cx-env">
             <thead><tr><th class="cap">Name</th><th class="cap">Development</th><th class="cap">Production</th><th class="cap">Updated</th><th class="cap" /></tr></thead>
             <tbody>
-              <For each={rows() ?? []} fallback={<tr><td colspan="5" class="dim">{rows.loading ? 'Loading' : rows.error ? message(rows.error) : 'No variables yet'}</td></tr>}>
+              <For each={rows() ?? []} fallback={<tr><td colspan="5" class="dim">{rows.error ? message(rows.error) : 'No variables yet'}</td></tr>}>
                 {(r) => (
                   <tr>
                     <td class="cx-env-name"><b>{r.name}</b></td>
@@ -1052,7 +1069,7 @@ function EnvTab(props: Ctx) {
           </form>
         </FxCell>
       </section>
-    </>
+    </Show>
   );
 }
 
@@ -1088,13 +1105,13 @@ function DomainsTab(props: Ctx) {
     if (ok && (await act('Removing ' + d.domain, () => cloud(`/projects/${pid(props.project)}/domains/${encodeURIComponent(d.id)}`, { method: 'DELETE', tenant })))) void refetch();
   };
   return (
-    <>
+    <Show when={settled(rows)} fallback={<SettingsDomainsSkeleton />}>
       <section class="fx-row">
         <FxCell label="Custom domains">
           <table class="fx-list cx-domains">
             <thead><tr><th class="cap">Domain</th><th class="cap">Serves</th><th class="cap">Status</th><th class="cap">DNS</th><th class="cap" /></tr></thead>
             <tbody>
-              <For each={rows() ?? []} fallback={<tr><td colspan="5" class="dim">{rows.loading ? 'Loading' : rows.error ? message(rows.error) : 'No custom domains'}</td></tr>}>
+              <For each={rows() ?? []} fallback={<tr><td colspan="5" class="dim">{rows.error ? message(rows.error) : 'No custom domains'}</td></tr>}>
                 {(d) => (
                   <tr>
                     <td><b>{d.domain}</b></td>
@@ -1122,7 +1139,7 @@ function DomainsTab(props: Ctx) {
           </form>
         </FxCell>
       </section>
-    </>
+    </Show>
   );
 }
 
@@ -1182,8 +1199,9 @@ function GitTab(props: Ctx) {
           </FxCell>
         </section>
       </Match>
-      <Match when={!link()}>
-        <section class="fx-row"><FxCell label="Repository"><p class="cx-note">Loading</p></FxCell></section>
+      {/* A linked project waits for its builds too, so the table does not read "No builds yet". */}
+      <Match when={!link() || (linked() && !settled(runs))}>
+        <SettingsGitSkeleton />
       </Match>
       <Match when={!linked() || editing()}>
         <LinkEditor {...props} link={link()!} onSaved={saved} onCancel={linked() ? () => setEditing(false) : undefined} onUnlink={linked() ? () => void unlink() : undefined} />
@@ -1430,6 +1448,21 @@ function LinkEditor(props: Ctx & { link: Link; onSaved: () => void; onCancel?: (
 /* ---------- scale ---------- */
 
 function ScaleTab(props: Ctx) {
+  const cx = useConsoleChrome();
+  const overview = useOverview();
+  // The count starts at what runs now, so the form waits for the overview; a
+  // dashboard that cannot open never sends one, and a slow one gets 5 s.
+  const [waited, setWaited] = createSignal(false);
+  const timer = setTimeout(() => setWaited(true), 5000);
+  onCleanup(() => clearTimeout(timer));
+  return (
+    <Show when={overview() || cx?.limited() || waited()} fallback={<SettingsScaleSkeleton />}>
+      <ScaleForm {...props} />
+    </Show>
+  );
+}
+
+function ScaleForm(props: Ctx) {
   const tenant = props.workspace.id;
   const overview = useOverview();
   const [count, setCount] = createSignal(overview()?.totals.ssps ?? 1);
@@ -1640,13 +1673,13 @@ function DatabaseTab(props: Ctx) {
     <Show
       when={status()}
       fallback={
-        <section class="fx-row">
-          <FxCell label="Version">
-            <Show when={data.error} fallback={<div class="fx-empty cap">Loading</div>}>
+        <Show when={data.error} fallback={<SettingsDatabaseSkeleton />}>
+          <section class="fx-row">
+            <FxCell label="Version">
               <p class="cx-reason bad">{message(data.error)}</p>
-            </Show>
-          </FxCell>
-        </section>
+            </FxCell>
+          </section>
+        </Show>
       }
     >
       {(s) => (

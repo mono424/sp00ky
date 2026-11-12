@@ -7,6 +7,7 @@ import { FilterMenu, FxCell, Sq, type FilterValue } from '../components/Frame';
 import { decodeParam, formatBytes, formatCount, formatDuration, formatRelativeTime } from '../lib/format';
 import { readStash, writeStash } from '../lib/stash';
 import { liveIncidentsView, useLiveView } from '../api/liveStack';
+import { IncidentDetailSkeleton, IncidentsSkeleton } from '../skeletons/Incidents';
 
 interface IncidentEvent {
   at: number;
@@ -248,7 +249,7 @@ export function Incidents() {
       {(error) => <section class="fx-row"><div class="fx-cell"><div class="fx-log bad" role="alert"><span class="fx-what">{error()}</span></div></div></section>}
     </Show>
 
-    <Show when={poll.data()} fallback={<Show when={!poll.error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+    <Show when={poll.data()} fallback={<Show when={!poll.error()}><IncidentsSkeleton /></Show>}>
       <div class="fx-page">
         {/* when and where, and how it is going */}
         <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 2fr) minmax(0, 1fr)' }}>
@@ -370,7 +371,7 @@ export function IncidentDetail() {
       {(error) => <section class="fx-row"><div class="fx-cell"><div class="fx-log bad" role="alert"><span class="fx-what">{error()}</span></div></div></section>}
     </Show>
 
-    <Show when={poll.data()?.incident} fallback={<Show when={!poll.error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+    <Show when={poll.data()?.incident} fallback={<Show when={!poll.error()}><IncidentDetailSkeleton /></Show>}>
       {(incident) => {
         const ended = () => incident().ended_at != null;
         return <div class="fx-page">

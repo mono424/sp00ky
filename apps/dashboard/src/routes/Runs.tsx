@@ -2,6 +2,7 @@ import { For, Index, Show, createEffect, createMemo, createResource, createSigna
 import { Navigate, useLocation, useNavigate, useParams, useSearchParams } from '@solidjs/router';
 import { api, openStream, streamsAvailable } from '../api/client';
 import { PageHead } from '../components/Chrome';
+import { RunsSkeleton, SchedulesSkeleton, WorkflowsSkeleton } from '../skeletons/Runs';
 import { runAction, post } from '../components/Actions';
 import { Barcode, FilterMenu, FxCell, Sheet, SheetSection, Slots, Sq, type FilterValue } from '../components/Frame';
 import { describeCron } from '../lib/cron';
@@ -195,7 +196,8 @@ function fallbackJobs(setPage: (p: JobsListResponse) => void, setError: (e: stri
 }
 
 function useWorkflowRuns() {
-  const [polled, setRuns] = createSignal<WorkflowRun[]>([]);
+  // Null until the first answer: an empty list and "not loaded yet" differ.
+  const [polled, setRuns] = createSignal<WorkflowRun[] | null>(null);
   const load = async () => {
     const r = await api.getResult<{ runs: WorkflowRun[] }>('/workflows/runs?limit=100');
     if (r.ok) setRuns(r.value.runs);
@@ -205,8 +207,9 @@ function useWorkflowRuns() {
     if (live()) return;
     fallbackRuns(setRuns, load);
   });
-  const runs = () => live()?.() ?? polled();
-  return { runs, refresh: load };
+  const runs = () => live()?.() ?? polled() ?? [];
+  const ready = () => live()?.() != null || polled() != null;
+  return { runs, ready, refresh: load };
 }
 
 function fallbackRuns(setRuns: (r: WorkflowRun[]) => void, load: () => Promise<void>) {
@@ -371,6 +374,8 @@ export function Runs(props: { view: RunsView }) {
   const opened = () => params.open ?? '';
 
   const count = (f: (i: Item) => boolean) => items().filter(f).length;
+  /** Whether this page's own data has answered once. */
+  const loaded = () => (view === 'schedules' ? scheduleRes() !== undefined : view === 'workflows' ? wf.ready() : !!jobs.page());
 
   return (
     <>
@@ -388,6 +393,7 @@ export function Runs(props: { view: RunsView }) {
         <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{jobs.error()}</span></div></FxCell></section>
       </Show>
 
+      <Show when={loaded()} fallback={view === 'schedules' ? <SchedulesSkeleton /> : view === 'workflows' ? <WorkflowsSkeleton /> : <RunsSkeleton />}>
       <div class="fx-page">
         {/* the numbers ======================================================= */}
         <Show when={view === 'runs'}>
@@ -571,6 +577,7 @@ export function Runs(props: { view: RunsView }) {
           </section>
         </Show>
       </div>
+      </Show>
 
       {/* one thing, in a sheet that lives in the URL */}
       <Show when={opened().startsWith('run:')}>

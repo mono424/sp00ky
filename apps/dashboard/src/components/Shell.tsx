@@ -3,6 +3,7 @@ import { A, useLocation, useNavigate, useResolvedPath } from '@solidjs/router';
 import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
+import { pageSkeleton, type PageSkeletonSpec } from '../skeletons';
 import type { LoginResponse, Overview } from '../api/types';
 import { GEAR, MobileHeadSlot, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
 
@@ -645,7 +646,7 @@ export function Shell(props: {
  * when there is one. Every loading state draws this, so nothing around the
  * page moves when it arrives.
  */
-export function PageSkeleton(props: { head?: JSX.Element }) {
+export function PageSkeleton(props: { head?: JSX.Element; title?: string; body?: () => JSX.Element }) {
   return (
     <>
       {props.head ?? (
@@ -653,10 +654,21 @@ export function PageSkeleton(props: { head?: JSX.Element }) {
           <div class="ph-crumb cap">
             <span class="sk sk-cap" style={{ width: '84px' }} />
             <span class="ph-sep">/</span>
-            <span class="sk sk-cap" style={{ width: '64px' }} />
+            <Show when={props.title} fallback={<span class="sk sk-cap" style={{ width: '64px' }} />}>
+              <h1 class="ph-title">{props.title}</h1>
+            </Show>
           </div>
         </div>
       )}
+      {/* The page's own skeleton when it has one, the generic frame when not. */}
+      <Show when={props.body} fallback={<GenericBody />}>{(b) => b()()}</Show>
+    </>
+  );
+}
+
+function GenericBody() {
+  return (
+    <>
       <div class="fx-page sk-page" aria-busy="true" aria-label="Loading">
         <section class="fx-row sk-tiles">
           <For each={[0, 1, 2, 3]}>
@@ -694,8 +706,13 @@ export function FrameSkeleton(props: { console?: boolean }) {
   const workspace = props.console && seg.length > 0 && (seg.length === 1 || seg[1] === '-');
   const links = (): NavLink[] =>
     workspace ? WORKSPACE_LINKS : projectNav(!!props.console).filter((l) => l.group !== 'Settings');
+  // The page the address names: under `/{ws}/{project}/` or `/{ws}/-/` in the
+  // console, under `/admin/` on a scheduler.
+  const page = props.console
+    ? pageSkeleton(seg.slice(2).join('/'), !!workspace)
+    : pageSkeleton(seg[0] === 'admin' ? seg.slice(1).join('/') : seg.join('/'));
   return (
-    <Show when={props.console} fallback={<AdminFrameSkeleton links={links()} />}>
+    <Show when={props.console} fallback={<AdminFrameSkeleton links={links()} page={page} />}>
       {/* The console's rail as it will paint: same classes, icons, folds and width. */}
       <div class="shell settled" classList={{ 'rail-min': railMin() }}>
         <header class="mobile-bar">
@@ -754,7 +771,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
         </nav>
         <div class="main-frame">
           <main class="main">
-            <PageSkeleton />
+            <PageSkeleton title={page.title} body={page.body} />
           </main>
         </div>
       </div>
@@ -763,7 +780,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
 }
 
 /** The scheduler-hosted /admin frame while it loads. */
-function AdminFrameSkeleton(props: { links: NavLink[] }) {
+function AdminFrameSkeleton(props: { links: NavLink[]; page: PageSkeletonSpec }) {
   return (
     <div class="shell settled">
       <header class="mobile-bar">
@@ -805,7 +822,7 @@ function AdminFrameSkeleton(props: { links: NavLink[] }) {
       </nav>
       <div class="main-frame">
         <main class="main">
-          <PageSkeleton />
+          <PageSkeleton title={props.page.title} body={props.page.body} />
         </main>
       </div>
     </div>

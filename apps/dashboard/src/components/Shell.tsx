@@ -321,7 +321,7 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
               <path d="M10.5 3.5a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M20.5 20.5l-5-5" />
             </svg>
           </button>
-          <button class="rail-tool rail-min-btn" onClick={() => setRailMin(!railMin())} title={railMin() ? 'Expand sidebar' : 'Collapse sidebar'} aria-label={railMin() ? 'Expand sidebar' : 'Collapse sidebar'}>
+          <button class="rail-tool rail-min-btn" onClick={() => setRailMin(!railMin())} title={railMin() ? 'Expand sidebar (⌘B)' : 'Collapse sidebar (⌘B)'} aria-label={railMin() ? 'Expand sidebar' : 'Collapse sidebar'}>
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
               <rect x="3" y="4" width="18" height="16" rx="3" />
               <path d="M9.5 4v16" />
@@ -501,6 +501,13 @@ export function Shell(props: {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault();
       setPaletteOpen(!paletteOpen());
+    }
+    // ⌘B folds the console rail to its icons, except while typing (an editor may want it).
+    if (cx && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b') {
+      const t = e.target;
+      if (t instanceof Element && t.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"], .cm-editor')) return;
+      e.preventDefault();
+      setRailMin(!railMin());
     }
   };
   window.addEventListener('keydown', onKey);

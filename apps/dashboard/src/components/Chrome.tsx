@@ -62,6 +62,7 @@ function PhoneHead(props: { crumb?: string; crumbHref?: string; title: string; a
         </Show>
         <h1>{props.title}</h1>
       </div>
+      <span class="mh-proj"><ProjectSwitcher /></span>
       <Show when={props.actions}>
         <div class="mh-more" ref={wrap}>
           <button class="mh-btn" classList={{ on: open() }} aria-label="Page actions" aria-haspopup="menu" aria-expanded={open()} onClick={() => setOpen(!open())}>
@@ -72,7 +73,6 @@ function PhoneHead(props: { crumb?: string; crumbHref?: string; title: string; a
           <div class="mh-panel" classList={{ open: open() }} role="menu">{props.actions}</div>
         </div>
       </Show>
-      <span class="mh-proj"><ProjectSwitcher /></span>
     </div>
   );
 }

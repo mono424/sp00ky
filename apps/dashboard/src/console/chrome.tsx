@@ -29,6 +29,26 @@ export interface ConsoleChrome {
 const Ctx = createContext<ConsoleChrome | undefined>(undefined);
 export const ConsoleChromeProvider = Ctx.Provider;
 
+/**
+ * Where a page's head goes on a phone: the console's top bar. Shell sets it;
+ * PageHead portals into it. Undefined outside the console.
+ */
+const MobileHeadCtx = createContext<Accessor<HTMLElement | undefined>>(() => undefined);
+export const MobileHeadSlot = MobileHeadCtx.Provider;
+export function useMobileHeadSlot(): Accessor<HTMLElement | undefined> {
+  return useContext(MobileHeadCtx);
+}
+
+/** A media query as a signal. */
+export function useMedia(query: string): Accessor<boolean> {
+  const mq = window.matchMedia(query);
+  const [on, setOn] = createSignal(mq.matches);
+  const onChange = (e: MediaQueryListEvent) => setOn(e.matches);
+  mq.addEventListener('change', onChange);
+  onCleanup(() => mq.removeEventListener('change', onChange));
+  return on;
+}
+
 /** The console's chrome, or undefined outside the console. */
 export function useConsoleChrome(): ConsoleChrome | undefined {
   return useContext(Ctx);

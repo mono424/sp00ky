@@ -4,7 +4,7 @@ import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
 import type { LoginResponse, Overview } from '../api/types';
-import { GEAR, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
+import { GEAR, MobileHeadSlot, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
 
 export interface NavLink {
   href: string;
@@ -412,6 +412,8 @@ export function Shell(props: {
   // In the console the workspace menu (the rail's foot) holds the account,
   // and Deployments and Settings join the rail; elsewhere this is undefined.
   const cx = useConsoleChrome();
+  // On a phone the page's head lives in the top bar (see PageHead).
+  const [headSlot, setHeadSlot] = createSignal<HTMLElement>();
 
   // Pages only a scheduler can fill: an SSP serving the API alone has no
   // presence sampler, incident log, log ring or backups.
@@ -528,6 +530,9 @@ export function Shell(props: {
           <span />
         </button>
         <Logo />
+        <Show when={cx}>
+          <div class="mb-slot" ref={setHeadSlot} />
+        </Show>
       </header>
 
       <Show when={open()}>
@@ -613,7 +618,7 @@ export function Shell(props: {
 
       <div class="main-frame">
         <main class="main" classList={{ scrolled: scrolled() }} onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 0)}>
-          {props.children}
+          <MobileHeadSlot value={headSlot}>{props.children}</MobileHeadSlot>
           <Show when={props.session.mode === 'breakglass'}>
             <div class="page-body">
               <div class="banner" style={{ 'margin-top': '16px' }}>

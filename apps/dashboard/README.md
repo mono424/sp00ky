@@ -16,12 +16,14 @@ Full documentation: [Admin dashboard](https://sp00ky.dev/docs/reference/admin-da
 - **Views** — every registered live query, filterable and sortable, with a
   detail page carrying its SurrealQL, params, subscribers, materialization
   percentiles and SSP memory footprint
-- **Workflows** — runs updating live over SSE, each carrying its own failure
-  reason; per-step detail expands to the step's cause and its job's whole attempt
-  history; cancel / retry-from-failed / rerun
 - **Schedules** — definitions with next and last fire, why each recent fire ended
   as it did, a callout naming the run whose key is suppressing fires,
   pause/resume and run-now
+- **Workflows** — runs updating live over SSE, each carrying its own failure
+  reason; per-step detail expands to the step's cause and its job's whole attempt
+  history; cancel / retry-from-failed / rerun
+- **Runs** — jobs of their own with running / waiting / done / failed figures,
+  kill and retry, and each queue's pace against its concurrency
 - **Backups** — catalog, schedule and retention (from Sp00ky Cloud when linked),
   create, and a staged restore
 - **Logs** — live tail of scheduler or SSP output
@@ -58,6 +60,16 @@ pnpm --filter @spooky-sync/dashboard dev     # http://localhost:4300
 The dev server is not served by a scheduler, so the app comes up in
 **standalone** mode: the sign-in form shows an endpoint field. Point it at a
 running scheduler's admin port (`http://localhost:9668`).
+
+The console with hot reload, on fixture data:
+
+```bash
+node apps/dashboard/screenshots/console.mjs              # fixtures on :4320
+pnpm --filter @spooky-sync/dashboard dev:console         # http://localhost:4400
+```
+
+The console dev server proxies `/v1`, `/fx` and `/cf` to the fixtures;
+`CONSOLE_API=<url>` points it at another backend.
 
 To run it the way it actually ships:
 

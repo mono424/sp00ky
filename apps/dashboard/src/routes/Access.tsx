@@ -5,6 +5,7 @@ import { FilterMenu, FxCell, Sq, type FilterValue } from '../components/Frame';
 import { toast } from '../components/Actions';
 import { formatStamp } from '../lib/format';
 import type { McpTool, MeResponse, SessionScope, TokenResponse } from '../api/types';
+import { AccessToolsSkeleton } from '../skeletons/Access';
 
 /**
  * MCP access: mint a token an AI agent can use against this scheduler's own
@@ -373,7 +374,7 @@ export function Access() {
                 <button class="btn btn-sm" onClick={() => void refetchTools()}>Refresh</button>
               </div>
             </div>
-            <Show when={tools()} fallback={<div class="fx-empty cap">Loading…</div>}>
+            <Show when={tools()} fallback={<AccessToolsSkeleton />}>
               {(t) => (
                 <Show when={t().ok} fallback={<div class="fx-log bad"><span class="fx-what">{(t() as { ok: false; message: string }).message}</span></div>}>
                   <Show when={shown()} fallback={<div class="fx-empty cap">No tool matches</div>}>

@@ -5262,21 +5262,6 @@ span.cx-me { pointer-events: none; }
 
 @media (max-width: 860px) {
   .sidebar.cx-rail { width: 280px; overflow: hidden; }
-  .mb-ctx {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    max-width: 55vw;
-    height: 30px;
-    margin-left: auto;
-    padding: 0 10px;
-    border: 1px solid var(--line);
-    background: none;
-    color: var(--ink);
-  }
-  .mb-ctx b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 500 12.5px var(--mono); }
-  .mb-ctx .cx-av { width: 18px; height: 18px; font-size: 8.5px; }
 }
 
 
@@ -6595,3 +6580,622 @@ a.bt-box:hover .bt-go { color: var(--accent-strong) !important; }
 .dx-pass .btn { height: 32px; }
 .dx-addfield .btn { height: 28px; }
 
+
+/* ======================================================================
+   CONSOLE RAIL, SOFT: sans labels, solid icons, a rounded pill for where
+   you are, folding group headings and an icon-only width. Scoped to
+   `.cx-rail`, so the scheduler-hosted /admin keeps its own rail.
+   ====================================================================== */
+.cx-rail {
+  --rail-bg: #161616;
+  --rail-ink: #e6e6e6;
+  --rail-dim: #b4b4b4;
+  --rail-icon: #8f8f8f;
+  --rail-head: #6f6f6f;
+  --rail-hover: rgba(255, 255, 255, 0.045);
+  --rail-on: #232323;
+  --rail-on-line: rgba(255, 255, 255, 0.075);
+  --rail-r: 10px;
+  background: var(--rail-bg);
+  font-family: var(--sans);
+}
+@media (min-width: 861px) { .shell:has(.cx-rail) { grid-template-columns: 248px minmax(0, 1fr); } }
+
+/* head: the wordmark, then search and the width toggle */
+.cx-rail .cx-brand { height: 56px; padding: 0 10px 0 18px; gap: 8px; border-bottom: 0; color: var(--rail-ink); }
+.cx-rail .cx-brand .brand-logo svg { height: 17px; width: auto; }
+.rail-tools { display: inline-flex; gap: 2px; margin-left: auto; }
+.rail-tool {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--rail-icon);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.rail-tool:hover { background: var(--rail-hover); color: var(--rail-ink); }
+
+/* the project switcher and the account: rounded, borderless until hovered */
+.cx-rail .cx-rail-head { padding-top: 2px; }
+.cx-rail .cx-rail-head .cx-proj-wrap.in-rail { padding: 0 8px; }
+.cx-rail .cx-prow,
+.cx-rail .cx-me {
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--rail-r);
+  background: none;
+  transition: background 0.12s, border-color 0.12s;
+}
+.cx-rail .cx-prow:hover, .cx-rail .cx-prow.on,
+.cx-rail .cx-me:hover, .cx-rail .cx-me.on { border-color: var(--rail-on-line); background: var(--rail-on); }
+.cx-rail .cx-prow b { font: 550 14px var(--sans); color: var(--rail-ink); letter-spacing: -0.005em; }
+.cx-rail .cx-wsw-text b { font: 550 14px var(--sans); color: var(--rail-ink); }
+.cx-rail .cx-prow-text small,
+.cx-rail .cx-wsw-text small { font: 12px var(--sans); color: var(--rail-head); }
+.cx-rail .cx-prow .fx-sq { width: 9px; height: 9px; border-radius: 3px; margin: 0 4px 0 3px; }
+.cx-rail .cx-uav, .cx-rail .cx-face-ws { border-radius: 7px; }
+.cx-rail .cx-face-ws { border-radius: 5px; }
+
+/* way back to the workspace */
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pin { border-bottom: 0; padding: 0 8px 2px; }
+.cx-rail .cx-back {
+  height: 28px;
+  margin: 2px 0 0;
+  padding: 0 10px;
+  gap: 8px;
+  border-radius: 8px;
+  font: 500 13px var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--rail-head);
+}
+.cx-rail .cx-back:hover { background: var(--rail-hover); color: var(--rail-ink); }
+
+/* the list */
+.cx-rail .nav { padding: 6px 8px 14px; gap: 0; }
+.cx-rail .nav-section { gap: 2px; }
+.cx-rail .nav-section + .nav-section { margin-top: 22px; }
+.cx-rail .cx-quick { padding-top: 6px; }
+.cx-rail .nav-link {
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--rail-r);
+  font: 450 14.5px var(--sans);
+  letter-spacing: -0.005em;
+  color: var(--rail-dim);
+}
+.cx-rail .nav-link > .row { gap: 13px !important; min-width: 0; }
+.cx-rail .nav-link svg { color: var(--rail-icon); transition: color 0.12s; }
+.cx-rail .nav-link:hover { background: var(--rail-hover); color: var(--rail-ink); }
+.cx-rail .nav-link:hover svg { color: #b8b8b8; }
+.cx-rail .nav-link.active {
+  background: var(--rail-on);
+  border-color: var(--rail-on-line);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03), 0 1px 2px rgba(0, 0, 0, 0.35);
+  color: var(--rail-ink);
+}
+.cx-rail .nav-link.active svg { color: #d9d9d9; }
+.cx-rail .nav-link.active::before { display: none; }
+.cx-rail .nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cx-rail .nav-count { font: 500 12px var(--sans); font-variant-numeric: tabular-nums; color: var(--rail-head); }
+.cx-rail .nav-link.active .nav-count { color: var(--rail-dim); }
+
+/* group headings fold their group */
+.rail-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 26px;
+  margin-bottom: 2px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  font: 500 12.5px var(--sans);
+  color: var(--rail-head);
+  text-align: left;
+  cursor: pointer;
+}
+.rail-head:hover { color: var(--rail-dim); }
+.rail-tri { flex: none; opacity: 0.85; }
+.rail-head-n { margin-left: auto; font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* a workspace's projects */
+.cx-rail .cx-pl { color: var(--rail-dim); font-weight: 450; }
+.cx-rail .cx-pl-name { font: 450 14.5px var(--sans); }
+.rail-sq { display: grid; place-items: center; flex: none; width: 16px; height: 16px; }
+.cx-rail .rail-sq .fx-sq { width: 9px; height: 9px; border-radius: 3px; }
+
+/* foot */
+.cx-rail .sb-foot.cx-foot { padding: 8px 8px 10px; border-top: 0; }
+.cx-rail .sb-ver { padding: 6px 11px 0; font: 11.5px var(--sans); color: var(--ink-ghost); letter-spacing: 0; text-transform: none; }
+
+/* ---- icon-only width ---- */
+@media (min-width: 861px) {
+  .shell.rail-min:has(.cx-rail) { grid-template-columns: 64px minmax(0, 1fr); }
+  .rail-min .cx-rail .cx-brand { flex-direction: column; height: auto; padding: 14px 0 8px; gap: 6px; }
+  .rail-min .cx-rail .cx-brand > .brand-logo { display: none; }
+  .rail-min .cx-rail .rail-tools { flex-direction: column; margin: 0; }
+  .rail-min .cx-rail .rail-min-btn { order: -1; }
+  .rail-min .cx-rail .cx-rail-head .cx-proj-wrap.in-rail,
+  .rail-min :is(.cx-rail, .ph-crumb, .mh-proj) .cx-pin,
+  .rail-min .cx-rail .nav,
+  .rail-min .cx-rail .sb-foot.cx-foot { padding-left: 10px; padding-right: 10px; }
+  .rail-min .cx-rail .cx-prow,
+  .rail-min .cx-rail .cx-me { justify-content: center; padding: 8px 0; }
+  .rail-min .cx-rail .cx-prow-text,
+  .rail-min .cx-rail .cx-prow > svg:last-child,
+  .rail-min .cx-rail .cx-me .cx-wsw-text,
+  .rail-min .cx-rail .cx-me > svg,
+  .rail-min .cx-rail .cx-back span,
+  .rail-min .cx-rail .nav-label,
+  .rail-min .cx-rail .nav-count,
+  .rail-min .cx-rail .cx-pl-r,
+  .rail-min .cx-rail .rail-head,
+  .rail-min .cx-rail .sb-ver { display: none; }
+  .rail-min .cx-rail .cx-prow .fx-sq { margin: 0; }
+  .rail-min .cx-rail .cx-back { justify-content: center; padding: 0; }
+  .rail-min .cx-rail .nav-link { justify-content: center; padding: 0; }
+  .rail-min .cx-rail .nav-section + .nav-section { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line-soft); }
+}
+@media (max-width: 860px) {
+  .rail-min-btn { display: none; }
+}
+
+/* The frame is square everywhere (`* { border-radius: 0 !important }`); the soft rail opts out. */
+.cx-rail .nav-link,
+.cx-rail .cx-prow,
+.cx-rail .cx-me { border-radius: var(--rail-r) !important; }
+.cx-rail .rail-tool,
+.cx-rail .rail-head,
+.cx-rail .cx-back,
+.cx-rail .cx-uav { border-radius: 8px !important; }
+.cx-rail .fx-sq { border-radius: 3px !important; }
+.cx-rail .cx-face-ws { border-radius: 5px !important; }
+
+/* foot: the list fades out above it instead of being cut mid-line */
+.cx-rail .nav {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 56px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 56px), transparent);
+}
+.cx-rail .sb-foot.cx-foot { position: relative; padding: 4px 8px 10px; background: var(--rail-bg); }
+.cx-rail .cx-me { gap: 11px; padding: 6px 8px; }
+.cx-rail .cx-face { --face: 30px; --badge: 14px; --hang: 3px; --cut: calc(var(--badge) - var(--hang) + 3px); }
+.cx-rail .cx-face > .cx-uav {
+  border: 0;
+  -webkit-mask-image: radial-gradient(circle at calc(100% - var(--badge) / 2 + var(--hang)) calc(100% - var(--badge) / 2 + var(--hang)), transparent calc(var(--badge) / 2 + 2px), #000 calc(var(--badge) / 2 + 2.5px));
+  mask-image: radial-gradient(circle at calc(100% - var(--badge) / 2 + var(--hang)) calc(100% - var(--badge) / 2 + var(--hang)), transparent calc(var(--badge) / 2 + 2px), #000 calc(var(--badge) / 2 + 2.5px));
+  -webkit-mask-size: auto;
+  mask-size: auto;
+  -webkit-mask-composite: source-over;
+  mask-composite: add;
+}
+.cx-rail .cx-face-ws {
+  border: 0;
+  background: #2a2d3d;
+  font: 650 8px/1 var(--sans);
+  color: var(--accent-strong);
+}
+.cx-rail .cx-face > .cx-uav,
+.cx-rail .cx-face-ws { border-radius: 50% !important; }
+.cx-rail .cx-me .cx-wsw-text { gap: 1px; }
+.cx-rail .cx-me .cx-wsw-text b { font-size: 13.5px; }
+.cx-rail .cx-me > svg { width: 13px; height: 13px; }
+.cx-rail .sb-ver { padding: 4px 10px 0; font-size: 11px; }
+
+/* ---- the rail's popovers (account + workspaces, project switcher), soft ---- */
+.cx-rail .cx-menu.cx-who-menu,
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop {
+  padding: 6px;
+  background: #1a1a1a;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px !important;
+  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.75), 0 2px 6px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  font-family: var(--sans);
+}
+.cx-rail .cx-menu.cx-who-menu { width: 300px; bottom: calc(100% + 6px); }
+
+/* section labels: sentence case, no mono caps */
+.cx-rail .cx-who-menu .cx-h,
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop .cx-h {
+  padding: 8px 10px 6px;
+  font: 500 12.5px var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--rail-head);
+}
+.cx-rail .cx-who-menu .cx-h kbd { font: 11px var(--sans); color: var(--ink-ghost); }
+
+/* who is signed in */
+.cx-rail .cx-who-acct { gap: 12px; padding: 10px; border-bottom: 0; background: none; }
+.cx-rail .cx-who-acct .cx-uav { width: 40px; height: 40px; border: 0; border-radius: 50% !important; }
+.cx-rail .cx-who-acct b { font: 600 14.5px var(--sans); }
+.cx-rail .cx-who-menu small,
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop small { font: 12px var(--sans); letter-spacing: 0; color: var(--rail-head); }
+
+/* sections: spaced, no rules between them */
+.cx-rail .cx-who-sec { margin-top: 4px; padding: 0; border-bottom: 0; }
+.cx-rail .cx-who-sec .cx-find,
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop .cx-find {
+  height: 34px;
+  margin: 0 0 4px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 9px !important;
+  background: rgba(255, 255, 255, 0.04);
+  font: 13px var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+}
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop .cx-find kbd { font: 11px var(--sans); }
+
+/* rows: rounded pills, the open one lifted */
+.cx-rail .cx-wrow { gap: 2px; padding: 0 4px 0 0; border-radius: 10px !important; }
+.cx-rail .cx-wrow + .cx-wrow { margin-top: 2px; }
+.cx-rail .cx-wrow.hot { background: rgba(255, 255, 255, 0.045); }
+.cx-rail .cx-wrow.on { background: #252525; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07); }
+.cx-rail .cx-wrow.on::before { display: none; }
+.cx-rail .cx-wrow-main { min-height: 46px; padding: 6px 10px; gap: 11px; }
+.cx-rail .cx-wrow-main b,
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pi-text b { font: 550 14px var(--sans); }
+.cx-rail .cx-av2,
+.cx-rail .cx-wrow-main .cx-av2 {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px !important;
+  background: #2a2a2a;
+  font: 650 10px var(--sans);
+  letter-spacing: 0.02em;
+  color: var(--rail-dim);
+}
+.cx-rail .cx-wrow.on .cx-av2 { background: #2a2d3d; color: var(--accent-strong); border: 0; }
+.cx-rail .cx-check { color: var(--rail-dim); }
+.cx-rail .cx-wrow-gear { width: 30px; height: 30px; border: 0; border-radius: 8px !important; }
+.cx-rail .cx-wrow-gear:hover { background: rgba(255, 255, 255, 0.06); border: 0; }
+
+/* project switcher rows */
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop .cx-grp { padding: 0; border: 0; }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pi { min-height: 44px; padding: 6px 10px; border-radius: 10px !important; gap: 11px; }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pi + .cx-pi { margin-top: 2px; }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pi:hover { background: rgba(255, 255, 255, 0.045); }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pi.on { background: #252525; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07); }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pi .fx-sq { width: 9px; height: 9px; margin: 0 5px; }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop .cx-tag { border-radius: 6px !important; font-family: var(--sans); letter-spacing: 0.02em; }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-pfoot {
+  margin-top: 4px;
+  padding: 8px 10px 4px;
+  border-top: 0;
+  font: 12.5px var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* foot actions: two soft buttons */
+.cx-rail .cx-who-foot { margin-top: 4px; padding: 0; gap: 4px; }
+.cx-rail .cx-who-foot .cx-mi {
+  min-height: 36px;
+  border-radius: 9px !important;
+  background: rgba(255, 255, 255, 0.035);
+  font: 500 13px var(--sans);
+  color: var(--rail-dim);
+}
+.cx-rail .cx-who-foot .cx-mi:hover { background: rgba(255, 255, 255, 0.07); color: var(--rail-ink); }
+:is(.cx-rail, .ph-crumb, .mh-proj) .cx-find input { font: 13.5px var(--sans) !important; letter-spacing: 0 !important; text-transform: none !important; color: var(--rail-ink); }
+
+.cx-rail .cx-brand > .brand-logo { flex: none; }
+.cx-rail .nav { padding-top: 4px; }
+@media (min-width: 861px) { .shell:has(.cx-rail) { grid-template-columns: 260px minmax(0, 1fr); } }
+.cx-rail .cx-brand { padding: 0 8px 0 16px; gap: 4px; }
+.cx-rail .cx-brand .brand-logo svg { height: 15px; }
+.rail-tools { gap: 0; }
+.rail-tool { width: 28px; height: 28px; }
+
+/* the last link clears the fade when scrolled to the end */
+.cx-rail .nav { padding-bottom: 48px; }
+
+/* ---- foot, final: a contained card; content scrolling under it fades via a lip, no dead gap ---- */
+.cx-rail .nav { padding-bottom: 20px; -webkit-mask-image: none; mask-image: none; }
+.cx-rail .sb-foot.cx-foot { padding: 0 10px 12px; }
+.cx-rail .sb-foot.cx-foot::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 36px;
+  background: linear-gradient(to bottom, transparent, var(--rail-bg));
+  pointer-events: none;
+}
+.cx-rail .cx-me {
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 12px !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+.cx-rail .cx-me:hover, .cx-rail .cx-me.on { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.09); }
+.cx-rail .cx-me .cx-wsw-text b { font: 600 13.5px var(--sans); }
+.cx-rail .cx-me .cx-wsw-text small { font-size: 12px; }
+.cx-rail .cx-me > svg { color: var(--rail-head); }
+.cx-rail .sb-ver { padding: 8px 12px 0; text-align: left; }
+
+/* The soft rail has no hard line for the frame's squares to cross: drop the
+   squares on the sidebar edge and the 5px overhang that made room for them. */
+.shell:has(.cx-rail) .main-frame > .main { --edge: 0px; }
+.shell:has(.cx-rail) .page-head::after,
+.shell:has(.cx-rail) .fx-row::after { display: none; }
+.shell:has(.cx-rail) .page-stack > *::after { display: none; }
+
+/* ---- the page as an inset card: the rail's colour is the frame, the page
+   sits in a rounded card a few pixels off its edges ---- */
+@media (min-width: 861px) {
+  .shell:has(.cx-rail) { background: var(--rail-bg, #161616); }
+  .shell:has(.cx-rail) { --rail-bg: #161616; }
+  .shell:has(.cx-rail) .sidebar.cx-rail { border-right: 0; }
+  .shell:has(.cx-rail) .main-frame { padding: 4px 4px 4px 0; background: var(--rail-bg); }
+  .shell:has(.cx-rail) .main-frame > .main {
+    margin-left: 0;
+    padding-left: 0;
+    background: var(--bg);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  }
+  /* the sticky bar follows the card's top corners */
+  .shell:has(.cx-rail) .main .page-head { border-radius: 12px 12px 0 0 !important; }
+  .shell:has(.cx-rail) .main-frame > .main .page-head::before { display: none; }
+}
+
+/* the card's own surface: a soft gray, not the frame's near-black */
+@media (min-width: 861px) {
+  .shell:has(.cx-rail) .main-frame > .main {
+    --bg: #1a1a1a;
+    --bg-panel: #1d1d1d;
+    --bg-raised: #212121;
+    --bg-sunken: #171717;
+    --bg-hover: #262626;
+    background: var(--bg);
+    background-image: none;
+  }
+}
+@media (min-width: 861px) { .shell:has(.cx-rail) .main .page-head { background: color-mix(in srgb, var(--bg) 88%, transparent); } }
+
+/* frame and rail lighter, the page card darker than both */
+.cx-rail { --rail-bg: #1c1c1c; --rail-on: #282828; --rail-on-line: rgba(255, 255, 255, 0.08); --rail-hover: rgba(255, 255, 255, 0.05); }
+@media (min-width: 861px) {
+  .shell:has(.cx-rail) { --rail-bg: #1c1c1c; }
+  .shell:has(.cx-rail) .main-frame > .main {
+    --bg: #0d0d0d;
+    --bg-panel: #111111;
+    --bg-raised: #151515;
+    --bg-sunken: #0a0a0a;
+    --bg-hover: #191919;
+  }
+}
+.cx-rail .cx-menu.cx-who-menu, :is(.cx-rail, .ph-crumb, .mh-proj) .cx-pop { background: #202020; }
+.cx-rail .cx-wrow.on, :is(.cx-rail, .ph-crumb, .mh-proj) .cx-pi.on { background: #2b2b2b; }
+
+
+/* the crumb's project name is the switcher: plain text until hovered */
+.ph-crumb, .mh-proj { --rail-ink: #e6e6e6; --rail-dim: #b4b4b4; --rail-head: #6f6f6f; }
+.shell:has(.cx-rail) .ph-ctx .cx-proj {
+  height: 28px;
+  margin-left: -8px;
+  padding: 0 8px;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: 8px !important;
+  background: none;
+}
+.shell:has(.cx-rail) .ph-ctx .cx-proj:hover,
+.shell:has(.cx-rail) .ph-ctx .cx-proj.on { border-color: rgba(255, 255, 255, 0.08); background: rgba(255, 255, 255, 0.05); }
+.shell:has(.cx-rail) .ph-ctx .cx-proj > svg { color: var(--ink-ghost); }
+.shell:has(.cx-rail) .ph-crumb .cx-pop { left: -8px; top: calc(100% + 10px); width: 360px; }
+
+/* ---- phone: the same soft frame. The bar sits on the rail's colour, the page
+   is the dark rounded card under it, the drawer is the rail itself. ---- */
+@media (max-width: 860px) {
+  .shell:has(.cx-rail) { --rail-bg: #1c1c1c; background: var(--rail-bg); }
+  .shell:has(.cx-rail) .mobile-bar {
+    height: 52px;
+    padding: 0 10px 0 8px;
+    gap: 8px;
+    border-bottom: 0;
+    background: var(--rail-bg);
+  }
+  .shell:has(.cx-rail) .burger {
+    width: 36px;
+    height: 36px;
+    padding: 0 10px;
+    gap: 4px;
+    border: 0;
+    border-radius: 9px !important;
+    background: none;
+  }
+  .shell:has(.cx-rail) .burger:hover,
+  .shell:has(.cx-rail) .burger.open { background: rgba(255, 255, 255, 0.06); }
+  .shell:has(.cx-rail) .burger span { height: 1.75px; border-radius: 2px !important; background: #b4b4b4; }
+  .shell:has(.cx-rail) .mobile-bar .brand-logo svg { height: 16px; width: auto; }
+
+
+  /* the page as a card under the bar */
+  .shell:has(.cx-rail) .main-frame { padding: 0 4px 4px; background: var(--rail-bg); }
+  .shell:has(.cx-rail) .main-frame > .main {
+    --bg: #0d0d0d;
+    --bg-panel: #111111;
+    --bg-raised: #151515;
+    --bg-sunken: #0a0a0a;
+    --bg-hover: #191919;
+    background: var(--bg);
+    background-image: none;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 12px !important;
+  }
+  .shell:has(.cx-rail) .main .page-head { border-radius: 12px 12px 0 0 !important; background: color-mix(in srgb, var(--bg) 88%, transparent); }
+
+  /* the drawer */
+  .shell:has(.cx-rail) .sidebar.cx-rail { background: var(--rail-bg); border-right: 0; box-shadow: 16px 0 48px -12px rgba(0, 0, 0, 0.6); }
+}
+
+/* ---- burger: two lines, the lower one short. Hover draws it out to full,
+   open folds both into an X with a small overshoot. ---- */
+@media (max-width: 860px) {
+  .shell:has(.cx-rail) .burger {
+    position: relative;
+    display: block;
+    padding: 0;
+  }
+  .shell:has(.cx-rail) .burger span {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    width: 16px;
+    height: 1.75px;
+    margin-top: -0.875px;
+    background: #c4c4c4;
+    transform-origin: 50% 50%;
+    transition:
+      transform 0.38s cubic-bezier(0.34, 1.45, 0.5, 1),
+      width 0.24s cubic-bezier(0.2, 0.7, 0.2, 1),
+      opacity 0.18s ease,
+      background-color 0.2s ease;
+  }
+  .shell:has(.cx-rail) .burger span:nth-child(1) { transform: translateY(-3.5px); }
+  .shell:has(.cx-rail) .burger span:nth-child(2) { opacity: 0; transform: scaleX(0); }
+  .shell:has(.cx-rail) .burger span:nth-child(3) { width: 10px; transform: translateY(3.5px); }
+  .shell:has(.cx-rail) .burger:hover span:nth-child(3) { width: 16px; }
+  .shell:has(.cx-rail) .burger:active { transform: scale(0.94); }
+  .shell:has(.cx-rail) .burger { transition: background-color 0.15s ease, transform 0.12s ease; }
+
+  .shell:has(.cx-rail) .burger.open span { background: #ededed; }
+  .shell:has(.cx-rail) .burger.open span:nth-child(1) { transform: translateY(0) rotate(45deg); }
+  .shell:has(.cx-rail) .burger.open span:nth-child(3) { width: 16px; transform: translateY(0) rotate(-45deg); }
+}
+@media (max-width: 860px) and (prefers-reduced-motion: reduce) {
+  .shell:has(.cx-rail) .burger span { transition: none; }
+}
+
+/* ---- phone: the page's head in the top bar. Burger, the page, its
+   actions under ⋮, the project. The wordmark steps aside for it. ---- */
+.mb-slot { display: none; }
+@media (max-width: 860px) {
+  .shell:has(.cx-rail) .mb-slot { display: flex; flex: 1 1 auto; min-width: 0; }
+  .shell:has(.cx-rail) .mobile-bar:has(.mb-slot .mh) > .brand-logo { display: none; }
+  .mh { display: flex; align-items: center; gap: 4px; flex: 1 1 auto; min-width: 0; }
+  .mh-title { display: flex; align-items: baseline; gap: 6px; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; }
+  .mh-title h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; font: 600 15px var(--sans); letter-spacing: -0.01em; color: #ededed; }
+  .mh-crumb { flex: none; font: 500 14px var(--sans); color: #8f8f8f; text-decoration: none; }
+  .mh-sep { flex: none; color: #4a4a4a; font: 14px var(--sans); }
+
+  .mh-more { position: relative; flex: none; }
+  .mh-btn {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border: 0;
+    border-radius: 9px !important;
+    background: none;
+    color: #b4b4b4;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+  }
+  .mh-btn:hover, .mh-btn.on { background: rgba(255, 255, 255, 0.06); color: #ededed; }
+  .mh-panel {
+    position: absolute;
+    z-index: 70;
+    top: calc(100% + 8px);
+    right: -2px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    width: min(280px, calc(100vw - 16px));
+    padding: 8px;
+    background: #202020;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px !important;
+    box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.75), 0 2px 6px rgba(0, 0, 0, 0.4);
+    visibility: hidden;
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+    transform-origin: top right;
+    transition: opacity 0.14s ease, transform 0.18s cubic-bezier(0.2, 0.7, 0.2, 1), visibility 0s linear 0.18s;
+  }
+  .mh-panel.open { visibility: visible; opacity: 1; transform: none; transition: opacity 0.14s ease, transform 0.18s cubic-bezier(0.2, 0.7, 0.2, 1); }
+  /* each action fills the panel's width, whatever wraps it */
+  /* buttons and split buttons fill the panel; a readout (a span) is a quiet line on top */
+  .mh-panel > .btn, .mh-panel > .split, .mh-panel > a, .mh-panel > button { width: 100%; }
+  .mh-panel > .split { display: flex; }
+  .mh-panel > .split > .btn { flex: 1 1 auto; }
+  .mh-panel .btn { justify-content: center; height: 36px; border-radius: 9px !important; }
+  .mh-panel > span {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px 6px;
+    white-space: nowrap;
+  }
+
+  .mh-proj { flex: none; }
+  .mh-proj .cx-proj-wrap { position: relative; }
+  .mh-proj .cx-proj {
+    height: 32px;
+    gap: 7px;
+    padding: 0 11px;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 999px !important;
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .mh-proj .cx-proj b { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 550 13px var(--sans); color: #e6e6e6; }
+  .mh-proj .cx-proj .fx-sq { width: 8px; height: 8px; border-radius: 50% !important; }
+  .mh-proj .cx-proj > svg { display: none; }
+  .mh-proj .cx-pop {
+    left: auto;
+    right: -40px;
+    top: calc(100% + 8px);
+    width: calc(100vw - 16px);
+    max-width: 380px;
+    padding: 6px;
+    background: #202020;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px !important;
+  }
+}
+@media (max-width: 860px) { .shell:has(.cx-rail) .mb-slot > div { display: flex; flex: 1 1 auto; min-width: 0; } }
+
+@media (max-width: 860px) { .mh-proj:last-child .cx-pop { right: -2px; } }
+
+/* the rail head lines up with the page bar: inset 4 + border 1 + half of its 51px content = 30.5 */
+@media (min-width: 861px) { .cx-rail .cx-brand { height: 61px; } }
+
+
+/* ---- one left edge and one right edge down the rail ----
+   Left: the wordmark, nav icons, group headings and the account picture
+   all start at 19px. Right: the counts, the width toggle and the account
+   chevron end at 241px. The account card is as wide as a nav pill. */
+@media (min-width: 861px) {
+  .cx-rail .cx-brand { padding: 0 12px 0 19px; }
+  .cx-rail .sb-foot.cx-foot { padding-left: 8px; padding-right: 8px; }
+  .cx-rail .cx-me { padding-left: 10px; padding-right: 10px; }
+
+  /* folded to icons: the toggle sits on the page bar's line, search under it */
+  .rail-min .cx-rail .cx-brand { padding: 16.5px 0 8px; gap: 6px; height: auto; }
+}
+@media (min-width: 861px) { .rail-min .cx-rail .rail-tools { gap: 6px; } }
+
+/* ---- skeleton bars sized by the text they stand in for (components/Skeleton.tsx) ---- */
+/* The wrapper sits on the baseline like the text it replaces (its zero-width
+   space is that text), and the bar hangs from the top of the line, so a bar
+   never makes its line taller than the words would. */
+.sk-w { display: inline-block; width: 6em; max-width: 100%; vertical-align: baseline; }
+.sk-t { display: inline-block; width: 100%; height: 0.72em; vertical-align: top; margin-top: 0.22em; border-radius: 3px !important; }
+.sk-b { display: block; width: 100%; height: 120px; border-radius: 4px !important; }
+.sk-w + .sk-w { margin-left: 0.6em; }

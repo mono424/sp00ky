@@ -9,6 +9,7 @@ import { A, useNavigate, useParams } from '@solidjs/router';
 import { PageHead } from '../components/Chrome';
 import { FxCell, Sq } from '../components/Frame';
 import { formatStamp } from '../lib/format';
+import { BuildRunSkeleton, BuildsSkeleton } from '../skeletons/Builds';
 import { cloud, consoleApi, type Workspace, type WorkspaceProject } from './cloud';
 import { ago } from './chrome';
 import {
@@ -280,6 +281,8 @@ export function Builds(props: Ctx) {
           </>
         }
       />
+      {/* The first answer draws the page's shape; a range change keeps the old one, dimmed. */}
+      <Show when={data.error || data.latest} fallback={<BuildsSkeleton />}>
       <div class="fx-page" classList={{ 'bt-stale': data.loading && !!data.latest }}>
         <Show when={data.error}>
           <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{String(data.error?.message ?? data.error)}</span></div></FxCell></section>
@@ -376,6 +379,7 @@ export function Builds(props: Ctx) {
           </FxCell>
         </section>
       </div>
+      </Show>
     </>
   );
 }
@@ -835,6 +839,7 @@ export function BuildRun(props: Ctx) {
   return (
     <>
       <PageHead crumb="Build time" crumbHref="/deployments/builds" title={run() ? (run()!.version != null ? `v${run()!.version}` : 'Build') : 'Build'} subtitle={run() ? <span class="bt-commit"><Show when={run()!.commit_sha}><b>{sha7(run()!.commit_sha!)}</b> </Show>{whatOf(run()!)}</span> : undefined} />
+      <Show when={data.error || data.latest} fallback={<BuildRunSkeleton />}>
       <div class="fx-page">
         <Show when={data.error}>
           <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{String(data.error?.message ?? data.error)}</span></div></FxCell></section>
@@ -904,6 +909,7 @@ export function BuildRun(props: Ctx) {
           )}
         </Show>
       </div>
+      </Show>
     </>
   );
 }

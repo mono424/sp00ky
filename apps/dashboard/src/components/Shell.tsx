@@ -3,8 +3,9 @@ import { A, useLocation, useNavigate, useResolvedPath } from '@solidjs/router';
 import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
 import { Logo } from './Chrome';
+import { pageSkeleton, type PageSkeletonSpec } from '../skeletons';
 import type { LoginResponse, Overview } from '../api/types';
-import { ProjectSwitcher, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
+import { GEAR, MobileHeadSlot, WORKSPACE_LINKS, WorkspaceMenu, projectLine, projectTone, useConsoleChrome } from '../console/chrome';
 
 export interface NavLink {
   href: string;
@@ -35,6 +36,8 @@ const NAV_PATHS: Record<string, string> = {
   '/backends': 'M4 6c0-4 16-4 16 0s-16 4-16 0v12c0 4 16 4 16 0V6 M4 12c0 4 16 4 16 0',
   '/views': 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0',
   '/runs': 'M3 3h6v6H3z M15 15h6v6h-6z M6 9v9h9 M9 6h9v9',
+  '/schedules': 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 7v5l3 2',
+  '/workflows': 'M6 3a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M18 15a3 3 0 1 0 0 6 3 3 0 0 0 0-6z M9 6h7.5a3 3 0 0 1 0 6h-9a3 3 0 0 0 0 6H15',
   '/backups': 'M4 4h16v5H4z M6 9v12h12V9 M9 13h6',
   '/incidents': 'M12 3 2 21h20L12 3z M12 9v5 M12 17v1',
   '/logs': 'M5 3h14v18H5z M8 7h8 M8 11h8 M8 15h5',
@@ -64,6 +67,97 @@ function NavIcon(props: { href: string; icon?: string }) {
     <path d={props.icon ?? NAV_PATHS[props.href]} />
   </svg>;
 }
+
+/**
+ * The console rail's icons: solid glyphs, so the rail reads at a glance and the
+ * labels carry the weight. `f` is filled (even-odd, so holes cut through), `s`
+ * an optional stroke drawn over it.
+ */
+const RAIL_ICONS: Record<string, { f: string; s?: string }> = {
+  '/': { f: 'M11.2 2.8a1.2 1.2 0 0 1 1.6 0l7.8 6.9c.3.2.4.6.4.9v9.4a1.5 1.5 0 0 1-1.5 1.5h-4.3v-5.6a1 1 0 0 0-1-1h-4.4a1 1 0 0 0-1 1v5.6H4.5A1.5 1.5 0 0 1 3 20v-9.4c0-.3.1-.7.4-.9z' },
+  '/activity': { f: 'M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20z M11 6.5v6.1l4.4 2.7.95-1.55-3.55-2.15V6.5z' },
+  '/deployments': { f: 'M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20z M12 6.2 7.3 10.9l1.3 1.3 2.5-2.5v7.3h1.8V9.7l2.5 2.5 1.3-1.3z' },
+  '/audience': { f: 'M4.5 12h3a.5.5 0 0 1 .5.5v8a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-8a.5.5 0 0 1 .5-.5z M10.5 3h3a.5.5 0 0 1 .5.5v17a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-17a.5.5 0 0 1 .5-.5z M16.5 8h3a.5.5 0 0 1 .5.5v12a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-12a.5.5 0 0 1 .5-.5z' },
+  '/incidents': { f: 'M10.3 3.4a2 2 0 0 1 3.4 0l8.3 14.6A2 2 0 0 1 20.3 21H3.7A2 2 0 0 1 2 18L10.3 3.4z M11.1 9v5.2h1.8V9z M11.1 15.8v1.9h1.8v-1.9z' },
+  '/logs': { f: 'M6.5 2h11A2.5 2.5 0 0 1 20 4.5v15a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z M8 6.6v1.7h8V6.6z M8 10.6v1.7h8v-1.7z M8 14.6v1.7h5v-1.7z' },
+  '/ssps': { f: 'M4.5 3h15A1.5 1.5 0 0 1 21 4.5v5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 9.5v-5A1.5 1.5 0 0 1 4.5 3z M4.5 13h15a1.5 1.5 0 0 1 1.5 1.5v5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 19.5v-5A1.5 1.5 0 0 1 4.5 13z M6 6.1v1.8h4V6.1z M6 16.1v1.8h4v-1.8z M16 6.1v1.8h2V6.1z M16 16.1v1.8h2v-1.8z' },
+  '/backends': { f: 'M11.5 2.6a1.2 1.2 0 0 1 1 0l8.6 4.3c.7.4.7 1.4 0 1.8l-8.6 4.3a1.2 1.2 0 0 1-1 0L2.9 8.7c-.7-.4-.7-1.4 0-1.8z M4.6 11.3l6.9 3.5c.3.2.7.2 1 0l6.9-3.5 1.7.9c.7.4.7 1.4 0 1.8l-8.6 4.3a1.2 1.2 0 0 1-1 0L2.9 14c-.7-.4-.7-1.4 0-1.8z M4.6 16.4l6.9 3.5c.3.2.7.2 1 0l6.9-3.5 1.7.9c.7.4.7 1.4 0 1.8l-8.6 4.3a1.2 1.2 0 0 1-1 0l-8.6-4.3c-.7-.4-.7-1.4 0-1.8z' },
+  '/views': { f: 'M12 4.5c5.6 0 9.6 5.2 10 7.5-.4 2.3-4.4 7.5-10 7.5S2.4 14.3 2 12c.4-2.3 4.4-7.5 10-7.5z M12 8.3a3.7 3.7 0 1 0 0 7.4 3.7 3.7 0 0 0 0-7.4z M12 10.2a1.8 1.8 0 1 1 0 3.6 1.8 1.8 0 0 1 0-3.6z' },
+  '/workflows': { f: 'M6 2.5a3.2 3.2 0 1 1 0 6.4 3.2 3.2 0 0 1 0-6.4z M18 15.1a3.2 3.2 0 1 1 0 6.4 3.2 3.2 0 0 1 0-6.4z', s: 'M9.5 5.7h7a3.15 3.15 0 0 1 0 6.3h-9a3.15 3.15 0 0 0 0 6.3h5' },
+  '/runs': { f: 'M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20z M9.8 7.6v8.8l7-4.4z' },
+  '/schedules': { f: 'M7 2.5h1.8V4.5h6.4V2.5H17v2h1.5A2.5 2.5 0 0 1 21 7v11.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 18.5V7a2.5 2.5 0 0 1 2.5-2.5H7z M5 9.5v9a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5v-9z M7.5 12h3v3h-3z' },
+  '/database': { f: 'M12 2c4.4 0 8 1.4 8 3.2S16.4 8.4 12 8.4 4 7 4 5.2 7.6 2 12 2z M4 7.9c1.7 1.3 4.7 2 8 2s6.3-.7 8-2v4c0 1.8-3.6 3.2-8 3.2S4 13.7 4 11.9z M4 14.6c1.7 1.3 4.7 2 8 2s6.3-.7 8-2v4.2c0 1.8-3.6 3.2-8 3.2s-8-1.4-8-3.2z' },
+  '/users': { f: 'M12 2.8a4.6 4.6 0 1 1 0 9.2 4.6 4.6 0 0 1 0-9.2z M3.8 20.2c0-3.9 3.7-6.6 8.2-6.6s8.2 2.7 8.2 6.6v.3a.7.7 0 0 1-.7.7H4.5a.7.7 0 0 1-.7-.7z' },
+  '/members': { f: 'M9 3a4.2 4.2 0 1 1 0 8.4A4.2 4.2 0 0 1 9 3z M1.8 19.6c0-3.6 3.2-6 7.2-6s7.2 2.4 7.2 6v.7a.7.7 0 0 1-.7.7H2.5a.7.7 0 0 1-.7-.7z M15.6 3.5a4 4 0 0 1 0 7.4 5.6 5.6 0 0 0 0-7.4z M17.4 13.8c2.8.6 4.8 2.7 4.8 5.6v.9a.7.7 0 0 1-.7.7h-3.8c.2-.3.3-.7.3-1.1v-.8c0-2.1-.2-3.6-.6-5.3z' },
+  '/flags': { f: 'M4.6 2.5h1.8V22H4.6z M7.6 3.5h11.5c.5 0 .8.6.5 1l-2.7 4.3 2.7 4.3c.3.4 0 1-.5 1H7.6z' },
+  '/storage': { f: 'M3.5 4h5.8c.4 0 .8.2 1.1.5L12.3 6.6h8.2A1.5 1.5 0 0 1 22 8.1v10.4a1.5 1.5 0 0 1-1.5 1.5h-17A1.5 1.5 0 0 1 2 18.5v-13A1.5 1.5 0 0 1 3.5 4z' },
+  '/backups': { f: 'M3.2 3.5h17.6c.7 0 1.2.5 1.2 1.2v3.1c0 .7-.5 1.2-1.2 1.2H3.2C2.5 9 2 8.5 2 7.8V4.7c0-.7.5-1.2 1.2-1.2z M3.6 10.5h16.8v8A2.5 2.5 0 0 1 17.9 21H6.1a2.5 2.5 0 0 1-2.5-2.5z M9.2 13.2v1.7h5.6v-1.7z' },
+  '/resources': { f: 'M7.5 5h9A2.5 2.5 0 0 1 19 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-9A2.5 2.5 0 0 1 5 16.5v-9A2.5 2.5 0 0 1 7.5 5z M9.6 9.6v4.8h4.8V9.6z', s: 'M9 2v3 M15 2v3 M9 19v3 M15 19v3 M2 9h3 M2 15h3 M19 9h3 M19 15h3' },
+  '/billing': { f: 'M4.5 4h15A2.5 2.5 0 0 1 22 6.5V8H2V6.5A2.5 2.5 0 0 1 4.5 4z M2 10.2h20v7.3a2.5 2.5 0 0 1-2.5 2.5h-15A2.5 2.5 0 0 1 2 17.5z M5 14.3V16h5v-1.7z' },
+  '/vault': { f: 'M7.6 10V7.2a4.4 4.4 0 0 1 8.8 0V10h-2V7.2a2.4 2.4 0 0 0-4.8 0V10z M5.5 10h13a1.5 1.5 0 0 1 1.5 1.5v8.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 20v-8.5A1.5 1.5 0 0 1 5.5 10z M11.1 14v3.4h1.8V14z' },
+  '/keys': { f: 'M15 2a7 7 0 1 1-2.6 13.5l-1.7 1.7H8.8v1.9H6.9V21H3.6a.6.6 0 0 1-.6-.6v-2.7c0-.2.1-.3.2-.4l5.9-5.9A7 7 0 0 1 15 2z M16.4 5.4a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4z' },
+  '/settings': { f: GEAR },
+};
+RAIL_ICONS['/access'] = RAIL_ICONS['/keys'];
+RAIL_ICONS['/settings/env'] = RAIL_ICONS['/settings'];
+RAIL_ICONS['/settings/domains'] = { f: 'M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20z', s: 'M2.5 12h19 M12 2.5c2.8 3 2.8 16 0 19 M12 2.5c-2.8 3-2.8 16 0 19' };
+RAIL_ICONS['/settings/git'] = { f: 'M6 2.5a2.6 2.6 0 1 1 0 5.2 2.6 2.6 0 0 1 0-5.2z M6 16.3a2.6 2.6 0 1 1 0 5.2 2.6 2.6 0 0 1 0-5.2z M18 4.3a2.6 2.6 0 1 1 0 5.2 2.6 2.6 0 0 1 0-5.2z', s: 'M6 7.5v9 M18 9.5c0 4.5-5 5-11 7.5' };
+RAIL_ICONS['/settings/scale'] = { f: 'M3 4h4v16H3z M10 9h4v11h-4z M17 13h4v7h-4z' };
+RAIL_ICONS['/settings/database'] = RAIL_ICONS['/database'];
+RAIL_ICONS['/settings/danger'] = RAIL_ICONS['/incidents'];
+
+function RailIcon(props: { href: string; icon?: string }) {
+  const glyph = () => RAIL_ICONS[props.href];
+  return (
+    <Show when={glyph()} fallback={<NavIcon href={props.href} icon={props.icon} />}>
+      {(g) => (
+        <svg class="rail-ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+          <path d={g().f} fill="currentColor" fill-rule="evenodd" />
+          <Show when={g().s}>
+            <path d={g().s} fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" />
+          </Show>
+        </svg>
+      )}
+    </Show>
+  );
+}
+
+/** Small solid triangle, the rail's group caret. */
+function Tri(props: { dir: 'down' | 'right' }) {
+  return (
+    <svg class="rail-tri" width="8" height="8" viewBox="0 0 8 8" aria-hidden="true">
+      <path d={props.dir === 'down' ? 'M1 2.5h6L4 6z' : 'M2.5 1v6L6 4z'} fill="currentColor" />
+    </svg>
+  );
+}
+
+/** Persisted rail state: folded groups and the icon-only width. */
+function stored<T>(key: string, fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    return v == null ? fallback : (JSON.parse(v) as T);
+  } catch {
+    return fallback;
+  }
+}
+function store(key: string, v: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(v));
+  } catch {
+    /* private mode */
+  }
+}
+const [railFolded, setRailFolded] = createSignal<string[]>(stored('spky.rail.folded', []));
+const toggleFold = (group: string) => {
+  const next = railFolded().includes(group) ? railFolded().filter((g) => g !== group) : [...railFolded(), group];
+  setRailFolded(next);
+  store('spky.rail.folded', next);
+};
+const [railMin, setRailMinSig] = createSignal<boolean>(stored('spky.rail.min', false));
+const setRailMin = (v: boolean) => {
+  setRailMinSig(v);
+  store('spky.rail.min', v);
+};
 
 /**
  * A project's rail, counts off the overview where it has them. Quick access
@@ -117,6 +211,8 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
       // views are registered".
       count: o?.presence?.ready ? formatCount(o.presence.totals.views) : undefined,
     },
+    { href: '/schedules', label: 'Schedules', group: 'Automation' },
+    { href: '/workflows', label: 'Workflows', group: 'Automation' },
     {
       href: '/runs',
       label: 'Runs',
@@ -159,7 +255,7 @@ function sectionsOf(links: NavLink[]): { group?: string; links: NavLink[] }[] {
 }
 
 /** One rail link, with its count. */
-function NavItem(props: { link: NavLink; atRoot: () => boolean }) {
+function NavItem(props: { link: NavLink; atRoot: () => boolean; rail?: boolean }) {
   const link = props.link;
   return (
     // `activeClass` + `end` rather than comparing pathnames by hand: the
@@ -177,8 +273,12 @@ function NavItem(props: { link: NavLink; atRoot: () => boolean }) {
       // merges this over its own active class, so `active: false` elsewhere
       // would erase it.
       classList={link.href === '/' ? { active: props.atRoot() } : undefined}
+      title={props.rail ? link.label : undefined}
     >
-      <span class="row" style={{ gap: '10px' }}><NavIcon href={link.href} icon={link.icon} /><span>{link.label}</span></span>
+      <span class="row" style={{ gap: '10px' }}>
+        {props.rail ? <RailIcon href={link.href} icon={link.icon} /> : <NavIcon href={link.href} icon={link.icon} />}
+        <span class="nav-label">{link.label}</span>
+      </span>
       <Show when={link.count}>
         <span class="nav-count" classList={{ warn: link.warn }}>{link.count}</span>
       </Show>
@@ -196,7 +296,7 @@ let lastLayer: 'workspace' | 'project' | undefined;
  * the cluster and the project's settings in groups. The project switcher heads
  * both; the foot is one menu for the account and its workspaces.
  */
-function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot: () => boolean; onJump: () => void; version: string }) {
+function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot: () => boolean; onJump: () => void }) {
   const cx = useConsoleChrome()!;
   const layer = props.workspaceLayer ? 'workspace' : 'project';
   const dir = lastLayer && lastLayer !== layer ? (layer === 'project' ? 'in' : 'out') : '';
@@ -205,27 +305,37 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
   const quick = () => sectionsOf(props.links).filter((x) => !x.group);
   const grouped = () => sectionsOf(props.links).filter((x) => x.group);
   const location = useLocation();
+  const Section = (sp: { group: string; count?: number; children: JSX.Element }) => {
+    const folded = () => railFolded().includes(sp.group);
+    return (
+      <div class="nav-section" classList={{ folded: folded() }}>
+        <button class="rail-head" aria-expanded={!folded()} onClick={() => toggleFold(sp.group)}>
+          <span>{sp.group}</span>
+          <Tri dir={folded() ? 'right' : 'down'} />
+          <Show when={sp.count != null}><span class="rail-head-n">{sp.count}</span></Show>
+        </button>
+        <Show when={!folded()}>{sp.children}</Show>
+      </div>
+    );
+  };
   return (
     <>
-      <div class="cx-brand"><Logo /><span class="cap">console</span></div>
-      <div class="cx-rail-head">
-        <ProjectSwitcher rail />
-      </div>
-      <button class="sb-jump cap" onClick={props.onJump}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-          <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
-        </svg>
-        Jump to
-        <kbd>⌘K</kbd>
-      </button>
-      <Show when={!props.workspaceLayer}>
-        <div class={`cx-pin cx-layer ${dir}`}>
-          <button class="cx-back" onClick={() => cx.go(`/${ws()?.slug}/-`)} title={`Back to ${ws()?.name ?? 'the workspace'}`}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M15 6l-6 6 6 6" /></svg>
-            <span>{ws()?.name ?? 'Workspace'}</span>
+      <div class="cx-brand">
+        <Logo />
+        <span class="rail-tools">
+          <button class="rail-tool" onClick={props.onJump} title="Search (⌘K)" aria-label="Search">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M10.5 3.5a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M20.5 20.5l-5-5" />
+            </svg>
           </button>
-        </div>
-      </Show>
+          <button class="rail-tool rail-min-btn" onClick={() => setRailMin(!railMin())} title={railMin() ? 'Expand sidebar (⌘B)' : 'Collapse sidebar (⌘B)'} aria-label={railMin() ? 'Expand sidebar' : 'Collapse sidebar'}>
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="16" rx="3" />
+              <path d="M9.5 4v16" />
+            </svg>
+          </button>
+        </span>
+      </div>
       <div
         class={`nav cx-layer ${dir}`}
         ref={(el) => {
@@ -239,43 +349,39 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
         <For each={quick()}>
           {(section) => (
             <div class="nav-section cx-quick">
-              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
+              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} rail />}</For>
             </div>
           )}
         </For>
         <Show when={props.workspaceLayer && ws()}>
           {(w) => (
-            <div class="nav-section">
-              <div class="nav-heading cx-nh"><span>Projects</span><span>{w().projects.length}</span></div>
+            <Section group="Projects" count={w().projects.length}>
               <For each={w().projects}>
                 {(p) => (
-                  <button class="nav-link cx-pl" title={projectLine(p)} onClick={() => cx.go(`/${w().slug}/${p.slug}`)}>
+                  <button class="nav-link cx-pl" title={`${p.slug} · ${projectLine(p)}`} onClick={() => cx.go(`/${w().slug}/${p.slug}`)}>
                     <span class="row" style={{ gap: '10px', 'min-width': '0' }}>
-                      <span class={`fx-sq ${projectTone(p)}`} />
-                      <span class="cx-pl-name">{p.slug}</span>
+                      <span class="rail-sq"><span class={`fx-sq ${projectTone(p)}`} /></span>
+                      <span class="cx-pl-name nav-label">{p.slug}</span>
                     </span>
                     <span class="cx-pl-r">
                       <Show when={p.platform === 'cloudflare'}><span class="cx-tag cf">CF</span></Show>
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
                     </span>
                   </button>
                 )}
               </For>
-            </div>
+            </Section>
           )}
         </Show>
         <For each={grouped()}>
           {(section) => (
-            <div class="nav-section">
-              <div class="nav-heading">{section.group}</div>
-              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} />}</For>
-            </div>
+            <Section group={section.group!}>
+              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} rail />}</For>
+            </Section>
           )}
         </For>
       </div>
       <div class="sb-foot cx-foot">
         <WorkspaceMenu />
-        <Show when={props.version}><div class="sb-ver cap">{props.version}</div></Show>
       </div>
     </>
   );
@@ -313,6 +419,8 @@ export function Shell(props: {
   // In the console the workspace menu (the rail's foot) holds the account,
   // and Deployments and Settings join the rail; elsewhere this is undefined.
   const cx = useConsoleChrome();
+  // On a phone the page's head lives in the top bar (see PageHead).
+  const [headSlot, setHeadSlot] = createSignal<HTMLElement>();
 
   // Pages only a scheduler can fill: an SSP serving the API alone has no
   // presence sampler, incident log, log ring or backups.
@@ -402,12 +510,19 @@ export function Shell(props: {
       e.preventDefault();
       setPaletteOpen(!paletteOpen());
     }
+    // ⌘B folds the console rail to its icons, except while typing (an editor may want it).
+    if (cx && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b') {
+      const t = e.target;
+      if (t instanceof Element && t.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"], .cm-editor')) return;
+      e.preventDefault();
+      setRailMin(!railMin());
+    }
   };
   window.addEventListener('keydown', onKey);
   onCleanup(() => window.removeEventListener('keydown', onKey));
 
   return (
-    <div class="shell" classList={{ settled: settled() }}>
+    <div class="shell" classList={{ settled: settled(), 'rail-min': !!cx && railMin() }}>
       {/* Mobile only; `display:none` above the breakpoint. */}
       <header class="mobile-bar">
         <button
@@ -422,14 +537,8 @@ export function Shell(props: {
           <span />
         </button>
         <Logo />
-        {/* Where this is; the drawer holds the switchers. */}
         <Show when={cx}>
-          <button class="mb-ctx" onClick={() => setOpen(true)}>
-            <Show when={cx!.project()} fallback={<span class="cx-av">{(cx!.workspace()?.name ?? '?').slice(0, 2).toUpperCase()}</span>}>
-              {(p) => <span class={`fx-sq ${projectTone(p())}`} />}
-            </Show>
-            <b>{cx!.project()?.slug ?? cx!.workspace()?.name ?? ''}</b>
-          </button>
+          <div class="mb-slot" ref={setHeadSlot} />
         </Show>
       </header>
 
@@ -447,7 +556,6 @@ export function Shell(props: {
             workspaceLayer={!!props.nav}
             atRoot={atRoot}
             onJump={() => setPaletteOpen(true)}
-            version={props.overview?.scheduler?.version?.replace(/^0\.0\.1-/, '') ?? ''}
           />
         </Show>
         <Show when={!cx}>
@@ -517,7 +625,7 @@ export function Shell(props: {
 
       <div class="main-frame">
         <main class="main" classList={{ scrolled: scrolled() }} onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 0)}>
-          {props.children}
+          <MobileHeadSlot value={headSlot}>{props.children}</MobileHeadSlot>
           <Show when={props.session.mode === 'breakglass'}>
             <div class="page-body">
               <div class="banner" style={{ 'margin-top': '16px' }}>
@@ -538,7 +646,7 @@ export function Shell(props: {
  * when there is one. Every loading state draws this, so nothing around the
  * page moves when it arrives.
  */
-export function PageSkeleton(props: { head?: JSX.Element }) {
+export function PageSkeleton(props: { head?: JSX.Element; title?: string; body?: () => JSX.Element }) {
   return (
     <>
       {props.head ?? (
@@ -546,10 +654,21 @@ export function PageSkeleton(props: { head?: JSX.Element }) {
           <div class="ph-crumb cap">
             <span class="sk sk-cap" style={{ width: '84px' }} />
             <span class="ph-sep">/</span>
-            <span class="sk sk-cap" style={{ width: '64px' }} />
+            <Show when={props.title} fallback={<span class="sk sk-cap" style={{ width: '64px' }} />}>
+              <h1 class="ph-title">{props.title}</h1>
+            </Show>
           </div>
         </div>
       )}
+      {/* The page's own skeleton when it has one, the generic frame when not. */}
+      <Show when={props.body} fallback={<GenericBody />}>{(b) => b()()}</Show>
+    </>
+  );
+}
+
+function GenericBody() {
+  return (
+    <>
       <div class="fx-page sk-page" aria-busy="true" aria-label="Loading">
         <section class="fx-row sk-tiles">
           <For each={[0, 1, 2, 3]}>
@@ -587,6 +706,81 @@ export function FrameSkeleton(props: { console?: boolean }) {
   const workspace = props.console && seg.length > 0 && (seg.length === 1 || seg[1] === '-');
   const links = (): NavLink[] =>
     workspace ? WORKSPACE_LINKS : projectNav(!!props.console).filter((l) => l.group !== 'Settings');
+  // The page the address names: under `/{ws}/{project}/` or `/{ws}/-/` in the
+  // console, under `/admin/` on a scheduler.
+  const page = props.console
+    ? pageSkeleton(seg.slice(2).join('/'), !!workspace)
+    : pageSkeleton(seg[0] === 'admin' ? seg.slice(1).join('/') : seg.join('/'));
+  return (
+    <Show when={props.console} fallback={<AdminFrameSkeleton links={links()} page={page} />}>
+      {/* The console's rail as it will paint: same classes, icons, folds and width. */}
+      <div class="shell settled" classList={{ 'rail-min': railMin() }}>
+        <header class="mobile-bar">
+          <span class="burger" aria-hidden="true"><span /><span /><span /></span>
+          <Logo />
+        </header>
+        <nav class="sidebar cx-rail" aria-hidden="true">
+          <div class="cx-brand">
+            <Logo />
+            <span class="rail-tools">
+              <span class="rail-tool">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                  <path d="M10.5 3.5a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M20.5 20.5l-5-5" />
+                </svg>
+              </span>
+              <span class="rail-tool rail-min-btn">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+                  <rect x="3" y="4" width="18" height="16" rx="3" />
+                  <path d="M9.5 4v16" />
+                </svg>
+              </span>
+            </span>
+          </div>
+          <div class="nav">
+            <For each={sectionsOf(links())}>
+              {(section) => (
+                <div class="nav-section" classList={{ 'cx-quick': !section.group, folded: !!section.group && railFolded().includes(section.group) }}>
+                  <Show when={section.group}>
+                    <span class="rail-head">
+                      <span>{section.group}</span>
+                      <Tri dir={railFolded().includes(section.group!) ? 'right' : 'down'} />
+                    </span>
+                  </Show>
+                  <Show when={!section.group || !railFolded().includes(section.group)}>
+                    <For each={section.links}>
+                      {(link) => (
+                        <span class="nav-link">
+                          <span class="row" style={{ gap: '10px' }}>
+                            <RailIcon href={link.href} icon={link.icon} />
+                            <span class="nav-label">{link.label}</span>
+                          </span>
+                        </span>
+                      )}
+                    </For>
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+          <div class="sb-foot cx-foot">
+            <span class="cx-me">
+              <span class="cx-face"><span class="cx-uav sk" /></span>
+              <span class="cx-wsw-text"><span class="sk sk-cap" style={{ width: '72px' }} /><span class="sk sk-cap" style={{ width: '52px' }} /></span>
+            </span>
+          </div>
+        </nav>
+        <div class="main-frame">
+          <main class="main">
+            <PageSkeleton title={page.title} body={page.body} />
+          </main>
+        </div>
+      </div>
+    </Show>
+  );
+}
+
+/** The scheduler-hosted /admin frame while it loads. */
+function AdminFrameSkeleton(props: { links: NavLink[]; page: PageSkeletonSpec }) {
   return (
     <div class="shell settled">
       <header class="mobile-bar">
@@ -594,17 +788,9 @@ export function FrameSkeleton(props: { console?: boolean }) {
         <Logo />
       </header>
       <nav class="sidebar" aria-hidden="true">
-        <Show
-          when={props.console}
-          fallback={
-            <div class="sb-me">
-              <span class="sb-me-btn"><span class="sb-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span>
-            </div>
-          }
-        >
-          <div class="cx-brand"><Logo /><span class="cap">console</span></div>
-          <div class="cx-rail-head"><span class="cx-prow"><span class="fx-sq idle" /><span class="sk sk-cap" style={{ width: '96px' }} /></span></div>
-        </Show>
+        <div class="sb-me">
+          <span class="sb-me-btn"><span class="sb-av sk" /><span class="sk sk-cap" style={{ width: '96px' }} /></span>
+        </div>
         <div class="sb-jump cap">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
             <path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13z M20 20l-4.5-4.5" />
@@ -613,7 +799,7 @@ export function FrameSkeleton(props: { console?: boolean }) {
           <kbd>⌘K</kbd>
         </div>
         <div class="nav">
-          <For each={sectionsOf(links())}>
+          <For each={sectionsOf(props.links)}>
             {(section) => (
               <div class="nav-section">
                 <Show when={section.group}>
@@ -630,19 +816,13 @@ export function FrameSkeleton(props: { console?: boolean }) {
             )}
           </For>
         </div>
-        <div class="sb-foot" classList={{ 'cx-foot': props.console }}>
-          <Show when={props.console}>
-            <span class="cx-me">
-              <span class="cx-face sk" />
-              <span class="cx-wsw-text"><span class="sk sk-cap" style={{ width: '72px' }} /><span class="sk sk-cap" style={{ width: '52px' }} /></span>
-            </span>
-          </Show>
+        <div class="sb-foot">
           <div class="sb-ver cap" />
         </div>
       </nav>
       <div class="main-frame">
         <main class="main">
-          <PageSkeleton />
+          <PageSkeleton title={props.page.title} body={props.page.body} />
         </main>
       </div>
     </div>

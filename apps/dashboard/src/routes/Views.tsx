@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
 import { A, useParams } from '@solidjs/router';
 import { api } from '../api/client';
 import { PageHead } from '../components/Chrome';
@@ -16,6 +16,7 @@ import {
   relativeStamp,
 } from '../lib/format';
 import type { Presence, ViewDetailData, ViewsList } from '../api/types';
+import { ViewDetailSkeleton, ViewsSkeleton } from '../skeletons/Views';
 
 /**
  * Every registered live query, and everything known about one of them.
@@ -96,6 +97,13 @@ export function Views() {
   }, POLL_MS);
   onCleanup(() => clearInterval(timer));
 
+  // The skeleton holds until the counts and the list have both answered once;
+  // after that a filter change refetches in place rather than blanking the page.
+  const [loaded, setLoaded] = createSignal(false);
+  createEffect(() => {
+    if (presence() !== undefined && result() !== undefined) setLoaded(true);
+  });
+
   const now = () => data()?.server_time_ms ?? Date.now();
   const totals = () => extra()?.totals;
   const filtering = () => !!(conditions().length || user() || ssp() || search());
@@ -133,188 +141,190 @@ export function Views() {
         }
       />
 
-      <div class="fx-page">
-        {/* how many, and what costs something ============================ */}
-        <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 2fr) minmax(0, 1fr)' }}>
-          <FxCell
-            label="Live views"
-            meta={
-              <Show when={totals()}>
-                {(t) => (
-                  <>
-                    <span><b>{formatCount(t().shared_views)}</b> shared</span>
-                    <span><b>{formatCount(t().sessions)}</b> tabs</span>
-                    <span><b>{formatCount(t().users)}</b> users</span>
-                  </>
-                )}
-              </Show>
-            }
-          >
-            <div class="fx-big">{totals() ? formatCount(totals()!.views) : '—'}</div>
-            <LineChart points={viewPoints()} format={(v) => formatCount(Math.round(v))} now={extra()?.taken_at_ms ?? Date.now()} />
-          </FxCell>
-          <FxCell label="Costing something" meta={<span>now</span>}>
-            <div class="vw-conds">
-              <Cond label="Hot" n={totals()?.hot_views} tone="warn" note={<>updating ≥ {extra() ? formatRate(extra()!.hot_view_rate) : '—'}</>} />
-              <Cond label="Slow" n={totals()?.slow_views} tone="warn" note={<>p99 ≥ {extra() ? formatMs(extra()!.slow_ms) : '—'}</>} />
-              <Cond label="Large" n={totals()?.large_views} tone="warn" note={<>≥ {extra() ? formatCount(extra()!.large_view_rows) : '—'} rows</>} />
-              <Cond label="Erroring" n={totals()?.errored_views} tone="bad" note="clients see stale data" />
-            </div>
-          </FxCell>
-        </section>
-
-        {/* where they live, and whose they are ============================= */}
-        <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 1fr) minmax(0, 1fr)' }}>
-          <FxCell label="By SSP" meta={<span><b>{bySsp().length}</b> serving</span>}>
-            <div class="sp-share">
-              <For each={bySsp()}>
-                {(x, i) => <i style={{ 'flex-grow': x.views || 0.0001, background: SHADES[i() % SHADES.length] }} title={`${x.ssp_id}: ${formatCount(x.views)}`} />}
-              </For>
-            </div>
-            <table class="fx-list vw-mini">
-              <tbody>
-                <For each={bySsp()}>
-                  {(x, i) => (
-                    <tr>
-                      <td><span class="fx-who"><i class="vw-key" style={{ background: SHADES[i() % SHADES.length] }} /><span style={{ color: 'var(--ink)' }}>{x.ssp_id}</span></span></td>
-                      <td class="r">{formatCount(x.views)}</td>
-                      <td class="r" style={{ width: '18%' }}>{sspViews() ? Math.round((x.views / sspViews()) * 100) : 0}%</td>
-                    </tr>
+      <Show when={loaded()} fallback={<ViewsSkeleton />}>
+        <div class="fx-page">
+          {/* how many, and what costs something ============================ */}
+          <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 2fr) minmax(0, 1fr)' }}>
+            <FxCell
+              label="Live views"
+              meta={
+                <Show when={totals()}>
+                  {(t) => (
+                    <>
+                      <span><b>{formatCount(t().shared_views)}</b> shared</span>
+                      <span><b>{formatCount(t().sessions)}</b> tabs</span>
+                      <span><b>{formatCount(t().users)}</b> users</span>
+                    </>
                   )}
-                </For>
-              </tbody>
-            </table>
-          </FxCell>
-          <FxCell label="Top users" meta={<span>by live views</span>}>
-            <table class="fx-list vw-mini">
-              <tbody>
-                <For each={topUsers()} fallback={<tr><td class="cap" style={{ color: 'var(--ink-ghost)' }}>Nobody is here</td></tr>}>
-                  {(u) => (
-                    <tr>
-                      <td style={{ color: 'var(--ink)' }}>{u.auth_id || 'anonymous'}</td>
-                      <td style={{ width: '40%' }}>
-                        <span class="vw-bar"><i style={{ width: `${(u.views / userMax()) * 100}%` }} /></span>
-                      </td>
-                      <td class="r" style={{ width: '12%' }}>{formatCount(u.views)}</td>
-                      <td class="r" style={{ width: '16%' }}>{plural(u.sessions, 'tab', 'tabs')}</td>
-                    </tr>
-                  )}
-                </For>
-              </tbody>
-            </table>
-          </FxCell>
-        </section>
-
-        {/* churning right now ============================================== */}
-        <Show when={(extra()?.hot.length ?? 0) > 0}>
-          <section class="fx-row">
-            <FxCell label="Hot right now" meta={<span>usually a bulk write into a table these watch</span>}>
-              <For each={extra()!.hot.slice(0, 3)}>
-                {(h) => (
-                  <div class="fx-log">
-                    <span class="cap">{formatRate(h.per_sec)}</span>
-                    <span class="fx-what">{h.auth_id || 'anonymous'} · {h.ssp_id ?? 'unassigned'} <em>· {h.key}</em></span>
-                    <A class="btn btn-sm" href={`/views/${encodeURIComponent(h.key)}`}>Open</A>
-                  </div>
-                )}
-              </For>
+                </Show>
+              }
+            >
+              <div class="fx-big">{totals() ? formatCount(totals()!.views) : '—'}</div>
+              <LineChart points={viewPoints()} format={(v) => formatCount(Math.round(v))} now={extra()?.taken_at_ms ?? Date.now()} />
+            </FxCell>
+            <FxCell label="Costing something" meta={<span>now</span>}>
+              <div class="vw-conds">
+                <Cond label="Hot" n={totals()?.hot_views} tone="warn" note={<>updating ≥ {extra() ? formatRate(extra()!.hot_view_rate) : '—'}</>} />
+                <Cond label="Slow" n={totals()?.slow_views} tone="warn" note={<>p99 ≥ {extra() ? formatMs(extra()!.slow_ms) : '—'}</>} />
+                <Cond label="Large" n={totals()?.large_views} tone="warn" note={<>≥ {extra() ? formatCount(extra()!.large_view_rows) : '—'} rows</>} />
+                <Cond label="Erroring" n={totals()?.errored_views} tone="bad" note="clients see stale data" />
+              </div>
             </FxCell>
           </section>
-        </Show>
 
-        {/* every view ====================================================== */}
-        <section class="fx-row">
-          <FxCell label="Live queries" meta={<Show when={data()}>{(d) => <span><b>{formatCount(d().returned)}</b>{d().total > d().returned ? ` of ${formatCount(d().total)}` : ''}</span>}</Show>}>
-            <div class="inc-filters">
-              <FilterMenu
-                value={filters()}
-                onChange={setFilters}
-                fields={[
-                  {
-                    key: 'condition',
-                    label: 'Condition',
-                    options: [
-                      { value: 'hot', label: 'hot', count: totals()?.hot_views, tone: 'warn' },
-                      { value: 'slow', label: 'slow', count: totals()?.slow_views, tone: 'warn' },
-                      { value: 'large', label: 'large', count: totals()?.large_views, tone: 'warn' },
-                      { value: 'shared', label: 'shared', count: totals()?.shared_views, tone: '' },
-                    ],
-                  },
-                  { key: 'user', label: 'User', single: true, options: userOptions() },
-                  { key: 'ssp', label: 'SSP', single: true, options: (extra()?.by_ssp ?? []).map((s) => ({ value: s.ssp_id, label: s.ssp_id, count: s.views })) },
-                ]}
-              />
-              <SortMenu options={SORTS.map((o) => ({ value: o.key, label: o.label }))} value={sort()} onChange={setSort} />
-              <div class="inc-find">
-                <input type="search" placeholder="Search the query" value={search()} onInput={(e) => setSearch(e.currentTarget.value)} aria-label="Search the query" />
-                <Show when={filtering()}><button type="button" class="btn btn-sm" onClick={reset}>Clear all</button></Show>
+          {/* where they live, and whose they are ============================= */}
+          <section class="fx-row" style={{ 'grid-template-columns': 'minmax(0, 1fr) minmax(0, 1fr)' }}>
+            <FxCell label="By SSP" meta={<span><b>{bySsp().length}</b> serving</span>}>
+              <div class="sp-share">
+                <For each={bySsp()}>
+                  {(x, i) => <i style={{ 'flex-grow': x.views || 0.0001, background: SHADES[i() % SHADES.length] }} title={`${x.ssp_id}: ${formatCount(x.views)}`} />}
+                </For>
               </div>
-            </div>
-
-            <Show when={error()}>{(msg) => <div class="fx-log bad"><span class="fx-what">{msg()}</span></div>}</Show>
-
-            <Show when={data()} fallback={<Show when={!error()}><div class="fx-empty cap">Loading…</div></Show>}>
-              {(d) => (
-                <Show when={d().views.length > 0} fallback={<div class="fx-empty cap">No live view matches</div>}>
-                  <table class="fx-list vw-list">
-                    <colgroup>
-                      <col /><col style={{ width: '15%' }} /><col style={{ width: '9%' }} /><col style={{ width: '9%' }} />
-                      <col style={{ width: '13%' }} /><col style={{ width: '7%' }} />
-                    </colgroup>
-                    <thead>
+              <table class="fx-list vw-mini">
+                <tbody>
+                  <For each={bySsp()}>
+                    {(x, i) => (
                       <tr>
-                        <th class="cap">Query</th><th class="cap">User</th><th class="cap r">Rows</th>
-                        <th class="cap r">p99</th><th class="cap r">Updates</th><th class="cap r">Errors</th>
+                        <td><span class="fx-who"><i class="vw-key" style={{ background: SHADES[i() % SHADES.length] }} /><span style={{ color: 'var(--ink)' }}>{x.ssp_id}</span></span></td>
+                        <td class="r">{formatCount(x.views)}</td>
+                        <td class="r" style={{ width: '18%' }}>{sspViews() ? Math.round((x.views / sspViews()) * 100) : 0}%</td>
                       </tr>
-                    </thead>
-                    <tbody>
-                      <For each={d().views}>
-                        {(v) => {
-                          const slow = () => v.p99 !== null && v.p99 >= d().slow_ms;
-                          const large = () => v.row_count >= d().large_view_rows;
-                          const lapsed = () => v.expires_at_ms !== null && v.expires_at_ms <= now();
-                          const tone = () => (v.error_count ? 'bad' : v.hot || slow() || large() ? 'warn' : lapsed() ? 'idle' : '');
-                          return (
-                            <tr classList={{ 'vw-lapsed': lapsed() }}>
-                              <td class="vw-q">
-                                <A href={`/views/${encodeURIComponent(v.key)}`} title={v.surql ?? v.key}>
-                                  <Sq tone={tone()} />
-                                  <span class="vw-surql">{v.surql ?? v.key}</span>
-                                </A>
-                                <span class="vw-meta cap">
-                                  <span>{v.ssp_id ?? 'unassigned'}</span>
-                                  <Show when={v.shared}><span>shared by {formatCount(v.subscriber_count)}</span></Show>
-                                  <Show when={v.hot}><span class="warn">hot</span></Show>
-                                  <Show when={lapsed()}><span>lapsed</span></Show>
-                                </span>
-                              </td>
-                              <td>
-                                <button type="button" class="vw-user" disabled={!v.auth_id}
-                                  title="Only this user's views" onClick={() => setFilters({ ...filters(), user: [v.auth_id] })}>
-                                  {v.auth_id || 'anonymous'}
-                                </button>
-                              </td>
-                              <td class="r" classList={{ warn: large() }}>{formatCount(v.row_count)}</td>
-                              <td class="r" classList={{ warn: slow() }}>{formatMs(v.p99)}</td>
-                              <td class="r">
-                                {formatCount(v.update_count)}
-                                <Show when={v.hot}><span class="vw-rate">{formatRate(v.update_rate)}</span></Show>
-                              </td>
-                              <td class="r" classList={{ bad: !!v.error_count }} style={{ color: v.error_count ? undefined : 'var(--ink-ghost)' }}>
-                                {formatCount(v.error_count)}
-                              </td>
-                            </tr>
-                          );
-                        }}
-                      </For>
-                    </tbody>
-                  </table>
-                </Show>
-              )}
-            </Show>
-          </FxCell>
-        </section>
-      </div>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </FxCell>
+            <FxCell label="Top users" meta={<span>by live views</span>}>
+              <table class="fx-list vw-mini">
+                <tbody>
+                  <For each={topUsers()} fallback={<tr><td class="cap" style={{ color: 'var(--ink-ghost)' }}>Nobody is here</td></tr>}>
+                    {(u) => (
+                      <tr>
+                        <td style={{ color: 'var(--ink)' }}>{u.auth_id || 'anonymous'}</td>
+                        <td style={{ width: '40%' }}>
+                          <span class="vw-bar"><i style={{ width: `${(u.views / userMax()) * 100}%` }} /></span>
+                        </td>
+                        <td class="r" style={{ width: '12%' }}>{formatCount(u.views)}</td>
+                        <td class="r" style={{ width: '16%' }}>{plural(u.sessions, 'tab', 'tabs')}</td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </FxCell>
+          </section>
+
+          {/* churning right now ============================================== */}
+          <Show when={(extra()?.hot.length ?? 0) > 0}>
+            <section class="fx-row">
+              <FxCell label="Hot right now" meta={<span>usually a bulk write into a table these watch</span>}>
+                <For each={extra()!.hot.slice(0, 3)}>
+                  {(h) => (
+                    <div class="fx-log">
+                      <span class="cap">{formatRate(h.per_sec)}</span>
+                      <span class="fx-what">{h.auth_id || 'anonymous'} · {h.ssp_id ?? 'unassigned'} <em>· {h.key}</em></span>
+                      <A class="btn btn-sm" href={`/views/${encodeURIComponent(h.key)}`}>Open</A>
+                    </div>
+                  )}
+                </For>
+              </FxCell>
+            </section>
+          </Show>
+
+          {/* every view ====================================================== */}
+          <section class="fx-row">
+            <FxCell label="Live queries" meta={<Show when={data()}>{(d) => <span><b>{formatCount(d().returned)}</b>{d().total > d().returned ? ` of ${formatCount(d().total)}` : ''}</span>}</Show>}>
+              <div class="inc-filters">
+                <FilterMenu
+                  value={filters()}
+                  onChange={setFilters}
+                  fields={[
+                    {
+                      key: 'condition',
+                      label: 'Condition',
+                      options: [
+                        { value: 'hot', label: 'hot', count: totals()?.hot_views, tone: 'warn' },
+                        { value: 'slow', label: 'slow', count: totals()?.slow_views, tone: 'warn' },
+                        { value: 'large', label: 'large', count: totals()?.large_views, tone: 'warn' },
+                        { value: 'shared', label: 'shared', count: totals()?.shared_views, tone: '' },
+                      ],
+                    },
+                    { key: 'user', label: 'User', single: true, options: userOptions() },
+                    { key: 'ssp', label: 'SSP', single: true, options: (extra()?.by_ssp ?? []).map((s) => ({ value: s.ssp_id, label: s.ssp_id, count: s.views })) },
+                  ]}
+                />
+                <SortMenu options={SORTS.map((o) => ({ value: o.key, label: o.label }))} value={sort()} onChange={setSort} />
+                <div class="inc-find">
+                  <input type="search" placeholder="Search the query" value={search()} onInput={(e) => setSearch(e.currentTarget.value)} aria-label="Search the query" />
+                  <Show when={filtering()}><button type="button" class="btn btn-sm" onClick={reset}>Clear all</button></Show>
+                </div>
+              </div>
+
+              <Show when={error()}>{(msg) => <div class="fx-log bad"><span class="fx-what">{msg()}</span></div>}</Show>
+
+              <Show when={data()} fallback={<Show when={!error()}><div class="fx-empty cap">Loading…</div></Show>}>
+                {(d) => (
+                  <Show when={d().views.length > 0} fallback={<div class="fx-empty cap">No live view matches</div>}>
+                    <table class="fx-list vw-list">
+                      <colgroup>
+                        <col /><col style={{ width: '15%' }} /><col style={{ width: '9%' }} /><col style={{ width: '9%' }} />
+                        <col style={{ width: '13%' }} /><col style={{ width: '7%' }} />
+                      </colgroup>
+                      <thead>
+                        <tr>
+                          <th class="cap">Query</th><th class="cap">User</th><th class="cap r">Rows</th>
+                          <th class="cap r">p99</th><th class="cap r">Updates</th><th class="cap r">Errors</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <For each={d().views}>
+                          {(v) => {
+                            const slow = () => v.p99 !== null && v.p99 >= d().slow_ms;
+                            const large = () => v.row_count >= d().large_view_rows;
+                            const lapsed = () => v.expires_at_ms !== null && v.expires_at_ms <= now();
+                            const tone = () => (v.error_count ? 'bad' : v.hot || slow() || large() ? 'warn' : lapsed() ? 'idle' : '');
+                            return (
+                              <tr classList={{ 'vw-lapsed': lapsed() }}>
+                                <td class="vw-q">
+                                  <A href={`/views/${encodeURIComponent(v.key)}`} title={v.surql ?? v.key}>
+                                    <Sq tone={tone()} />
+                                    <span class="vw-surql">{v.surql ?? v.key}</span>
+                                  </A>
+                                  <span class="vw-meta cap">
+                                    <span>{v.ssp_id ?? 'unassigned'}</span>
+                                    <Show when={v.shared}><span>shared by {formatCount(v.subscriber_count)}</span></Show>
+                                    <Show when={v.hot}><span class="warn">hot</span></Show>
+                                    <Show when={lapsed()}><span>lapsed</span></Show>
+                                  </span>
+                                </td>
+                                <td>
+                                  <button type="button" class="vw-user" disabled={!v.auth_id}
+                                    title="Only this user's views" onClick={() => setFilters({ ...filters(), user: [v.auth_id] })}>
+                                    {v.auth_id || 'anonymous'}
+                                  </button>
+                                </td>
+                                <td class="r" classList={{ warn: large() }}>{formatCount(v.row_count)}</td>
+                                <td class="r" classList={{ warn: slow() }}>{formatMs(v.p99)}</td>
+                                <td class="r">
+                                  {formatCount(v.update_count)}
+                                  <Show when={v.hot}><span class="vw-rate">{formatRate(v.update_rate)}</span></Show>
+                                </td>
+                                <td class="r" classList={{ bad: !!v.error_count }} style={{ color: v.error_count ? undefined : 'var(--ink-ghost)' }}>
+                                  {formatCount(v.error_count)}
+                                </td>
+                              </tr>
+                            );
+                          }}
+                        </For>
+                      </tbody>
+                    </table>
+                  </Show>
+                )}
+              </Show>
+            </FxCell>
+          </section>
+        </div>
+      </Show>
     </>
   );
 }
@@ -379,7 +389,7 @@ export function ViewDetail() {
 
       <Show when={error()}>{(msg) => <section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{msg()}</span></div></FxCell></section>}</Show>
 
-      <Show when={data()} fallback={<Show when={!error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+      <Show when={data()} fallback={<Show when={!error()}><ViewDetailSkeleton /></Show>}>
         {(d) => {
           const v = () => d().view;
           const heap = () => {

@@ -5,6 +5,7 @@ import { PageHead } from '../components/Chrome';
 import { FilterMenu, Sq, type FilterValue } from '../components/Frame';
 import { formatCount, formatRelativeTime } from '../lib/format';
 import { liveLogsView, useLiveView } from '../api/liveStack';
+import { LogRowsSkeleton, LogTotalSkeleton, PlotSkeleton } from '../skeletons/Logs';
 import type { Overview } from '../api/types';
 import {
   appendNew,
@@ -417,7 +418,7 @@ export function Logs(props: { overview: Overview | undefined }) {
                 </For>
               </div>
               <div class="lx-total">
-                <Show when={!loading()} fallback={<span class="sk lx-total-sk" />}>
+                <Show when={!loading()} fallback={<LogTotalSkeleton />}>
                   <b>{formatCount(viewCount())}</b>
                   <span class="cap">
                     lines<Show when={viewSpan()}> · {viewSpan()}</Show>
@@ -887,9 +888,7 @@ function Histogram(props: {
       >
         <canvas ref={canvas} aria-hidden="true" />
         <Show when={props.loading}>
-          <div class="lx-plot-sk" aria-hidden="true">
-            <Index each={SKELETON}>{(h, i) => <span class="sk" style={{ height: `${h()}%`, '--i': i % 12 }} />}</Index>
-          </div>
+          <PlotSkeleton />
         </Show>
         <Show when={pillWin()}>
           {(pw) => (
@@ -942,9 +941,6 @@ function Histogram(props: {
     </div>
   );
 }
-
-/** Heights of the loading bars: a plausible skyline, fixed so it does not flicker. */
-const SKELETON = Array.from({ length: 64 }, (_, i) => 18 + Math.round(30 * (1 + Math.sin(i / 4.3)) * (0.6 + 0.4 * Math.cos(i / 9))));
 
 /* ------------------------------------------------------------------ */
 /* the table                                                           */
@@ -1070,7 +1066,7 @@ function LogTable(props: {
         <span>Message</span>
       </div>
       <div class="lx-vp" ref={vp} onScroll={remember} tabIndex={0} onKeyDown={onKey} role="grid" aria-rowcount={props.count} aria-label="Log lines, newest first">
-        <Show when={!props.loading} fallback={<SkeletonRows />}>
+        <Show when={!props.loading} fallback={<LogRowsSkeleton />}>
           <Show when={props.count > 0} fallback={props.empty}>
             <div class="lx-spacer" style={{ height: `${props.count * ROW}px` }}>
               <div class="lx-rows" style={{ transform: `translateY(${first() * ROW}px)` }}>
@@ -1121,23 +1117,6 @@ function Marked(props: { text: string; q: string }) {
       <mark>{props.text.slice(at(), at() + props.q.length)}</mark>
       {props.text.slice(at() + props.q.length)}
     </Show>
-  );
-}
-
-function SkeletonRows() {
-  return (
-    <div class="lx-sk-rows" aria-hidden="true">
-      <Index each={Array.from({ length: 14 })}>
-        {(_, i) => (
-          <div class="lx-row">
-            <span class="sk" style={{ width: '84px', '--i': i }} />
-            <span class="sk" style={{ width: '34px', '--i': i }} />
-            <span class="sk lx-target" style={{ width: '90px', '--i': i }} />
-            <span class="sk" style={{ width: `${38 + ((i * 37) % 45)}%`, '--i': i }} />
-          </div>
-        )}
-      </Index>
-    </div>
   );
 }
 

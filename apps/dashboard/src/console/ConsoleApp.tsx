@@ -33,6 +33,7 @@ import type { LoginResponse } from '../api/types';
 import { ConfirmHost, ToastHost } from '../components/Actions';
 import { Logo, PageHead } from '../components/Chrome';
 import { FrameSkeleton, PageSkeleton, Shell } from '../components/Shell';
+import { pageSkeleton } from '../skeletons';
 import { ProjectApp } from '../ProjectApp';
 import { Database, SqlEditor } from '../routes/Database';
 import { Flags } from '../routes/Flags';
@@ -375,12 +376,8 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
 /** A project page while its session opens: its own head, a loading body. */
 function Opening() {
   const params = useParams<{ rest?: string }>();
-  const title = () => {
-    const page = (params.rest ?? '').split('/')[0];
-    if (!page) return 'Overview';
-    return page === 'ssps' ? 'SSPs' : page[0].toUpperCase() + page.slice(1);
-  };
-  return <PageSkeleton head={<PageHead title={title()} />} />;
+  const page = () => pageSkeleton(params.rest ?? '');
+  return <PageSkeleton head={<PageHead title={page().title} />} body={page().body} />;
 }
 
 /** The cloud's own pages for a project whose dashboard cannot open. */

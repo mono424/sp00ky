@@ -29,6 +29,26 @@ export interface ConsoleChrome {
 const Ctx = createContext<ConsoleChrome | undefined>(undefined);
 export const ConsoleChromeProvider = Ctx.Provider;
 
+/**
+ * Where a page's head goes on a phone: the console's top bar. Shell sets it;
+ * PageHead portals into it. Undefined outside the console.
+ */
+const MobileHeadCtx = createContext<Accessor<HTMLElement | undefined>>(() => undefined);
+export const MobileHeadSlot = MobileHeadCtx.Provider;
+export function useMobileHeadSlot(): Accessor<HTMLElement | undefined> {
+  return useContext(MobileHeadCtx);
+}
+
+/** A media query as a signal. */
+export function useMedia(query: string): Accessor<boolean> {
+  const mq = window.matchMedia(query);
+  const [on, setOn] = createSignal(mq.matches);
+  const onChange = (e: MediaQueryListEvent) => setOn(e.matches);
+  mq.addEventListener('change', onChange);
+  onCleanup(() => mq.removeEventListener('change', onChange));
+  return on;
+}
+
 /** The console's chrome, or undefined outside the console. */
 export function useConsoleChrome(): ConsoleChrome | undefined {
   return useContext(Ctx);
@@ -170,7 +190,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
           </button>
         }
       >
-        <button class="cx-prow" classList={{ on: open() }} onClick={() => setOpen(!open())} aria-haspopup="menu" aria-expanded={open()} title="Switch project (⌘P)">
+        <button class="cx-prow" classList={{ on: open() }} onClick={() => setOpen(!open())} aria-haspopup="menu" aria-expanded={open()} title={`${c.project()?.slug ?? 'Projects'} · switch project (⌘P)`}>
           <Show
             when={c.project()}
             fallback={
@@ -182,7 +202,7 @@ export function ProjectSwitcher(props: { rail?: boolean }) {
             {(p) => <span class={`fx-sq ${projectTone(p())}`} />}
           </Show>
           <span class="cx-prow-text">
-            <b classList={{ 'cx-prow-none': !c.project() }}>{c.project()?.slug ?? (c.workspace()?.projects.length ? 'Open a project' : 'No projects yet')}</b>
+            <b classList={{ 'cx-prow-none': !c.project() }}>{c.project()?.slug ?? (c.workspace()?.projects.length ? 'Projects' : 'No projects')}</b>
             <small>{c.project() ? projectLine(c.project()!) : `${c.workspace()?.projects.length ?? 0} in ${c.workspace()?.name ?? 'this workspace'}`}</small>
           </span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">

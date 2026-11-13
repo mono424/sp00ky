@@ -223,42 +223,39 @@ when it cannot get a machine.
   caption="Your own services, their resolved health-check URLs and response times."
 />
 
-**Runs** — schedules, workflow runs and jobs on one page, because they are one
-machine seen from three sides: a schedule fires either a job (a row in an outbox
-table that a backend runs at a path) or a workflow run, and every step of a
-workflow run is itself a job. On separate pages one failure showed up three
-times; here it shows up once.
+**Schedules**, **Workflows** and **Runs** — three pages over one machine: a
+schedule fires either a job (a row in an outbox table that a backend runs at a
+path) or a workflow run, and every step of a workflow run is itself a job.
 
 <Screenshot
   src="/docs/admin/runs.png"
   caption="What is running and waiting, every schedule with its last fires, every run, and the queues."
 />
 
-Top to bottom:
-
-- **The numbers**: running, waiting (with the oldest wait), jobs done per minute,
-  and failures in the last hour. **Stalled** is called out separately from
-  running: a `processing` row whose lease has expired, meaning nobody is working
-  on it and a recovery sweep will reclaim it on its own clock.
 - **Schedules**: each one's cadence in words, its last twelve fires as squares
   (red where a fire failed; click one to open what it ran), the last and next
   fire, and **Run now** and **Pause** on hover.
-- **Runs**: everything that executed, running and waiting first. A workflow run
-  is one row and its step jobs live inside it; a job of its own (from a
-  `kind: job` schedule, a durable instance, or your own code, which belongs to
-  no schedule and no workflow) is one row. Each row carries its failure reason,
-  so four failed runs do not cost four clicks to tell one problem from four.
-  **Filter** by status, kind, what started it, schedule or queue, or search by
-  name, id or error. A filter the scheduler can answer is pushed into SurrealQL
-  rather than applied to the page already fetched, so failures on a busy table
-  are found even when they are older than the newest page.
-- **Queues**: one row per outbox table, running against its `_00_job_policy`
-  concurrency, its pace, what waits and what failed.
+- **Workflows**: every workflow run, running and waiting first. A run is one row
+  and its step jobs live inside it. Each row carries its failure reason, so four
+  failed runs do not cost four clicks to tell one problem from four. **Filter**
+  by status, what started it or schedule, or search by name, id or error.
+- **Runs**: jobs of their own (from a `kind: job` schedule, a durable instance,
+  or your own code, which belongs to no schedule and no workflow), with the
+  numbers on top: running, waiting (with the oldest wait), jobs done per minute,
+  and failures in the last hour. **Stalled** is called out separately from
+  running: a `processing` row whose lease has expired, meaning nobody is working
+  on it and a recovery sweep will reclaim it on its own clock. **Filter** adds
+  the queue; a filter the scheduler can answer is pushed into SurrealQL rather
+  than applied to the page already fetched, so failures on a busy table are
+  found even when they are older than the newest page. Under the list, **Queues**:
+  one row per outbox table, running against its `_00_job_policy` concurrency,
+  its pace, what waits and what failed.
 
-A run, job or schedule opens in a sheet beside the list. The sheet is part of
-the address (`/admin/runs?open=run:<id>`, `job:<id>`, `schedule:<name>`), so it
-survives a reload, and the old `/admin/jobs/<id>`, `/admin/workflows/<id>` and
-`/admin/schedules/<name>` links land on it.
+A run, job or schedule opens in a sheet beside the list, on whichever page you
+are on. The sheet is part of the address (`/admin/workflows?open=run:<id>`,
+`/admin/runs?open=job:<id>`, `/admin/schedules?open=schedule:<name>`), so it
+survives a reload. `/admin/workflows/<id>`, `/admin/schedules/<name>`,
+`/admin/jobs/<id>` and `/admin/jobs` land on the right page.
 
 <Screenshot
   src="/docs/admin/run.png"
@@ -628,7 +625,7 @@ falls back to polling on its own.
 | `SPKY_ADMIN_LARGE_VIEW_ROWS`        | `1000`                        | Row count from which a view is flagged **large** on the Views tab and the Overview. Every row of an unwindowed live view is republished as an edge on each cold registration, so a few thousand at once can stall the database; `?large=true` filters the list to them |
 | `SPKY_ADMIN_HOT_VIEW_UPDATES_PER_SEC` | `5`                         | Updates per second, between two presence samples, from which a view is flagged **hot** on the Views tab and the Overview and opens a `hot_views` incident. `?hot=true` filters the list to them. See [Hot views](#hot-views) |
 | `SPKY_ADMIN_PRESENCE_MAX_ROWS`      | `20000`                       | Ceiling on rows one presence or views query may pull back                                                                                                                                                                                                              |
-| `SPKY_ADMIN_JOB_INTERVAL_SECS`      | `15`                          | How often the job sampler reads the outbox tables while nobody has the Jobs page open. `0` switches the sampler off: the Jobs list still works, the totals and the Overview tile report that they are not measured                                                     |
+| `SPKY_ADMIN_JOB_INTERVAL_SECS`      | `15`                          | How often the job sampler reads the outbox tables while nobody has the Runs page open. `0` switches the sampler off: the Runs list still works, the totals and the Overview tile report that they are not measured                                                     |
 | `SPKY_ADMIN_JOB_LIVE_INTERVAL_SECS` | `2`                           | The cadence while at least one dashboard holds `/admin/api/jobs/stream` open. Clamped to no slower than the idle interval                                                                                                                                              |
 | `SPKY_ADMIN_ALLOWED_ORIGINS`        | unset (any)                   | Comma-separated browser origins allowed to call the API and open the live socket. Unset or `*` allows any (the bearer token, never a cookie, is what authenticates); the scheduler's own page is always allowed. Sp00ky Cloud sets it to the console and the project's admin host |
 | `SPKY_ADMIN_CLOUD_LOGIN`            | `true`                        | Whether console grants are accepted on a cloud-linked scheduler. `0`/`false`/`off` refuses them                                                                                                                                                                        |

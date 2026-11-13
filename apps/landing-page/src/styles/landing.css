@@ -1,4 +1,4 @@
-/* Homepage art direction: cyanotype landscape above an industrial cutaway. */
+/* Homepage art direction: blurred cyanotype landscape behind a console teaser. */
 body.landing-page { padding-top: 0; }
 .launch-atmosphere {
   position: absolute;
@@ -32,27 +32,76 @@ body.landing-page { padding-top: 0; }
   width: 100%;
   height: 100%;
 }
-.landscape-hero-art { object-fit: cover; object-position: 75% 58%; z-index: -2; }
+.landscape-hero-art {
+  object-fit: cover;
+  object-position: 75% 58%;
+  z-index: -2;
+  /* Blurred backdrop: the dashboard teaser is the subject, the landscape is mood. */
+  filter: blur(22px) saturate(1.2);
+  transform: scale(1.12);
+}
 .landscape-hero-shade {
   z-index: -1;
-  background: linear-gradient(90deg, rgba(3, 10, 55, .36), transparent 68%), linear-gradient(180deg, rgba(2, 7, 37, .18), transparent 55%, rgba(2, 7, 37, .5));
+  background:
+    radial-gradient(ellipse 60% 42% at 50% 22%, rgba(3, 8, 44, .38), transparent 72%),
+    linear-gradient(180deg, rgba(2, 7, 37, .3), rgba(2, 7, 37, .08) 45%, rgba(2, 7, 37, .45));
 }
-.landing-intro { max-width: 1440px; margin: auto; padding: clamp(112px, 14vh, 160px) 56px 80px; }
-.landing-intro-copy { display: flex; flex-direction: column; align-items: flex-start; text-align: left; gap: 32px; max-width: 690px; }
-.landing-intro .hero-actions { position: absolute; bottom: clamp(88px, 12svh, 144px); left: 50%; transform: translateX(-50%); display: grid; gap: 12px; width: 390px; max-width: calc(100% - 48px); }
-.landing-intro .hero-ctas { display: grid; grid-template-columns: 1fr 1.15fr; gap: 10px; }
-.landing-intro .hero-ctas .hero-btn { justify-content: space-between; min-width: 0; min-height: 46px; font-size: 13px; white-space: nowrap; }
-.landing-intro .hero-headline { font-size: clamp(3.25rem, 5.7vw, 5.2rem); text-shadow: 0 2px 24px #08104b44; }
-.landing-intro .hero-btn { border-radius: 3px; padding: 12px 19px; gap: 24px; transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease; }
-.landing-intro .hero-btn-ghost { color: white; background: #09134b66; border-color: #e8edff66; }
-.landing-intro .hero-btn-ghost:hover { background: #101e6f; }
-.landing-intro .hero-install { width: 100%; min-height: 44px; border-radius: 3px; background: #050b29b3; border-color: #dce6ff55; font-size: 11px; flex-shrink: 0; }
-.landing-intro .copy-btn { color: #e0e7ff; margin-left: auto; }
+.landing-intro {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: clamp(104px, 13svh, 148px) 32px 0;
+}
+.landing-intro-copy { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 28px; max-width: 820px; }
+.landing-intro .hero-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; animation: fade-up 320ms 180ms ease-out both; }
+.landing-intro .hero-headline { font-size: clamp(2.9rem, 5vw, 4.6rem); text-shadow: 0 2px 28px #08104b55; }
+.landing-intro .hero-btn { border-radius: 999px; min-height: 46px; padding: 12px 24px; gap: 10px; font-size: 14px; white-space: nowrap; transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease; }
+.landing-intro .hero-btn-ghost { color: white; background: #09134b66; border-color: #e8edff66; -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.landing-intro .hero-btn-ghost:hover { background: #101e6f; border-color: #e8edff99; }
+
+/* Console teaser: sits under the copy and runs off the bottom edge of the hero,
+   which clips it. It rises a little as the hero shrinks on scroll. */
+.hero-console {
+  flex: 1;
+  min-height: 0;
+  width: min(1180px, 100%);
+  margin-top: clamp(36px, 6svh, 64px);
+  transform: translateY(calc(var(--hero-progress, 0) * -24px));
+}
+.hero-console-frame {
+  box-sizing: border-box;
+  /* Always run past the hero's bottom edge, whatever the viewport height. */
+  height: calc(100% + 40px);
+  padding: 7px 7px 0;
+  border: 1px solid rgba(232, 237, 255, .22);
+  border-bottom: 0;
+  border-radius: 14px 14px 0 0;
+  background: linear-gradient(180deg, rgba(232, 237, 255, .14), rgba(232, 237, 255, .05));
+  box-shadow: 0 -2px 0 rgba(255, 255, 255, .04) inset, 0 40px 120px -24px rgba(2, 6, 30, .75);
+  animation: fade-up 520ms 160ms ease-out both;
+}
+.hero-console-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: left top;
+  border: 1px solid rgba(0, 0, 0, .5);
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hero-console { transform: none; }
+  .hero-console-frame { animation: none; }
+}
 @media (max-width: 760px) {
-  .landscape-hero-art { object-position: 75% center; }
-  .landing-intro { padding: 104px 24px 48px; }
-  .landing-intro-copy { gap: 28px; }
+  .landscape-hero-art { object-position: 75% center; filter: blur(16px) saturate(1.2); }
+  .landing-intro { padding: 104px 24px 0; }
+  .landing-intro-copy { gap: 24px; }
   .landing-intro .hero-headline { font-size: clamp(40px, 8.1vw, 60px); }
-  .landing-intro .hero-ctas .hero-btn { font-size: 12px; padding: 11px 10px; gap: 8px; }
-  .landing-intro .hero-install { padding: 10px; gap: 6px; font-size: clamp(9px, 2.55vw, 11px); }
+  .landing-intro .hero-btn { font-size: 13px; padding: 11px 20px; }
+  /* Too small to read whole: cover crops to the left part (sidebar + round trip). */
+  .hero-console { margin-top: 32px; }
 }

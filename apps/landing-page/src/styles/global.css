@@ -442,13 +442,13 @@ body {
 .nav-link.active {
   color: #ffffff;
 }
-.mega-caret {
+.nav-caret {
   width: 12px;
   height: 12px;
   transition: transform 200ms ease;
   opacity: 0.7;
 }
-.nav-link.active .mega-caret {
+.nav-link.active .nav-caret {
   transform: rotate(180deg);
 }
 
@@ -518,21 +518,77 @@ body {
   }
 }
 .nav-mobile-menu {
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
-  padding: 12px 28px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  font-size: 14px;
-}
-.nav-mobile-menu a {
-  color: #a1a1aa;
-}
-.nav-mobile-menu a:hover {
-  color: #fff;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  max-height: calc(100svh - 96px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .nav-mobile-menu.hidden {
   display: none;
+}
+.nav-mobile-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px 12px 16px;
+}
+.nav-mobile-label {
+  margin: 0 0 4px;
+  padding: 0 14px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #8a8f9e;
+}
+.nav-mobile-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+}
+.nav-mobile-grid .nav-item {
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+}
+.nav-mobile-grid .nav-item-icon {
+  margin-top: 0;
+}
+/* Titles only on a phone: the grid stays short enough to scan at once. */
+.nav-mobile-grid .nav-item-desc {
+  display: none;
+}
+/* The open menu reads on a solid surface, not over the hero's colour. */
+.nav-root:has(.nav-mobile-menu:not(.hidden))::before {
+  background: rgba(19, 21, 29, 0.94);
+  border-color: rgba(255, 255, 255, 0.09);
+}
+.nav-mobile-foot {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 2px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+.nav-mobile-link {
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 14px;
+  color: #c6c9d3;
+}
+.nav-mobile-link:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.05);
+}
+.nav-mobile-start {
+  margin-left: auto;
+  padding: 9px 18px;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 500;
+  background: #fff;
+  color: #000;
+}
+.nav-mobile-start:hover {
+  background: rgba(255, 255, 255, 0.88);
 }
 
 /* ─────────────────────────── LOGO CONTEXT MENU ─────────────────────────── */
@@ -543,12 +599,12 @@ body {
   z-index: 100;
   min-width: 240px;
   padding: 6px;
-  background: rgba(14, 14, 18, 0.98);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 10px;
-  box-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.02);
-  backdrop-filter: saturate(140%) blur(6px);
-  -webkit-backdrop-filter: saturate(140%) blur(6px);
+  background: rgba(19, 21, 29, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px -16px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(24px) saturate(140%);
+  -webkit-backdrop-filter: blur(24px) saturate(140%);
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -561,12 +617,12 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 10px;
+  padding: 9px 12px;
   border: none;
   background: transparent;
-  color: #a1a1aa;
+  color: #c6c9d3;
   text-align: left;
-  border-radius: 6px;
+  border-radius: 8px;
   cursor: pointer;
   font: inherit;
   transition: background 120ms ease, color 120ms ease;
@@ -587,179 +643,105 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 
-/* ─────────────────────────── MEGA MENU ─────────────────────────── */
-.mega-trigger {
-  position: static;
+/* ─────────────────────────── NAV DROPDOWNS ─────────────────────────── */
+/* Compact floating panels: a two-column grid of icon, title and one line. */
+.nav-menu {
+  position: relative;
 }
-/* Fill the small space between the trigger and the panel, without moving the
-   panel's hit area during its fade. */
-.mega::before {
+.nav-panel {
+  position: absolute;
+  /* The trigger sits 14px above the bar's bottom edge: 8px of air below it. */
+  top: calc(100% + 22px);
+  left: 50%;
+  z-index: 60;
+  width: max-content;
+  padding: 6px;
+  background: rgba(19, 21, 29, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px -16px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(24px) saturate(140%);
+  -webkit-backdrop-filter: blur(24px) saturate(140%);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-50%, -4px);
+  transition: opacity 160ms ease, transform 200ms cubic-bezier(0.22, 1, 0.36, 1), visibility 0s linear 200ms;
+}
+/* Bridges the gap to the trigger so the pointer can travel down. */
+.nav-panel::before {
   content: '';
   position: absolute;
   left: 0;
   right: 0;
-  top: -18px;
-  height: 18px;
+  top: -24px;
+  height: 24px;
 }
-.mega {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  right: 0;
-  background: linear-gradient(180deg, rgba(235, 242, 255, .12), rgba(235, 242, 255, .04)), rgba(16, 22, 38, .64);
-  backdrop-filter: blur(24px) saturate(145%);
-  -webkit-backdrop-filter: blur(24px) saturate(145%);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.9);
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  transition: opacity 180ms ease, visibility 180ms;
-  z-index: 40;
-}
-.mega.open {
+.nav-panel.open {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
+  transform: translate(-50%, 0);
+  transition: opacity 160ms ease, transform 200ms cubic-bezier(0.22, 1, 0.36, 1), visibility 0s;
 }
-.mega-inner {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 32px 28px 36px;
-}
-.mega-cols {
+.nav-panel-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr 1px 1.1fr;
-  gap: 36px;
+  grid-template-columns: repeat(2, max-content);
+  gap: 2px;
 }
-.mega-divider {
-  background: linear-gradient(
-    180deg,
-    transparent,
-    rgba(255, 255, 255, 0.08) 20%,
-    rgba(255, 255, 255, 0.08) 80%,
-    transparent
-  );
-}
-.mega-col {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.mega-label {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  color: #71717a;
-  margin-bottom: 14px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.mega-label.cloud {
-  color: #9b8aff;
-}
-.mega-label .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #71717a;
-}
-.mega-label.cloud .dot {
-  background: #9b8aff;
-  box-shadow: 0 0 8px rgba(155, 138, 255, 0.6);
-}
-.mega-item {
+.nav-item {
   display: flex;
   align-items: flex-start;
   gap: 12px;
-  padding: 8px 10px;
-  margin: 0 -10px;
+  padding: 11px 14px;
   border-radius: 8px;
-  cursor: pointer;
-  transition: background 160ms ease;
+  text-align: left;
+  transition: background-color 140ms ease;
 }
-.mega-item:hover {
-  background: rgba(255, 255, 255, 0.04);
+.nav-item:hover,
+.nav-item:focus-visible {
+  background: rgba(255, 255, 255, 0.05);
+  outline: none;
 }
-.mega-item:hover .mega-icon-wrap {
-  border-color: rgba(124, 106, 239, 0.4);
-  background: rgba(124, 106, 239, 0.08);
-  color: #9b8aff;
-}
-.mega-item.cloud:hover .mega-icon-wrap {
-  border-color: rgba(155, 138, 255, 0.55);
-}
-.mega-icon-wrap {
-  width: 36px;
-  height: 36px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.02);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #a1a1aa;
+.nav-item-icon {
+  display: inline-flex;
   flex-shrink: 0;
-  transition: all 160ms ease;
+  margin-top: 2px;
+  color: #8a8f9e;
+  transition: color 140ms ease;
 }
-.mega-icon-wrap svg {
-  width: 18px;
-  height: 18px;
+.nav-item:hover .nav-item-icon,
+.nav-item:focus-visible .nav-item-icon {
+  color: #e6e8ee;
 }
-.mega-item-body {
+.nav-item-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   min-width: 0;
 }
-.mega-item-title {
+.nav-item-title {
   font-size: 14px;
   font-weight: 500;
-  color: #ffffff;
-  line-height: 1.3;
-  margin-bottom: 2px;
+  line-height: 1.35;
+  color: #f4f4f5;
 }
-.mega-item-desc {
-  font-size: 12px;
-  color: #c1c8d8;
-  line-height: 1.4;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.mega-footer {
-  margin-top: 24px;
-  padding-top: 18px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
+.nav-item-desc {
   font-size: 13px;
-}
-.mega-footer .links {
-  display: flex;
-  gap: 22px;
-}
-.mega-footer a {
-  color: #a1a1aa;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  transition: color 160ms ease;
-}
-.mega-footer a:hover {
-  color: #ffffff;
-}
-.mega-footer a.cloud:hover {
-  color: #9b8aff;
-}
-.mega-footer a svg {
-  width: 14px;
-  height: 14px;
+  line-height: 1.4;
+  color: #9497a3;
+  white-space: nowrap;
 }
 @media (max-width: 960px) {
-  .mega {
+  .nav-panel {
     display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nav-panel,
+  .nav-panel.open {
+    transform: translate(-50%, 0);
+    transition: none;
   }
 }
 
@@ -1156,5 +1138,6 @@ body {
 }
 
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  .nav-root::before, .mega { background: rgba(16, 22, 38, .97); }
+  .nav-root::before { background: rgba(16, 22, 38, .97); }
+  .nav-panel, .nav-logo-menu { background: rgba(19, 21, 29, .98); }
 }

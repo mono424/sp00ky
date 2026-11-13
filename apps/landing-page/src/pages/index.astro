@@ -6,11 +6,10 @@ import '../styles/landing.css';
 import { Image, getImage } from 'astro:assets';
 import heroLandscape from '../assets/munich-california-hero.png';
 import heroPortrait from '../assets/munich-california-hero-mobile.png';
-import whitepawnArt from '../assets/case-studies/whitepawn/hero.webp';
 import SiteNav from '../components/SiteNav.astro';
 import SiteFooter from '../components/SiteFooter.astro';
 import SyncArchitecture from '../components/SyncArchitecture.astro';
-import { ScrollRevealText } from '../components/ScrollRevealText';
+import SpookyIntro from '../components/SpookyIntro.astro';
 import NewsletterSignup from '../components/NewsletterSignup';
 import { basePath, DEMO_URL } from '../config/nav';
 
@@ -82,7 +81,7 @@ const mobileHeroSources = await Promise.all(
             src={heroLandscape}
             alt="An imagined lake between Bavaria and California: Munich towers, an academic stone facade, the Golden Gate Bridge and Berkeley’s Campanile among alpine forests, with a little ghost on the shore."
             class="landscape-hero-art"
-            widths={[768, 1280, 1672]}
+            widths={[768, 1280]}
             sizes="100vw"
             format="webp"
             quality={85}
@@ -99,192 +98,34 @@ const mobileHeroSources = await Promise.all(
             </h1>
 
             <div class="hero-actions">
-              <div class="hero-ctas">
-                <a href={`${basePath}/docs`} class="hero-btn hero-btn-primary">Start building <span aria-hidden="true">↗</span></a>
-                <a href="#architecture" class="hero-btn hero-btn-ghost">Explore the engine <span aria-hidden="true">↓</span></a>
-              </div>
+              <a href="https://console.sp00ky.cloud" class="hero-btn hero-btn-primary">Get started <span aria-hidden="true">↗</span></a>
+              <a href={`${basePath}/docs`} class="hero-btn hero-btn-ghost">Read the docs</a>
+            </div>
+          </div>
 
-              <div class="hero-install">
-                <span class="prompt">$</span>
-                <span class="cmd">npx @spooky-sync/cli@canary create</span>
-                <button class="copy-btn" id="hero-copy-btn" aria-label="Copy install command">
-                  <svg
-                    id="hero-copy-icon"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  >
-                    <rect x="9" y="9" width="11" height="11" rx="2"></rect>
-                    <path d="M5 15 H4 a2 2 0 0 1 -2 -2 V4 a2 2 0 0 1 2 -2 h9 a2 2 0 0 1 2 2 v1"></path>
-                  </svg>
-                  <svg
-                    id="hero-check-icon"
-                    class="hidden"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  >
-                    <path d="M20 6 L9 17 l-5 -5"></path>
-                  </svg>
-                </button>
-              </div>
+          <div class="hero-console">
+            <div class="hero-console-frame">
+              <video
+                class="hero-console-img"
+                autoplay
+                muted
+                loop
+                playsinline
+                preload="auto"
+                poster={`${basePath}/hero/console-poster.webp`}
+                aria-label="The sp00ky Cloud console overview, live: sync round trip, live users, SurrealDB and scheduler health, and every running service."
+              >
+                <source src={`${basePath}/hero/console.webm`} type="video/webm" />
+                <source src={`${basePath}/hero/console.mp4`} type="video/mp4" />
+              </video>
             </div>
           </div>
         </div>
       </section>
       </div>
 
-      <!-- Local-first introduction and live demo -->
-      <section class="pt-12 pb-16 md:pb-32">
-        <div class="max-w-7xl mx-auto px-4">
-          <ScrollRevealText
-            client:visible
-            className="text-balance text-4xl md:text-6xl font-medium leading-[1.05] tracking-[-0.045em]"
-            segments={[
-              { text: "It's", preRevealed: true },
-              {
-                text: 'sp00ky.',
-                preRevealed: true,
-                className: 'font-serif font-normal italic tracking-tight text-text-secondary',
-              },
-              {
-                text: 'Data changes, every screen updates. Reactive queries keep every tab, every device, and every user in sync, instantly.',
-              },
-            ]}
-          />
-        </div>
-
-        <!-- Try Out Now, card style -->
-        <div class="max-w-7xl mx-auto px-4 mt-16 md:mt-24">
-          <div class="try-out-btn group relative rounded-2xl border border-white/[0.08] bg-[#111318] overflow-hidden cursor-pointer transition-all duration-300 hover:border-white/[0.14]">
-            <div class="flex flex-col md:flex-row items-stretch min-h-[200px]">
-              <div class="relative z-10 flex flex-col justify-between p-8 md:p-10 md:w-[45%]">
-                <div>
-                  <p class="text-[11px] font-mono uppercase tracking-[0.25em] text-white/35 mb-3">Live demo</p>
-                  <h3 class="text-xl font-semibold text-white/90 mb-2">sp00ky threads</h3>
-                  <p class="text-sm text-white/40 leading-relaxed max-w-[280px]">
-                    A live app built with sp00ky: threads, comments and a collaborative editor, synced in real time
-                    across tabs and devices. Powered by CRDTs, file buckets and local-first sync.
-                  </p>
-                </div>
-                <div class="mt-6 flex flex-wrap items-center gap-4">
-                  <span class="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white/70 rounded-lg border border-white/[0.1] bg-white/[0.04] group-hover:bg-white/[0.08] group-hover:text-white group-hover:border-white/[0.18] transition-all duration-300">
-                    Try it now
-                    <svg
-                      class="w-3.5 h-3.5 -rotate-[0deg] group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform duration-300"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      stroke-width="2"
-                    >
-                      <path stroke-linecap="round" stroke-linejoin="round" d="M7 17L17 7M17 7H7M17 7v10"></path>
-                    </svg>
-                  </span>
-                  <a
-                    href={DEMO_URL}
-                    target="_blank"
-                    rel="noopener"
-                    class="text-sm text-white/45 hover:text-white underline decoration-white/20 underline-offset-4 transition-colors duration-300"
-                  >
-                    Open in a new tab
-                  </a>
-                </div>
-              </div>
-              <div class="relative flex-1 min-h-[160px] md:min-h-0">
-                <div class="absolute inset-0 tryout-grid opacity-[0.35]"></div>
-                <div class="absolute inset-0 flex items-center justify-center">
-                  <div class="flex flex-col items-center gap-5 opacity-40 group-hover:opacity-60 transition-opacity duration-500">
-                    <img src="/logo.svg" alt="sp00ky" class="w-40 md:w-48" />
-                    <span class="text-[11px] font-mono uppercase tracking-[0.25em] text-white/50">sp00ky threads demo</span>
-                  </div>
-                </div>
-                <div class="hidden md:flex absolute right-0 top-0 bottom-0 w-10 items-center justify-center">
-                  <span class="text-[10px] font-mono uppercase tracking-[0.3em] text-white/15 whitespace-nowrap" style="writing-mode: vertical-rl;">Experimental Preview</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Customer story: WhitePawn -->
-        <div class="max-w-7xl mx-auto px-4 mt-6">
-          <a
-            href="/customers/whitepawn"
-            class="story-card group relative block rounded-2xl border border-white/[0.08] bg-[#111318] overflow-hidden transition-all duration-300 hover:border-white/[0.14]"
-          >
-            <div class="flex flex-col md:flex-row items-stretch min-h-[240px]">
-              <div class="relative z-10 flex flex-col justify-between gap-8 p-8 md:p-10 md:w-[46%]">
-                <div>
-                  <p class="flex items-center gap-2 text-[13px] text-white/45 mb-4">
-                    <svg class="w-4 h-4 text-white/60" viewBox="0 0 512 512" fill="currentColor" aria-hidden="true">
-                      <path d="M299,92c-6.9-1.4-36.9-15.2-41.3-8.5c-7.6,11.5-5.5,31.4-9.5,44.5c-7.4,24.1-26.2,48.9-38.3,71 c-6.2,11.2-11,26.6-20.1,35.8c-26.7,26.9-80.5,23.1-107.2,49.7c-7.2,7.2-8.2,20.3-16.1,26.7c-7.6,6.1-20.8,2.8-29.2,7.4 c-6.3,3.5-9.4,14.3-12.4,20.4c-1.9,3.7-6.7,10.2-4.4,14.5c2.9,5.5,13.4,8.6,18.6,11.2c15.4,7.7,31,15.3,46,23.7 c50.7,28.2,103.1,53.9,155,79.8c17.1,8.6,44,29.3,63,30.8c7.6,0.6,24.2-19.8,27.3-26.1c5.7-11.7-12.3-22.3-10.2-34 c1.9-10.4,15.7-17.2,16.2-28c1.2-28.2-21-58.9-24.9-87c-4.9-34.7,10.7-61.9,24.1-93c5.6-12.9,11-36,21.8-45.2 c8.2-7,37.4-16.7,40.1-27.1c3-11.6-29.1-21.4-26.2-33.3c3.2-13.1,22.5-25.4,29.3-37.4c5.9-10.4-1.3-38.2-6.4-48.8 c-3.4-7.1-17.2-10.3-24-13.2c-8.1-3.4-19-12.2-28-11.9c-9.7,0.3-44.3,26.6-48.5,35.4C289.2,58.5,297.2,82.2,299,92z"></path>
-                    </svg>
-                    Customer story, WhitePawn
-                  </p>
-                  <h3 class="text-xl md:text-2xl font-semibold text-white/90 leading-snug mb-3 max-w-[440px] text-balance">
-                    One developer runs a real&#8209;time chess platform on sp00ky.
-                  </h3>
-                  <p class="text-sm text-white/45 leading-relaxed max-w-[400px]">
-                    Web, iOS and Android, with no API layer, no sync code and no ops team. See the
-                    schema, the live queries and the agents that keep it running.
-                  </p>
-                </div>
-                <dl class="grid grid-cols-3 gap-6 max-w-[420px]">
-                  <div>
-                    <dt class="sr-only">Tables</dt>
-                    <dd class="text-xl font-medium text-white/85 tabular-nums">79</dd>
-                    <dd class="text-[12px] text-white/40 mt-1">tables, one schema</dd>
-                  </div>
-                  <div>
-                    <dt class="sr-only">Live queries</dt>
-                    <dd class="text-xl font-medium text-white/85 tabular-nums">178</dd>
-                    <dd class="text-[12px] text-white/40 mt-1">live queries</dd>
-                  </div>
-                  <div>
-                    <dt class="sr-only">API endpoints</dt>
-                    <dd class="text-xl font-medium text-white/85 tabular-nums">0</dd>
-                    <dd class="text-[12px] text-white/40 mt-1">API endpoints written</dd>
-                  </div>
-                </dl>
-                <div>
-                  <span class="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white/70 rounded-lg border border-white/[0.1] bg-white/[0.04] group-hover:bg-white/[0.08] group-hover:text-white group-hover:border-white/[0.18] transition-all duration-300">
-                    Read the case study
-                    <svg
-                      class="w-3.5 h-3.5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform duration-300"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      aria-hidden="true"
-                    >
-                      <path stroke-linecap="round" stroke-linejoin="round" d="M7 17L17 7M17 7H7M17 7v10"></path>
-                    </svg>
-                  </span>
-                </div>
-              </div>
-              <div class="relative flex-1 p-3 pt-0 md:p-4 md:pl-0">
-                <div class="relative h-full min-h-[220px] overflow-hidden rounded-xl border border-white/[0.06]">
-                  <Image
-                    src={whitepawnArt}
-                    alt="Watercolor of a sunny terrace above a bay, with pairs of people playing chess at wooden tables."
-                    class="absolute inset-0 h-full w-full object-cover object-[50%_72%] transition-transform duration-700 ease-out group-hover:scale-[1.04]"
-                    widths={[640, 960, 1280]}
-                    sizes="(min-width: 768px) 50vw, 100vw"
-                    format="webp"
-                    quality={80}
-                  />
-                </div>
-              </div>
-            </div>
-          </a>
-        </div>
-      </section>
+      <!-- Introduction, revealed sentence by sentence, and the live demo -->
+      <SpookyIntro />
 
       <SyncArchitecture />
 
@@ -434,25 +275,17 @@ const mobileHeroSources = await Promise.all(
     </div>
 
     <script>
-      // Hero install copy button
-      const copyBtn = document.getElementById('hero-copy-btn');
-      const copyIcon = document.getElementById('hero-copy-icon');
-      const checkIcon = document.getElementById('hero-check-icon');
-      if (copyBtn && copyIcon && checkIcon) {
-        copyBtn.addEventListener('click', async () => {
-          try {
-            await navigator.clipboard.writeText('npx @spooky-sync/cli@canary create');
-          } catch {
-            /* ignore */
-          }
-          copyIcon.classList.add('hidden');
-          checkIcon.classList.remove('hidden');
-          setTimeout(() => {
-            copyIcon.classList.remove('hidden');
-            checkIcon.classList.add('hidden');
-          }, 1600);
-        });
-      }
+      // The console teaser is decoration: hold it on its first frame when the
+      // visitor asks for less motion.
+      const heroVideo = document.querySelector<HTMLVideoElement>('.hero-console-img');
+      const lessMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+      const applyMotion = () => {
+        if (!heroVideo) return;
+        if (lessMotion.matches) heroVideo.pause();
+        else void heroVideo.play().catch(() => {});
+      };
+      applyMotion();
+      lessMotion.addEventListener('change', applyMotion);
 
       // Try sp00ky overlay
       //
@@ -494,8 +327,11 @@ const mobileHeroSources = await Promise.all(
 
       document.querySelectorAll('.try-out-btn').forEach((btn) => {
         btn.addEventListener('click', (e) => {
-          // The card's own "Open in a new tab" link opens the demo directly.
-          if ((e.target as HTMLElement).closest('a')) return;
+          // The card is a link to the demo: a modified click (new tab, new
+          // window) goes through, a plain one opens the overlay instead.
+          const ev = e as MouseEvent;
+          if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+          e.preventDefault();
           openTryout();
         });
       });
@@ -568,13 +404,4 @@ const mobileHeroSources = await Promise.all(
     }
   </script>
 
-  <style>
-    /* Try Out Now, grid pattern */
-    .tryout-grid {
-      background-image:
-        linear-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
-      background-size: 40px 40px;
-    }
-  </style>
 </html>

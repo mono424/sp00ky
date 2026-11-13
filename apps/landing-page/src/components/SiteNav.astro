@@ -1,7 +1,8 @@
 ---
 import '../styles/site-nav.css';
 import { basePath } from '../config/nav';
-import { MegaMenu } from './MegaMenu';
+import { CONSOLE_URL, GITHUB_URL, navMenus } from '../config/navMenus';
+import { NavMenus, NavMenuItemLink } from './NavMenus';
 
 interface Props {
   activePath?: string;
@@ -29,7 +30,7 @@ const faviconSrc = assetUrl('favicon.svg');
 
     <div class="nav-links-wrap">
       <div class="nav-links">
-        <MegaMenu client:idle />
+        <NavMenus client:idle menus={navMenus} />
         {
           links.map((l) => (
             <a
@@ -44,10 +45,10 @@ const faviconSrc = assetUrl('favicon.svg');
     </div>
 
     <div class="nav-right">
-      <a class="nav-cta" href="https://console.sp00ky.cloud">Console</a>
+      <a class="nav-cta" href={CONSOLE_URL}>Console</a>
       <a
         class="nav-github"
-        href="https://github.com/mono424/sp00ky"
+        href={GITHUB_URL}
         target="_blank"
         rel="noopener"
         aria-label="GitHub"
@@ -71,9 +72,22 @@ const faviconSrc = assetUrl('favicon.svg');
   </div>
 
   <div id="mobile-menu" class="nav-mobile-menu hidden">
-    <a href="/features">Features</a>
-    {links.map((l) => <a href={l.href}>{l.label}</a>)}
-    <a href="https://github.com/mono424/sp00ky" target="_blank" rel="noopener">GitHub</a>
+    <div class="nav-mobile-panel">
+      {
+        navMenus.map((menu) => (
+          <section class="nav-mobile-section" aria-label={menu.label}>
+            <p class="nav-mobile-label">{menu.label}</p>
+            <div class="nav-mobile-grid">
+              {menu.items.map((item) => <NavMenuItemLink item={item} />)}
+            </div>
+          </section>
+        ))
+      }
+      <div class="nav-mobile-foot">
+        {links.map((l) => <a class="nav-mobile-link" href={l.href}>{l.label}</a>)}
+        <a class="nav-mobile-start" href={CONSOLE_URL}>Get started</a>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -134,6 +148,7 @@ const faviconSrc = assetUrl('favicon.svg');
           const progress = reducedHeroMotion.matches || travel <= 0 ? 0 : Math.min(1, Math.max(0, -heroShell.getBoundingClientRect().top / travel));
           const eased = progress * progress * (3 - 2 * progress);
           const scale = 1 - .08 * eased;
+          hero.style.setProperty('--hero-progress', eased.toFixed(4));
           hero.style.setProperty('--hero-scale', scale.toFixed(4));
           hero.style.setProperty('--hero-offset', `${(32 * eased).toFixed(2)}px`);
           hero.style.setProperty('--hero-radius', `${(14 * eased / scale).toFixed(2)}px`);

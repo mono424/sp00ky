@@ -21,7 +21,9 @@ use crate::package_manager::{self, PackageManager};
 // Version
 // ---------------------------------------------------------------------------
 
-const VERSION: &str = "0.0.1-canary.17";
+/// Scaffolded projects pin `@spooky-sync/*` to the CLI's own version, so a
+/// project created by a given CLI installs the matching packages.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
 // Ghost art (matches AsciiGhost.tsx)

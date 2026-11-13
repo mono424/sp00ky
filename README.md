@@ -12,7 +12,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@spooky-sync/core?label=%40spooky-sync%2Fcore&color=cb3837)](https://www.npmjs.com/package/@spooky-sync/core)
 [![npm downloads](https://img.shields.io/npm/dm/@spooky-sync/core)](https://www.npmjs.com/package/@spooky-sync/core)
-[![bundle size](https://img.shields.io/bundlejs/size/@spooky-sync/core@canary)](https://bundlejs.com/?q=%40spooky-sync%2Fcore%40canary)
+[![bundle size](https://img.shields.io/bundlejs/size/@spooky-sync/core)](https://bundlejs.com/?q=%40spooky-sync%2Fcore)
 [![npm version](https://img.shields.io/npm/v/@spooky-sync/cli?label=%40spooky-sync%2Fcli&color=cb3837)](https://www.npmjs.com/package/@spooky-sync/cli)
 [![license](https://img.shields.io/github/license/mono424/sp00ky)](https://github.com/mono424/sp00ky)
 [![stars](https://img.shields.io/github/stars/mono424/sp00ky)](https://github.com/mono424/sp00ky/stargazers)

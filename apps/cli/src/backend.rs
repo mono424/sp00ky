@@ -1855,8 +1855,42 @@ pub enum VersionPolicy {
 pub const VERSION_ANY: &str = "any";
 /// The keyword that tracks [`DEFAULT_VERSION_CHANNEL`].
 pub const VERSION_NEWEST: &str = "newest";
-/// There is no stable release line yet, so the newest build is the newest canary.
-pub const DEFAULT_VERSION_CHANNEL: &str = "canary";
+/// The channel this CLI build was released on, read from its own version: a
+/// canary CLI tracks `canary` images, an alpha tracks `alpha`, and anything
+/// else (a beta or a stable release, published under `latest`) tracks `latest`.
+/// A CLI installed via plain `npx @spooky-sync/cli` must not pull canary images.
+pub const DEFAULT_VERSION_CHANNEL: &str = channel_for_version(env!("CARGO_PKG_VERSION"));
+
+const fn contains(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.len() > h.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        let mut j = 0;
+        while j < n.len() && h[i + j] == n[j] {
+            j += 1;
+        }
+        if j == n.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Same rule as the publish workflows: `alpha` first, then `canary`, else `latest`.
+pub const fn channel_for_version(version: &str) -> &'static str {
+    if contains(version, "alpha") {
+        "alpha"
+    } else if contains(version, "canary") {
+        "canary"
+    } else {
+        "latest"
+    }
+}
 const VERSION_CHANNELS: [&str; 3] = ["canary", "latest", "alpha"];
 
 /// Classify one `version:` string. Errors on anything that is not a keyword,
@@ -1903,8 +1937,8 @@ pub enum DeployEnv {
 }
 
 const DEFAULT_SURREALDB_VERSION: &str = "v3.1.0-beta.3";
-const DEFAULT_SSP_VERSION: &str = "canary";
-const DEFAULT_SCHEDULER_VERSION: &str = "canary";
+const DEFAULT_SSP_VERSION: &str = DEFAULT_VERSION_CHANNEL;
+const DEFAULT_SCHEDULER_VERSION: &str = DEFAULT_VERSION_CHANNEL;
 
 /// How a single component (SSP or scheduler) should be launched in dev mode.
 /// `Image` keeps the existing `docker run` path; `LocalBinary` spawns the
@@ -3486,7 +3520,7 @@ mod version_tests {
     #[test]
     fn per_service_partial_fills_with_defaults() {
         let yaml = "version: { ssp: a }\n";
-        assert_eq!(resolve(yaml, DeployEnv::Dev), ("a".into(), "canary".into()));
+        assert_eq!(resolve(yaml, DeployEnv::Dev), ("a".into(), DEFAULT_VERSION_CHANNEL.into()));
     }
 
     #[test]
@@ -3520,7 +3554,7 @@ mod version_tests {
         assert_eq!(classify_version(" ").unwrap(), VersionPolicy::Any);
         assert_eq!(
             classify_version("newest").unwrap(),
-            VersionPolicy::Track("canary".into())
+            VersionPolicy::Track(DEFAULT_VERSION_CHANNEL.into())
         );
         assert_eq!(
             classify_version("latest").unwrap(),
@@ -3573,11 +3607,11 @@ mod version_tests {
         // `any` and `newest` are policies, not Docker tags.
         assert_eq!(
             resolve("version: any\n", DeployEnv::Dev),
-            ("canary".into(), "canary".into())
+            (DEFAULT_VERSION_CHANNEL.into(), DEFAULT_VERSION_CHANNEL.into())
         );
         assert_eq!(
             resolve("version: newest\n", DeployEnv::Dev),
-            ("canary".into(), "canary".into())
+            (DEFAULT_VERSION_CHANNEL.into(), DEFAULT_VERSION_CHANNEL.into())
         );
         assert_eq!(
             resolve("version: v0.0.1-canary.270\n", DeployEnv::Dev),
@@ -3593,11 +3627,14 @@ mod version_tests {
         };
         assert_eq!(
             refresh("version: newest\n"),
-            vec!["mono424/spooky-ssp:canary", "mono424/spooky-scheduler:canary"]
+            vec![
+                format!("mono424/spooky-ssp:{DEFAULT_VERSION_CHANNEL}"),
+                format!("mono424/spooky-scheduler:{DEFAULT_VERSION_CHANNEL}")
+            ]
         );
         assert_eq!(
             refresh("version:\n  dev: { ssp: newest, scheduler: 0.0.1-canary.270 }\n"),
-            vec!["mono424/spooky-ssp:canary"]
+            vec![format!("mono424/spooky-ssp:{DEFAULT_VERSION_CHANNEL}")]
         );
         // A channel name keeps pull-if-missing; so does a cloud-only `newest`.
         assert!(refresh("version: canary\n").is_empty());
@@ -3610,7 +3647,7 @@ mod version_tests {
         let yaml = "version:\n  cloud: canary\n";
         assert_eq!(
             resolve(yaml, DeployEnv::Dev),
-            ("canary".into(), "canary".into())
+            (DEFAULT_VERSION_CHANNEL.into(), DEFAULT_VERSION_CHANNEL.into())
         );
         assert_eq!(
             resolve(yaml, DeployEnv::Cloud),
@@ -3622,8 +3659,16 @@ mod version_tests {
     fn no_version_uses_defaults() {
         assert_eq!(
             resolve("apps: {}\n", DeployEnv::Dev),
-            ("canary".into(), "canary".into())
+            (DEFAULT_VERSION_CHANNEL.into(), DEFAULT_VERSION_CHANNEL.into())
         );
+    }
+
+    #[test]
+    fn default_channel_follows_the_release_line() {
+        assert_eq!(channel_for_version("0.0.1-canary.385"), "canary");
+        assert_eq!(channel_for_version("0.0.1-alpha.2"), "alpha");
+        assert_eq!(channel_for_version("0.1.0-beta.1"), "latest");
+        assert_eq!(channel_for_version("1.0.0"), "latest");
     }
 
     #[test]

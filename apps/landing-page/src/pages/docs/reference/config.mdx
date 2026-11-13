@@ -374,7 +374,7 @@ Whatever the policy, Sp00ky Cloud records the concrete version it resolved, so a
 
 A pinned version that was never published fails the deploy before anything is built. A roll restarts the scheduler and the SSPs (about a minute of sync downtime), so with `newest` every deploy can include one: pin a version when you want rolls to happen only on purpose.
 
-Under `spky dev`, an exact version is the image tag to run, `any` runs the local `canary` image (pulling it once if missing), and `newest` re-pulls `canary` on every start.
+Under `spky dev`, an exact version is the image tag to run, `any` runs the local image of your CLI's release channel (pulling it once if missing), and `newest` re-pulls it on every start. The channel follows the CLI: a canary CLI uses `canary` images, a beta or stable CLI uses `latest`.
 
 ## Per-environment overrides
 

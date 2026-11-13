@@ -37,8 +37,10 @@ jobs:
           fi
           TAG="${GITHUB_REF#refs/tags/sp00ky/v}"
           echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          # Same three channels as the npm publish: an alpha moves only its own
-          # tag, never `canary` and never `latest`.
+          # Channels moved by this tag (comma separated). An alpha moves only its
+          # own tag. A canary moves `canary`. A release (beta or stable) moves
+          # `latest` AND `canary`: it is newer than every canary before it, and a
+          # project tracking `canary` follows the newest build of either kind.
           if echo "$TAG" | grep -q "alpha"; then
             echo "channel=alpha" >> "$GITHUB_OUTPUT"
             echo "is_canary=false" >> "$GITHUB_OUTPUT"
@@ -46,7 +48,7 @@ jobs:
             echo "channel=canary" >> "$GITHUB_OUTPUT"
             echo "is_canary=true" >> "$GITHUB_OUTPUT"
           else
-            echo "channel=latest" >> "$GITHUB_OUTPUT"
+            echo "channel=latest,canary" >> "$GITHUB_OUTPUT"
             echo "is_canary=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -185,9 +187,9 @@ jobs:
         id: tags
         run: |
           TAGS="${{ matrix.image }}:${{ needs.prepare.outputs.version }}"
-          if [ -n "${{ needs.prepare.outputs.channel }}" ]; then
-            TAGS="$TAGS,${{ matrix.image }}:${{ needs.prepare.outputs.channel }}"
-          fi
+          for CH in $(echo "${{ needs.prepare.outputs.channel }}" | tr ',' ' '); do
+            TAGS="$TAGS,${{ matrix.image }}:$CH"
+          done
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
       - name: Create manifest list and push

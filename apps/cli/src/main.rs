@@ -1219,7 +1219,14 @@ pub enum CloudBackupCommands {
     /// Restore database from a backup
     Restore {
         /// Backup ID, full name, or unique id prefix
-        backup_id: String,
+        #[arg(required_unless_present = "at", conflicts_with = "at")]
+        backup_id: Option<String>,
+        /// Restore to a moment instead (point-in-time recovery, needs
+        /// `configure --point-in-time true`): the newest backup that finished
+        /// before it, then every recorded change up to it. RFC 3339
+        /// ("2026-11-15T13:45:00Z"), "2026-11-15 13:45" (UTC), or "90m ago"
+        #[arg(long)]
+        at: Option<String>,
     },
     /// Delete a backup
     Delete {
@@ -1265,6 +1272,10 @@ pub enum CloudBackupCommands {
         /// limit); any --keep-* or --retention flag given alongside wins
         #[arg(long)]
         recommended: bool,
+        /// Point-in-time recovery: record every change (read every 15 minutes)
+        /// so `spky backup restore --at` can reach any moment of the last 48 hours
+        #[arg(long)]
+        point_in_time: Option<bool>,
     },
     /// Reset the database (drop all data, re-run migrations)
     Reset {

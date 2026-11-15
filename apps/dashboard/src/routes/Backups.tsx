@@ -19,6 +19,7 @@ import type {
   CatalogEntry,
   KeepTiers,
   OperationResponse,
+  PointInTime,
   Overview,
   RestoreStatus,
 } from '../api/types';
@@ -56,7 +57,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
       d?.local.current_running ||
       (d?.local.queue_len ?? 0) > 0 ||
       d?.catalog.some((c) => c.status === 'pending' || c.status === 'in_progress') ||
-      d?.restores.some((r) => r.status === 'queued' || r.status === 'running');
+      d?.restores.some((r) => r.status === 'queued' || r.status === 'running' || r.status === 'awaiting_replay');
     void (busy ? refetch() : undefined);
   }, 3000);
   const slow = setInterval(refetch, 30_000);
@@ -259,6 +260,23 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
               <SchedulePanel linked={d().linked} config={d().config} onSaved={refreshAll} />
             </section>
 
+            {/* restore to a moment ============================================ */}
+            <Show when={d().linked && d().config?.point_in_time}>
+              {(pit) => (
+                <section class="fx-row">
+                  <PointInTimePanel
+                    pit={pit()}
+                    blocked={restoreBlocked()}
+                    onSaved={refreshAll}
+                    onRestore={(r, at) => {
+                      setWatching({ id: r.restore_id, backupId: r.backup_id, label: `Data as of ${formatStamp(at)}`, sub: `point in time · from ${r.backup_id}` });
+                      refreshAll();
+                    }}
+                  />
+                </section>
+              )}
+            </Show>
+
             {/* every backup =================================================== */}
             <section class="fx-row">
               <FxCell label="Backups" meta={<span><b>{formatCount(d().catalog.length)}</b></span>}>
@@ -325,7 +343,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
                       <For each={d().restores}>
                         {(r) => (
                           <tr class="inc-tr" onClick={() => setWatching({ id: r.restore_id, backupId: r.backup_id })}>
-                            <td><span class="fx-who"><Sq tone={r.status === 'failed' ? 'bad' : r.status === 'queued' || r.status === 'running' ? 'warn' : ''} /><span style={{ color: 'var(--ink)' }}>{r.backup_id}</span></span></td>
+                            <td><span class="fx-who"><Sq tone={r.status === 'failed' ? 'bad' : r.status === 'queued' || r.status === 'running' || r.status === 'awaiting_replay' ? 'warn' : ''} /><span style={{ color: 'var(--ink)' }}>{r.backup_id}</span></span></td>
                             <td classList={{ bad: r.status === 'failed', warn: r.status === 'running' || r.status === 'queued' }}>{r.status}</td>
                             <td class="r">{elapsed(r.started_at ?? r.enqueued_at, r.finished_at)}</td>
                             <td class="r">{relativeStamp(r.started_at ?? r.enqueued_at)}</td>
@@ -578,6 +596,136 @@ function SchedulePanel(props: {
           <button class="btn btn-sm btn-primary bu-save" disabled={!dirty() || saving()} onClick={() => void save()}>
             {saving() ? 'Saving…' : 'Save'}
           </button>
+        </div>
+      </Show>
+    </FxCell>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Point in time                                                        */
+/* ------------------------------------------------------------------ */
+
+/** An ISO time as a datetime-local input value, in the browser's zone. */
+const localInput = (iso: string) => {
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+function PointInTimePanel(props: {
+  pit: PointInTime;
+  blocked: string | undefined;
+  onSaved: () => void;
+  onRestore: (r: { restore_id: string; backup_id: string }, at: string) => void;
+}) {
+  const [moment, setMoment] = createSignal(props.pit.window ? localInput(props.pit.window.latest) : '');
+
+  const toggle = () =>
+    runAction<{ status: string }>({
+      label: props.pit.enabled ? 'Point-in-time recovery off' : 'Point-in-time recovery on',
+      confirm: props.pit.enabled
+        ? {
+            title: 'Turn point-in-time recovery off?',
+            verb: 'Turn off',
+            consequences: [
+              'The recorded changes are deleted; restores can only reach full backups again.',
+              "The database's change feed is taken off.",
+            ],
+          }
+        : {
+            title: 'Turn point-in-time recovery on?',
+            verb: 'Turn on',
+            consequences: [
+              'The database keeps a change feed of every write (a day of it), which costs some write throughput and disk.',
+              'Changes are read every 15 minutes; a restore can then reach any moment of the last 48 hours.',
+              'A full backup starts about ten minutes later to replay from, and at least one a day after that.',
+            ],
+          },
+      request: () => api.put('/backups/config', { point_in_time: !props.pit.enabled }),
+      success: () => 'Saved',
+      after: props.onSaved,
+    });
+
+  const restoreTo = () => {
+    const t = Date.parse(moment());
+    if (Number.isNaN(t)) {
+      toast('bad', 'Pick a moment first');
+      return;
+    }
+    const at = new Date(t).toISOString();
+    void runAction<{ operation: OperationResponse['operation']; restore_id: string; backup_id: string }>({
+      label: `Restore to ${formatStamp(at)}`,
+      confirm: {
+        title: `Restore the database to ${formatStamp(at)}?`,
+        verb: 'Restore',
+        typeToConfirm: 'restore',
+        consequences: [
+          'The whole database is dropped, re-imported from the newest backup before that moment, and every change recorded up to it is replayed. Everything written after it is lost.',
+          'Ingest and queries are refused while it runs; every SSP is evicted and re-bootstraps after. On a large database this takes a while: the replica is rebuilt from the result.',
+          'Migrations must be run again afterwards (spky migrate).',
+          'Bucket file contents are not part of a backup; only their definitions are.',
+        ],
+      },
+      request: post('/backups/restore-to', { at }),
+      success: (r) => `Restore ${r.restore_id} queued`,
+      after: (r) => props.onRestore(r, at),
+    });
+  };
+
+  const outside = () => {
+    const w = props.pit.window;
+    const t = Date.parse(moment());
+    return !w || Number.isNaN(t) || t < Date.parse(w.earliest) - 60_000 || t > Date.parse(w.latest);
+  };
+
+  return (
+    <FxCell
+      label="Point in time"
+      meta={
+        <span style={{ display: 'inline-flex', 'align-items': 'center', gap: '10px' }}>
+          <Show when={props.pit.last_reading}><span>last reading {relativeStamp(props.pit.last_reading)}</span></Show>
+          <button type="button" class="chip" onClick={() => void toggle()}>{props.pit.enabled ? 'Turn off' : 'Turn on'}</button>
+        </span>
+      }
+    >
+      <Show
+        when={props.pit.enabled}
+        fallback={<div class="fx-empty cap">Off · turn it on to restore to any moment of the last 48 hours, not just to a backup</div>}
+      >
+        <div class="bu-pit">
+          <div class="fx-sub cap">
+            <Show
+              when={props.pit.window}
+              fallback={<span>Recording changes since {formatStamp(props.pit.since)} · waiting for the first backup to replay from</span>}
+            >
+              {(w) => (
+                <span>
+                  any moment from <b>{formatStamp(w().earliest)}</b> to <b>{formatStamp(w().latest)}</b> · read every 15 minutes
+                </span>
+              )}
+            </Show>
+          </div>
+          <Show when={props.pit.error}>
+            <div class="fx-sub cap bad">{props.pit.error}</div>
+          </Show>
+          <Show when={props.pit.window}>
+            {(w) => (
+              <div class="bu-pit-form">
+                <label class="li-field">
+                  <span>Restore to</span>
+                  <input type="datetime-local" step="60" value={moment()}
+                    min={localInput(w().earliest)} max={localInput(w().latest)}
+                    onInput={(e) => setMoment(e.currentTarget.value)} />
+                  <small class="cap">your time zone · {Intl.DateTimeFormat().resolvedOptions().timeZone}</small>
+                </label>
+                <button class="btn btn-sm" title={props.blocked ?? (outside() ? 'Outside the window' : undefined)}
+                  disabled={!!props.blocked || outside()} onClick={restoreTo}>
+                  Restore to this moment
+                </button>
+              </div>
+            )}
+          </Show>
         </div>
       </Show>
     </FxCell>

@@ -60,6 +60,8 @@ fn id_from_key(slug: &str, key: &str) -> Option<String> {
 fn stage_from_local(local: &Value) -> &'static str {
     match local.get("status").and_then(Value::as_str) {
         Some("queued") => "queued",
+        // A held restore: main imported, waiting for the cloud's replay.
+        Some("awaiting_replay") => "main_db",
         Some("completed") => "done",
         Some("failed") => "failed",
         Some("running") => {
@@ -349,9 +351,9 @@ pub async fn create(
     ))
 }
 
-fn watch_restore(state: AdminState, op_id: String, restore_id: String) {
+fn watch_restore(state: AdminState, op_id: String, restore_id: String, budget: Duration) {
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + WATCH_BUDGET;
+        let deadline = tokio::time::Instant::now() + budget;
         loop {
             if let Some(job) = state.backup.restore_registry.get(&restore_id).await {
                 let local = json!(job);
@@ -378,9 +380,10 @@ fn watch_restore(state: AdminState, op_id: String, restore_id: String) {
                 }
             }
             if tokio::time::Instant::now() >= deadline {
-                state
-                    .ops
-                    .fail(&op_id, "Restore did not finish within 30 minutes");
+                state.ops.fail(
+                    &op_id,
+                    format!("Restore did not finish within {} minutes", budget.as_secs() / 60),
+                );
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -435,7 +438,9 @@ pub async fn restore(
                 if let Some(existing) = backup.restore_registry.get(&id).await {
                     if matches!(
                         existing.status,
-                        RestoreStatus::Queued | RestoreStatus::Running
+                        RestoreStatus::Queued
+                            | RestoreStatus::Running
+                            | RestoreStatus::AwaitingReplay
                     ) {
                         return Err(api_error(
                             StatusCode::CONFLICT,
@@ -455,6 +460,7 @@ pub async fn restore(
                     backup_id: id.clone(),
                     project_slug: slug,
                     storage_path: path,
+                    hold_for_replay: false,
                 })
                 .await
             {
@@ -478,10 +484,57 @@ pub async fn restore(
         session.subject.clone(),
         json!({ "backup_id": id, "restore_id": restore_id, "stage": "queued" }),
     );
-    watch_restore(state.clone(), op.id.clone(), restore_id.clone());
+    watch_restore(state.clone(), op.id.clone(), restore_id.clone(), WATCH_BUDGET);
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "operation": op, "restore_id": restore_id })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RestoreToRequest {
+    /// The moment, RFC 3339.
+    pub at: String,
+}
+
+/// A restore to a moment imports, replays and then rebuilds the replica from
+/// a fresh export: allow it far longer than a plain restore.
+const RESTORE_TO_WATCH_BUDGET: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// `POST /admin/api/backups/restore-to`: point-in-time recovery through
+/// Sp00ky Cloud, which picks the backup, replays the changes recorded after
+/// it, and drives this scheduler's held restore.
+pub async fn restore_to(
+    State(state): State<AdminState>,
+    Extension(CurrentSession(session)): Extension<CurrentSession>,
+    Json(req): Json<RestoreToRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let link = state.cloud.as_ref().ok_or_else(not_linked)?;
+    let status = *state.resync.status.read().await;
+    if status != crate::SchedulerStatus::Ready {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Cannot restore while the scheduler is {status:?}; it must be Ready"),
+        ));
+    }
+    let (_, res) = link.post("/backups/restore-to", json!({ "at": req.at })).await?;
+    let restore_id = res["id"]
+        .as_str()
+        .ok_or_else(|| api_error(StatusCode::BAD_GATEWAY, "Sp00ky Cloud returned no restore id"))?
+        .to_string();
+    let backup_id = res["backup_id"].as_str().unwrap_or_default().to_string();
+    warn!(at = %req.at, backup_id = %backup_id, restore_id = %restore_id, by = %session.subject,
+        "Restore to a moment requested through Sp00ky Cloud");
+    let op = state.ops.start(
+        OpKind::BackupRestore,
+        Some(backup_id.clone()),
+        session.subject.clone(),
+        json!({ "backup_id": backup_id, "restore_id": restore_id, "at": req.at, "stage": "queued" }),
+    );
+    watch_restore(state.clone(), op.id.clone(), restore_id.clone(), RESTORE_TO_WATCH_BUDGET);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "operation": op, "restore_id": restore_id, "backup_id": backup_id })),
     ))
 }
 
@@ -557,6 +610,9 @@ pub struct ConfigRequest {
     /// Retention tiers; Sp00ky Cloud merges them into the stored ones.
     #[serde(default)]
     pub keep: Option<KeepTiers>,
+    /// Point-in-time recovery on or off.
+    #[serde(default)]
+    pub point_in_time: Option<bool>,
 }
 
 /// How many periods keep their newest backup, per tier. A tier left out keeps
@@ -598,6 +654,9 @@ pub async fn configure(
     }
     if let Some(v) = req.keep {
         body.insert("keep".into(), json!(v));
+    }
+    if let Some(v) = req.point_in_time {
+        body.insert("point_in_time".into(), json!(v));
     }
     info!(by = %session.subject, config = ?body, "Backup schedule updated through Sp00ky Cloud");
     let (_, v) = link.post("/backups/configure", Value::Object(body)).await?;

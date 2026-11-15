@@ -259,7 +259,10 @@ pub const TOOLS: &[ToolDef] = &[
             p("schedule", "string", "Standard 5-field cron in UTC, e.g. '0 3 * * *'"),
             p("retention", "number", "Keep the newest N completed backups whatever their age (0 = no count limit)"),
             p("keep", "object", "Retention tiers: any of hourly, daily, weekly, monthly, quarterly, yearly, each a count of periods, e.g. {\"daily\": 3, \"weekly\": 5, \"quarterly\": 4}. A tier left out keeps its stored value"),
+            p("point_in_time", "boolean", "Point-in-time recovery: record every change (read every 15 minutes) so backup_restore_to can reach any moment of the last 48 hours"),
         ]),
+    tool!("backup_restore_to", "Restore to a moment (point-in-time recovery, needs the cloud link and point_in_time on): the newest backup that finished before it, then every recorded change up to it. Wipes the database, evicts every SSP, and requires migrations to be re-run afterwards. backups_list's config.point_in_time.window gives the moments that can be reached.", "POST", "/backups/restore-to",
+        body = &[req("at", "string", "The moment, RFC 3339, e.g. 2026-11-15T13:45:00Z")], destructive = true),
 ];
 
 pub fn find_tool(name: &str) -> Option<&'static ToolDef> {

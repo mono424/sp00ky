@@ -31,8 +31,9 @@ pub use backup::{
 pub use db::{connect_http, connect_http_raw, DbConfig};
 pub use host::MaintenanceHost;
 pub use restore::{
-    create_restore_channel, run_restore_worker, RestoreJob, RestoreJobState, RestoreOutcome,
-    RestoreProgress, RestoreRegistry, RestoreStatus,
+    create_restore_channel, run_restore_worker, ContinueResult, ReplayOutcome, RestoreJob,
+    RestoreJobState, RestoreOutcome, RestoreProgress, RestoreRegistry, RestoreStatus,
+    REPLAY_HOLD_TIMEOUT,
 };
 pub use routes::{create_backup_router, BackupState};
 pub use s3::{ensure_bucket, BackupConfig};

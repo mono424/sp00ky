@@ -214,6 +214,7 @@ async fn restore_failure_before_gate_skips_host_hooks() {
         backup_id: "b1".into(),
         project_slug: "proj".into(),
         storage_path: "proj/missing.gz".into(),
+        hold_for_replay: false,
     })
     .await
     .unwrap();
@@ -510,4 +511,128 @@ async fn health_monitor_tracks_backend_status_and_live_updates() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "good");
     assert_eq!(entries[0].status, BackendStatus::Healthy);
+}
+
+// ---------------------------------------------------------------------------
+// Held restore routes (point-in-time restore)
+// ---------------------------------------------------------------------------
+
+/// The backup router on a local port, with the restore queue's receiver handed
+/// back so a test sees the jobs it enqueued (no worker runs them).
+async fn serve_backup_router() -> (
+    String,
+    Arc<RestoreRegistry>,
+    tokio::sync::mpsc::Receiver<maintenance::RestoreJob>,
+) {
+    // No test here creates a backup, so the backup queue's receiver can go.
+    let (backup_tx, _) = create_backup_channel();
+    let (restore_tx, restore_rx) = create_restore_channel();
+    let restore_registry = Arc::new(RestoreRegistry::new());
+    let router = maintenance::create_backup_router(maintenance::BackupState {
+        host: MockHost::new() as Arc<dyn MaintenanceHost>,
+        config: unreachable_s3(),
+        registry: Arc::new(BackupRegistry::new()),
+        tx: backup_tx,
+        restore_registry: restore_registry.clone(),
+        restore_tx,
+        backup_restore_lock: Arc::new(Mutex::new(())),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{addr}"), restore_registry, restore_rx)
+}
+
+/// `/backup/restore/held` enqueues a job that holds for its replay, and the
+/// old `/backup/restore` keeps enqueueing jobs that do not; both refuse a
+/// duplicate restore id.
+#[tokio::test]
+async fn held_restore_route_marks_the_job() {
+    let (base, registry, mut jobs) = serve_backup_router().await;
+    let http = reqwest::Client::new();
+    let body = |id: &str| {
+        serde_json::json!({
+            "restore_id": id,
+            "backup_id": "b1",
+            "project_slug": "proj",
+            "storage_path": "proj/b1.surql.gz",
+        })
+    };
+
+    let resp = http.post(format!("{base}/backup/restore/held")).json(&body("r1")).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    let job = jobs.recv().await.unwrap();
+    assert_eq!(job.restore_id, "r1");
+    assert!(job.hold_for_replay);
+    assert!(registry.contains("r1").await);
+
+    let resp = http.post(format!("{base}/backup/restore")).json(&body("r2")).send().await.unwrap();
+    assert_eq!(resp.status(), 202);
+    assert!(!jobs.recv().await.unwrap().hold_for_replay);
+
+    let resp = http.post(format!("{base}/backup/restore/held")).json(&body("r1")).send().await.unwrap();
+    assert_eq!(resp.status(), 409);
+}
+
+/// `/backup/restore/:id/continue` reaches a restore awaiting its replay (200),
+/// refuses one that is not (409) and an unknown id (404); the status route
+/// shows `awaiting_replay` during the hold.
+#[tokio::test]
+async fn continue_route_reaches_only_a_held_restore() {
+    let (base, registry, _jobs) = serve_backup_router().await;
+    let http = reqwest::Client::new();
+    registry
+        .enqueue("r1".into(), "b1".into(), "proj".into(), "proj/b1.surql.gz".into())
+        .await;
+    registry.mark_running("r1").await;
+
+    let resp = http
+        .post(format!("{base}/backup/restore/r1/continue"))
+        .json(&serde_json::json!({ "ok": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409, "running but not held");
+
+    let resp = http
+        .post(format!("{base}/backup/restore/nope/continue"))
+        .json(&serde_json::json!({ "ok": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let waiting = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.await_replay("r1", std::time::Duration::from_secs(30)).await }
+    });
+    let status = || async {
+        http.get(format!("{base}/backup/restore/status/r1"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while status().await != "awaiting_replay" {
+        assert!(std::time::Instant::now() < deadline, "the hold never showed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let resp = http
+        .post(format!("{base}/backup/restore/r1/continue"))
+        .json(&serde_json::json!({ "ok": false, "error": "replay of stamps 1..2: boom" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let outcome = waiting.await.unwrap();
+    assert!(!outcome.ok);
+    assert_eq!(outcome.error.as_deref(), Some("replay of stamps 1..2: boom"));
+    assert_eq!(status().await, "running");
 }

@@ -483,14 +483,14 @@ const policyOf = (c: BackupConfig | null): Policy => ({
 const samePolicy = (a: Policy, b: Policy) => RETENTION_TIERS.every((t) => a[t] === b[t]);
 
 /** The ladder's rungs, in the order retention fills them. */
-const RUNGS: ReadonlyArray<{ tier: Tier; name: string; help: string }> = [
-  { tier: 'last', name: 'Newest', help: 'The newest backups, whatever their age. Filled first, so every rung below starts where this one ends.' },
-  { tier: 'hourly', name: 'Hourly', help: 'The newest backup of each hour' },
-  { tier: 'daily', name: 'Daily', help: 'The newest backup of each day' },
-  { tier: 'weekly', name: 'Weekly', help: 'The newest backup of each ISO week' },
-  { tier: 'monthly', name: 'Monthly', help: 'The newest backup of each month' },
-  { tier: 'quarterly', name: 'Quarterly', help: 'The newest backup of each quarter' },
-  { tier: 'yearly', name: 'Yearly', help: 'The newest backup of each year' },
+const RUNGS: ReadonlyArray<{ tier: Tier; name: string; help: string; short: string }> = [
+  { tier: 'last', name: 'Newest', short: 'the newest, any age', help: 'The newest backups, whatever their age. Filled first, so every rung below starts where this one ends.' },
+  { tier: 'hourly', name: 'Hourly', short: 'one per hour', help: 'The newest backup of each hour' },
+  { tier: 'daily', name: 'Daily', short: 'one per day', help: 'The newest backup of each day' },
+  { tier: 'weekly', name: 'Weekly', short: 'one per week', help: 'The newest backup of each ISO week' },
+  { tier: 'monthly', name: 'Monthly', short: 'one per month', help: 'The newest backup of each month' },
+  { tier: 'quarterly', name: 'Quarterly', short: 'one per quarter', help: 'The newest backup of each quarter' },
+  { tier: 'yearly', name: 'Yearly', short: 'one per year', help: 'The newest backup of each year' },
 ];
 
 /* The cron shapes the schedule line can edit; anything else is typed. */
@@ -550,15 +550,17 @@ function Count(props: { value: number; label: string; onChange: (n: number) => v
         aria-label={props.label}
         onInput={(e) => {
           const raw = e.currentTarget.value.trim();
-          if (raw === '') set(0);
-          else if (/^\d+$/.test(raw)) set(Number(raw));
+          if (/^\d+$/.test(raw)) set(Number(raw));
         }}
         onKeyDown={(e) => {
           if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
           e.preventDefault();
           set(props.value + (e.key === 'ArrowUp' ? 1 : -1));
         }}
-        onBlur={(e) => (e.currentTarget.value = String(props.value))}
+        onBlur={(e) => {
+          if (e.currentTarget.value.trim() === '') set(0);
+          else e.currentTarget.value = String(props.value);
+        }}
       />
       <button type="button" aria-label={`More: ${props.label}`} disabled={props.value >= MAX_KEEP} onClick={() => set(props.value + 1)}>+</button>
     </span>
@@ -582,8 +584,6 @@ function SchedulePanel(props: {
   const [schedule, setSchedule] = createSignal(storedSchedule());
   const [typing, setTyping] = createSignal(shapeOf(storedSchedule()).freq === 'cron');
   const [policy, setPolicy] = createSignal<Policy>(policyOf(props.config));
-  /** Rows on screen besides those with a count: ones added or emptied here. */
-  const [shown, setShown] = createSignal<ReadonlySet<Tier>>(new Set());
   const [hot, setHot] = createSignal<Tier | null>(null);
   const [saving, setSaving] = createSignal(false);
   /** Tiers need a cloud that knows them; an older one would drop them silently. */
@@ -612,10 +612,7 @@ function SchedulePanel(props: {
     else setSchedule(cronOf({ ...base, freq: 'weekly', dow: Number(v.slice(1)) }));
   };
 
-  const setTier = (t: Tier, n: number) => {
-    if (n === 0) setShown(new Set([...shown(), t]));
-    setPolicy({ ...policy(), [t]: n });
-  };
+  const setTier = (t: Tier, n: number) => setPolicy({ ...policy(), [t]: n });
 
   /** What the policy keeps on this schedule, as of now. */
   const sim = createMemo(() => {
@@ -627,17 +624,14 @@ function SchedulePanel(props: {
   });
   const oldest = () => sim().r.kept[sim().r.kept.length - 1]?.at;
 
+  /**
+   * Every period has a row whether it is used or not, so adding or removing
+   * one never moves the others. Hourly only shows on an hourly schedule.
+   */
   const available = () =>
     tiered()
       ? RUNGS.filter((g) => g.tier !== 'hourly' || sim().step < DAY_MS || policy().hourly > 0)
       : RUNGS.filter((g) => g.tier === 'last');
-  const inUse = (t: Tier) => policy()[t] > 0 || shown().has(t);
-  const rows = () => available().filter((g) => inUse(g.tier));
-  const addable = () => available().filter((g) => !inUse(g.tier));
-  const add = (t: Tier) => {
-    setShown(new Set([...shown(), t]));
-    setPolicy({ ...policy(), [t]: ADD_COUNT[t] });
-  };
 
   /** Log scale, so the last few days and the last year both read. */
   const span = () => Math.max(35, ((sim().now - (oldest() ?? sim().now)) / DAY_MS) * 1.1);
@@ -663,10 +657,13 @@ function SchedulePanel(props: {
     return mine.length === 1 ? name(mine[0]!) : `${name(mine[mine.length - 1]!)} → ${name(mine[0]!)}`;
   };
 
-  /** The total, or while a row is hovered, the dates that row covers. */
+  /** The total, or while a row is hovered, the dates it covers or what adding it keeps. */
   const headline = () => {
     const t = hot();
-    if (t) return `${RUNGS.find((g) => g.tier === t)!.name}: ${reach(t)}`;
+    if (t) {
+      const g = RUNGS.find((r) => r.tier === t)!;
+      return policy()[t] ? `${g.name}: ${reach(t)}` : `Add ${g.name.toLowerCase()}: ${g.short}`;
+    }
     if (!sim().r.prunes) return 'keeps everything';
     return `${formatCount(sim().r.kept.length)} kept, back to ${shortDate(oldest()!, sim().now)}${sim().approx ? ' (as if nightly)' : ''}`;
   };
@@ -678,7 +675,6 @@ function SchedulePanel(props: {
 
   const useRecommended = () => {
     setPolicy(recommended());
-    setShown(new Set<Tier>());
     setEnabled(true);
   };
 
@@ -783,51 +779,57 @@ function SchedulePanel(props: {
         </div>
 
         <div class="bu-stairs" onMouseLeave={() => setHot(null)}>
-          <For each={rows()}>
+          <For each={available()}>
             {(g) => (
-              <div class="bu-stair" classList={{ off: !policy()[g.tier], hot: hot() === g.tier }}
-                title={`${g.help}: ${reach(g.tier)}`}
-                onMouseEnter={() => setHot(policy()[g.tier] ? g.tier : null)}>
-                <span class="bu-stair-name">{g.name}</span>
-                <Count value={policy()[g.tier]} label={g.name} onChange={(n) => setTier(g.tier, n)} />
-                <div class="bu-lane">
-                  <For each={ticks().slice(1)}>{([d]) => <span class="bu-lane-grid" style={{ left: `${pctDays(d)}%` }} />}</For>
-                  <Show when={keptBy(g.tier).length > 1}>
-                    <u style={{
-                      left: `${pct(keptBy(g.tier)[0]!.at)}%`,
-                      width: `${pct(keptBy(g.tier)[keptBy(g.tier).length - 1]!.at) - pct(keptBy(g.tier)[0]!.at)}%`,
-                    }} />
-                  </Show>
-                  <For each={keptBy(g.tier)}>{(k) => <i style={{ left: `${pct(k.at)}%` }} />}</For>
+              <Show
+                when={policy()[g.tier] > 0}
+                fallback={
+                  <button type="button" class="bu-stair off" classList={{ hot: hot() === g.tier }} title={g.help}
+                    onClick={() => setTier(g.tier, ADD_COUNT[g.tier])}
+                    onMouseEnter={() => setHot(g.tier)} onFocus={() => setHot(g.tier)} onBlur={() => setHot(null)}>
+                    <span class="bu-stair-name">{g.name}</span>
+                    <span />
+                    <span class="bu-lane" />
+                    <span class="bu-stair-act" aria-hidden="true">+</span>
+                  </button>
+                }
+              >
+                <div class="bu-stair" classList={{ hot: hot() === g.tier }} title={`${g.help}: ${reach(g.tier)}`}
+                  onMouseEnter={() => setHot(g.tier)}>
+                  <span class="bu-stair-name">{g.name}</span>
+                  <Count value={policy()[g.tier]} label={g.name} onChange={(n) => setTier(g.tier, n)} />
+                  <div class="bu-lane">
+                    <For each={ticks().slice(1)}>{([d]) => <span class="bu-lane-grid" style={{ left: `${pctDays(d)}%` }} />}</For>
+                    <Show when={keptBy(g.tier).length > 1}>
+                      <u style={{
+                        left: `${pct(keptBy(g.tier)[0]!.at)}%`,
+                        width: `${pct(keptBy(g.tier)[keptBy(g.tier).length - 1]!.at) - pct(keptBy(g.tier)[0]!.at)}%`,
+                      }} />
+                    </Show>
+                    <For each={keptBy(g.tier)}>{(k) => <i style={{ left: `${pct(k.at)}%` }} />}</For>
+                  </div>
+                  <button type="button" class="bu-stair-act" aria-label={`Remove ${g.name.toLowerCase()}`}
+                    title={`Remove ${g.name.toLowerCase()}`} onClick={() => setTier(g.tier, 0)}>×</button>
                 </div>
-              </div>
+              </Show>
             )}
           </For>
-          <Show when={sim().r.prunes}>
-            <div class="bu-stair bu-stair-axis" aria-hidden="true">
-              <span />
-              <span />
-              <div class="bu-lane-axis">
-                <For each={ticks()}>{([d, label], i) => <span classList={{ first: i() === 0 }} style={{ left: `${pctDays(d)}%` }}>{label}</span>}</For>
-              </div>
-            </div>
-          </Show>
-        </div>
-
-        <div class="bu-add">
-          <For each={addable()}>
-            {(g) => <button type="button" title={g.help} onClick={() => add(g.tier)}>+ {g.name.toLowerCase()}</button>}
-          </For>
-          <Show when={tiered()}>
-            <span class="bu-add-rec">
-              <Show when={!samePolicy(policy(), recommended())} fallback={<span>recommended</span>}>
-                <button type="button" class="bu-link" onClick={useRecommended}
-                  title="3 days, then one a week for the month before, then four quarter ends">
-                  use recommended
-                </button>
+          <div class="bu-stair bu-stair-axis">
+            <span class="bu-stair-rec">
+              <Show when={tiered()}>
+                <Show when={!samePolicy(policy(), recommended())} fallback={<span>Recommended</span>}>
+                  <button type="button" class="bu-link" onClick={useRecommended}
+                    title="3 days, then one a week for the month before, then four quarter ends">
+                    Use recommended
+                  </button>
+                </Show>
               </Show>
             </span>
-          </Show>
+            <div class="bu-lane-axis" aria-hidden="true">
+              <For each={ticks()}>{([d, label], i) => <span classList={{ first: i() === 0 }} style={{ left: `${pctDays(d)}%` }}>{label}</span>}</For>
+            </div>
+            <span />
+          </div>
         </div>
 
         <div class="bu-foot">

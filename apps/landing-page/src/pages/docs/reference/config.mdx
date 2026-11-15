@@ -368,13 +368,15 @@ A project can list several outputs, e.g. a TypeScript web client plus one or mor
 | `newest` | **Tracked** | Rolls the stack to the newest published build whenever there is one. | The same as any deploy. |
 | `any`, or no `version` at all | **Manual** | Leaves the stack alone. | Moves the stack to the newest published build. |
 
+A channel name is tracked the same way as `newest`, on that channel only. `canary` follows the newest build of any kind: every canary, and every beta or stable release too, since a release is newer than the canaries before it. `latest` follows beta and stable releases only and never moves to a canary. `alpha` follows alpha builds only.
+
 <CodeBlock code={ymlVersions} lang="yaml" />
 
 Whatever the policy, Sp00ky Cloud records the concrete version it resolved, so a container that is recreated later for an unrelated reason (a changed env var, a crash) comes back on the version it had, not on whatever is newest by then. `spky status` prints the policy next to the running versions and warns when a pinned stack is not running its pin.
 
 A pinned version that was never published fails the deploy before anything is built. A roll restarts the scheduler and the SSPs (about a minute of sync downtime), so with `newest` every deploy can include one: pin a version when you want rolls to happen only on purpose.
 
-Under `spky dev`, an exact version is the image tag to run, `any` runs the local `canary` image (pulling it once if missing), and `newest` re-pulls `canary` on every start.
+Under `spky dev`, an exact version is the image tag to run, `any` runs the local image of your CLI's release channel (pulling it once if missing), and `newest` re-pulls it on every start. The channel follows the CLI: a canary CLI uses `canary` images, a beta or stable CLI uses `latest`.
 
 ## Per-environment overrides
 

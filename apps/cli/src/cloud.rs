@@ -6899,14 +6899,34 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
                 result["status"].as_str().unwrap_or("pending")
             );
         }
-        CloudBackupCommands::Restore { backup_id } => {
-            let backup_id = resolve_backup_id(&mut client, &pid, &backup_id)?;
-            println!("  Restoring from backup {}...", backup_id);
-            let resp = client.post(
-                &format!("/v1/projects/{}/backups/{}/restore", pid, backup_id),
-                &serde_json::json!({}),
-            )?;
-            let result: serde_json::Value = resp.into_json()?;
+        CloudBackupCommands::Restore { backup_id, at } => {
+            let (backup_id, result, polls) = if let Some(at) = at {
+                let at = parse_restore_moment(&at, chrono::Utc::now())?;
+                println!("  Restoring to {}...", at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                let resp = client.post(
+                    &format!("/v1/projects/{}/backups/restore-to", pid),
+                    &serde_json::json!({ "at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) }),
+                )?;
+                let result: serde_json::Value = resp.into_json()?;
+                let backup_id = result["backup_id"].as_str().unwrap_or_default().to_string();
+                println!(
+                    "  From backup {} (started {}), then the changes recorded after it.",
+                    backup_id,
+                    result["backup_started"].as_str().unwrap_or("?")
+                );
+                // Import, replay and, on a VM project, the scheduler's replica:
+                // up to 6 hours for a large database.
+                (backup_id, result, 6 * 720)
+            } else {
+                let backup_id = resolve_backup_id(&mut client, &pid, backup_id.as_deref().unwrap_or_default())?;
+                println!("  Restoring from backup {}...", backup_id);
+                let resp = client.post(
+                    &format!("/v1/projects/{}/backups/{}/restore", pid, backup_id),
+                    &serde_json::json!({}),
+                )?;
+                let result: serde_json::Value = resp.into_json()?;
+                (backup_id, result, 60)
+            };
             let restore_id = result["id"]
                 .as_str()
                 .or_else(|| result["restore_id"].as_str())
@@ -6915,11 +6935,11 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
             println!("  Restore {} queued. Waiting for completion...", restore_id);
 
             // Poll until restore completes. Same cadence as backup polling in
-            // the Reset flow (5s × 60 = up to 5 minutes).
+            // the Reset flow (5s × 60 = up to 5 minutes; longer to a moment).
             let mut last_status = String::new();
             let mut final_status: Option<String> = None;
             let mut final_error: Option<String> = None;
-            for _ in 0..60 {
+            for _ in 0..polls {
                 thread::sleep(Duration::from_secs(5));
                 let status_resp = client.get(&format!(
                     "/v1/projects/{}/backups/{}/restore",
@@ -6965,7 +6985,7 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
                     let err = final_error.unwrap_or_else(|| "unknown".to_string());
                     bail!("Restore failed: {}", err);
                 }
-                _ => bail!("Restore did not complete within 5 minutes. Check status with `spky backup list`."),
+                _ => bail!("Restore did not complete in time. Check status with `spky backup list`."),
             }
 
             // Re-run migrations against the restored database.
@@ -7062,14 +7082,42 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
             enabled,
             schedule,
             retention,
+            keep_hourly,
+            keep_daily,
+            keep_weekly,
+            keep_monthly,
+            keep_quarterly,
+            keep_yearly,
+            recommended,
+            point_in_time,
         } => {
+            let flags = KeepTiers {
+                hourly: keep_hourly,
+                daily: keep_daily,
+                weekly: keep_weekly,
+                monthly: keep_monthly,
+                quarterly: keep_quarterly,
+                yearly: keep_yearly,
+            };
+            let (retention, keep) = if recommended {
+                (retention.or(Some(0)), flags.or(KeepTiers::RECOMMENDED))
+            } else {
+                (retention, flags)
+            };
             let body = serde_json::json!({
                 "enabled": enabled,
                 "schedule": schedule,
                 "retention": retention,
+                "keep": keep.to_json(),
+                "point_in_time": point_in_time,
             });
             client.post(&format!("/v1/projects/{}/backups/configure", pid), &body)?;
             println!("  Backup configuration updated.");
+            if let Ok(resp) = client.get(&format!("/v1/projects/{}/backups/config", pid)) {
+                if let Ok(cfg) = resp.into_json::<serde_json::Value>() {
+                    println!("  {}", describe_backup_config(&cfg));
+                }
+            }
         }
         CloudBackupCommands::Reset { no_backup, confirm } => {
             println!();
@@ -11016,5 +11064,190 @@ mod host_move_tests {
                 "  Old data kept until: 2026-11-09T04:00:00Z",
             ]
         );
+    }
+}
+
+/// Retention tiers for `spky backup configure`: each keeps the newest backup of
+/// its last N periods. `None` leaves the stored value alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct KeepTiers {
+    hourly: Option<u32>,
+    daily: Option<u32>,
+    weekly: Option<u32>,
+    monthly: Option<u32>,
+    quarterly: Option<u32>,
+    yearly: Option<u32>,
+}
+
+impl KeepTiers {
+    /// Mirrors `backups.RecommendedPolicy` in the control plane: three days,
+    /// five calendar weeks (four only reach 24 to 29 days back mid-week), and
+    /// four quarter ends.
+    const RECOMMENDED: KeepTiers = KeepTiers {
+        hourly: Some(0),
+        daily: Some(3),
+        weekly: Some(5),
+        monthly: Some(0),
+        quarterly: Some(4),
+        yearly: Some(0),
+    };
+
+    /// Each tier set here, else the one from `other`.
+    fn or(self, other: KeepTiers) -> KeepTiers {
+        KeepTiers {
+            hourly: self.hourly.or(other.hourly),
+            daily: self.daily.or(other.daily),
+            weekly: self.weekly.or(other.weekly),
+            monthly: self.monthly.or(other.monthly),
+            quarterly: self.quarterly.or(other.quarterly),
+            yearly: self.yearly.or(other.yearly),
+        }
+    }
+
+    /// The `keep` object for POST /backups/configure, `null` when no tier is set.
+    fn to_json(self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for (name, v) in [
+            ("hourly", self.hourly),
+            ("daily", self.daily),
+            ("weekly", self.weekly),
+            ("monthly", self.monthly),
+            ("quarterly", self.quarterly),
+            ("yearly", self.yearly),
+        ] {
+            if let Some(v) = v {
+                m.insert(name.into(), v.into());
+            }
+        }
+        if m.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(m)
+        }
+    }
+}
+
+/// One line for GET /backups/config, e.g.
+/// "Schedule 0 3 * * * (UTC). Keeps 3 daily, 5 weekly, 4 quarterly."
+fn describe_backup_config(cfg: &serde_json::Value) -> String {
+    let schedule = match (cfg["enabled"].as_bool(), cfg["schedule"].as_str()) {
+        (Some(true), Some(s)) if !s.is_empty() => format!("Schedule {s} (UTC)."),
+        (Some(true), _) => "Enabled, but no schedule set.".to_string(),
+        _ => "Scheduled backups off.".to_string(),
+    };
+    let mut keeps = Vec::new();
+    if let Some(n) = cfg["retention"].as_u64().filter(|n| *n > 0) {
+        keeps.push(format!("the newest {n}"));
+    }
+    for tier in ["hourly", "daily", "weekly", "monthly", "quarterly", "yearly"] {
+        if let Some(n) = cfg["keep"][tier].as_u64().filter(|n| *n > 0) {
+            keeps.push(format!("{n} {tier}"));
+        }
+    }
+    let kept = if keeps.is_empty() {
+        format!("{schedule} Keeps every backup.")
+    } else {
+        format!("{schedule} Keeps {}.", keeps.join(", "))
+    };
+    let pitr = &cfg["point_in_time"];
+    if !pitr["enabled"].as_bool().unwrap_or(false) {
+        return kept;
+    }
+    let reach = match (pitr["window"]["earliest"].as_str(), pitr["window"]["latest"].as_str()) {
+        (Some(from), Some(to)) => format!("restores reach any moment from {from} to {to}"),
+        _ => "waiting for the first backup to replay from".to_string(),
+    };
+    match pitr["error"].as_str() {
+        Some(err) => format!("{kept}\n  Point-in-time recovery: on, {reach}. Problem: {err}"),
+        None => format!("{kept}\n  Point-in-time recovery: on, {reach}."),
+    }
+}
+
+/// The moment `spky backup restore --at` names: RFC 3339, a UTC date and time
+/// ("2026-11-15 13:45" or with seconds, a space or a T between), or a span
+/// back from now ("90m ago", "2h ago", "1d ago").
+fn parse_restore_moment(s: &str, now: chrono::DateTime<chrono::Utc>) -> Result<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if let Some(span) = s.strip_suffix(" ago").map(str::trim) {
+        let (num, unit) = span.split_at(span.find(|c: char| !c.is_ascii_digit()).unwrap_or(span.len()));
+        let n: i64 = num.parse().map_err(|_| anyhow::anyhow!("cannot read {s:?}: expected a span such as \"90m ago\""))?;
+        let d = match unit.trim() {
+            "s" => chrono::Duration::seconds(n),
+            "m" | "min" => chrono::Duration::minutes(n),
+            "h" => chrono::Duration::hours(n),
+            "d" => chrono::Duration::days(n),
+            other => bail!("cannot read {s:?}: unknown unit {other:?} (s, m, h or d)"),
+        };
+        return Ok(now - d);
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(t.with_timezone(&chrono::Utc));
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(t.and_utc());
+        }
+    }
+    bail!("cannot read {s:?} as a moment: use RFC 3339 (2026-11-15T13:45:00Z), \"2026-11-15 13:45\" (UTC) or \"90m ago\"")
+}
+
+#[cfg(test)]
+mod keep_tiers_tests {
+    use super::*;
+
+    #[test]
+    fn recommended_fills_only_the_tiers_not_given() {
+        let flags = KeepTiers { weekly: Some(8), ..Default::default() };
+        let keep = flags.or(KeepTiers::RECOMMENDED);
+        assert_eq!(keep.weekly, Some(8));
+        assert_eq!(keep.daily, Some(3));
+        assert_eq!(keep.quarterly, Some(4));
+        assert_eq!(keep.yearly, Some(0));
+    }
+
+    #[test]
+    fn unset_tiers_send_no_keep_object() {
+        assert!(KeepTiers::default().to_json().is_null());
+        let one = KeepTiers { daily: Some(3), ..Default::default() }.to_json();
+        assert_eq!(one, serde_json::json!({ "daily": 3 }));
+    }
+
+    #[test]
+    fn describes_a_tiered_config() {
+        let cfg = serde_json::json!({
+            "enabled": true, "schedule": "0 3 * * *", "retention": 0,
+            "keep": { "hourly": 0, "daily": 3, "weekly": 5, "monthly": 0, "quarterly": 4, "yearly": 0 },
+        });
+        assert_eq!(
+            describe_backup_config(&cfg),
+            "Schedule 0 3 * * * (UTC). Keeps 3 daily, 5 weekly, 4 quarterly."
+        );
+        let legacy = serde_json::json!({ "enabled": true, "schedule": "0 2 * * *", "retention": 7 });
+        assert_eq!(describe_backup_config(&legacy), "Schedule 0 2 * * * (UTC). Keeps the newest 7.");
+    }
+
+    #[test]
+    fn describes_point_in_time_recovery() {
+        let cfg = serde_json::json!({
+            "enabled": true, "schedule": "0 3 * * *", "retention": 3,
+            "point_in_time": { "enabled": true, "window": { "earliest": "2026-11-13T09:00:00Z", "latest": "2026-11-15T08:45:00Z" } },
+        });
+        assert!(describe_backup_config(&cfg)
+            .ends_with("Point-in-time recovery: on, restores reach any moment from 2026-11-13T09:00:00Z to 2026-11-15T08:45:00Z."));
+        let fresh = serde_json::json!({ "enabled": true, "schedule": "0 3 * * *", "point_in_time": { "enabled": true, "window": null } });
+        assert!(describe_backup_config(&fresh).contains("waiting for the first backup"));
+    }
+
+    #[test]
+    fn reads_restore_moments() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-15T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let at = |s: &str| parse_restore_moment(s, now).unwrap().to_rfc3339();
+        assert_eq!(at("2026-11-15T10:30:00+01:00"), "2026-11-15T09:30:00+00:00");
+        assert_eq!(at("2026-11-15 10:30"), "2026-11-15T10:30:00+00:00");
+        assert_eq!(at("2026-11-15T10:30:15"), "2026-11-15T10:30:15+00:00");
+        assert_eq!(at("90m ago"), "2026-11-15T10:30:00+00:00");
+        assert_eq!(at("1d ago"), "2026-11-14T12:00:00+00:00");
+        assert!(parse_restore_moment("yesterday", now).is_err());
+        assert!(parse_restore_moment("3w ago", now).is_err());
     }
 }

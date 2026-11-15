@@ -18,7 +18,7 @@ body.landing-page { overflow-x: clip; }
 .walk-heading h2 { font-size: clamp(38px, 4.5vw, 64px); font-weight: 400; line-height: 1.08; letter-spacing: -.04em; margin: 0; }
 .walk-heading h2 em { font-family: Georgia, serif; font-weight: 400; color: #c3cddc; }
 .sync-walkthrough a { color: #e0e6ee; font-size: 12px; text-decoration: none; }
-.sync-walkthrough a:hover { color: #a6d7f0; }
+.sync-walkthrough a:hover { color: #ffffff; }
 .walk-step a span { margin-left: 14px; }
 .walk-layout { --walk-gap: 32px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr); align-items: start; column-gap: var(--walk-gap); }
 .walk-steps { grid-column: 1 / -1; grid-row: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr); column-gap: var(--walk-gap); }
@@ -28,19 +28,14 @@ body.landing-page { overflow-x: clip; }
 .blueprint { grid-column: 2; grid-row: 1; min-width: 0; position: sticky; top: 90px; }
 .blueprint-scene { position: relative; width: 100%; height: calc(100svh - 180px); margin: auto; }
 .blueprint-scene { transform: scale(calc(1 + var(--assembled, 0) * .08)); transform-origin: center; }
-.blueprint-scene::before { content: ''; position: absolute; inset: 12% -30%; background: radial-gradient(ellipse, #a6dfff22, #8099ff0a 42%, transparent 68%); opacity: var(--assembled, 0); pointer-events: none; }
+.blueprint-scene::before { content: ''; position: absolute; inset: 12% -30%; background: radial-gradient(ellipse, #ffffff0d, #ffffff05 42%, transparent 68%); opacity: var(--assembled, 0); pointer-events: none; }
 .is-assembled .blueprint-scene::before { animation: assembly-bloom 1400ms ease-out both; }
-.plan-layer::after { content: ''; position: absolute; inset: 0; pointer-events: none; mask: url('../assets/architecture-surrealdb-mask.svg') center / 100% 100% no-repeat; background: linear-gradient(110deg, transparent 35%, #d4f0ff66 49%, #fff8 50%, transparent 65%) -180% 0 / 250% 100% no-repeat; opacity: 0; }
+.plan-layer::after { content: ''; position: absolute; inset: 0; pointer-events: none; mask: url('../assets/architecture-slab-mask.svg') center / 100% 100% no-repeat; background: linear-gradient(110deg, transparent 35%, #ffffff14 49%, #ffffff26 50%, transparent 65%) -180% 0 / 250% 100% no-repeat; opacity: 0; }
 .is-assembled .plan-layer::after { animation: assembly-sweep 1200ms cubic-bezier(.22, 1, .36, 1) both; }
 .is-assembled .plan-layer-database::after { animation-delay: 100ms; }
 .is-assembled .plan-layer-engine::after { animation-delay: 200ms; }
-.plan-connections { position: absolute; inset: 0; height: 100%; width: 100%; stroke: #a5cadd65; stroke-width: 1; stroke-dasharray: 3 6; }
+.plan-connections { position: absolute; inset: 0; height: 100%; width: 100%; stroke: #8b909b66; stroke-width: 1; stroke-dasharray: 3 6; }
 .plan-layer { position: absolute; width: 100%; left: 50%; top: 0; transform: translate3d(-50%, calc(var(--layer-offset, 0px) - 50%), 0); opacity: var(--layer-opacity, 1); filter: grayscale(var(--layer-gray, 0)); will-change: transform, opacity; }
-.plan-layer-art, .plan-client-devices, .plan-engine-circuit { mask-size: 100% 100%; mask-repeat: no-repeat; }
-.plan-layer-art { mask-image: url('../assets/architecture-surrealdb-mask.svg'); }
-.plan-client-devices, .plan-engine-circuit { position: absolute; inset: 0; width: 100%; height: auto; }
-.plan-client-devices { mask-image: url('../assets/architecture-devices-mask.svg'); transform: translate(.1%, -7.45%) scale(1.052, 1.098); }
-.plan-engine-circuit { mask-image: url('../assets/architecture-circuit-mask.svg'); }
 .sync-walkthrough:not(.walk-ready) .plan-layer { top: var(--layer-y); transform: translate(-50%, -50%); }
 .plan-layer-client { --layer-y: 29%; z-index: 3; }.plan-layer-database { --layer-y: 49%; z-index: 2; }.plan-layer-engine { --layer-y: 69%; z-index: 1; }
 .stack-caption { position: absolute; left: 50%; bottom: 0; transform: translate(-50%, calc((1 - var(--assembled, 0)) * 18px)); width: max-content; max-width: calc(100vw - 48px); margin: 0; text-align: center; font-size: clamp(24px, 2.4vw, 36px); letter-spacing: -.035em; opacity: var(--assembled, 0); }
@@ -49,13 +44,13 @@ body.landing-page { overflow-x: clip; }
 .sync-walkthrough:not(.walk-ready) .walk-finale { display: none; }
 .plan-layer-art { display: block; width: 100%; height: auto; }
 .plan-surface-logo, .plan-chip-logo { position: absolute; height: auto; object-fit: contain; transform: translate(-50%, -50%) matrix(1, .5, -1, .5, 0, 0); }
-.plan-surface-logo { width: 15%; left: 50%; top: 48%; }
-.plan-layer-client .plan-surface-logo { top: 41%; width: 16%; }
-.plan-layer-database .plan-surface-logo { top: 41%; width: 18%; }
-.plan-layer-engine .plan-surface-logo { top: 40.5%; width: 9%; }
+.plan-surface-logo { width: 15%; left: 50%; top: 40.8%; }
+.plan-layer-client .plan-surface-logo { top: 39.84%; width: 10%; }
+.plan-layer-database .plan-surface-logo { top: 38.09%; width: 13%; }
+.plan-layer-engine .plan-surface-logo { top: 37.5%; width: 8%; }
 .plan-chip-logo { width: 4%; }
-.plan-chip-0 { left: 40.5%; top: 33%; }.plan-chip-1 { left: 59.5%; top: 33%; }
-.plan-chip-2 { left: 40.5%; top: 48%; }.plan-chip-3 { left: 59.5%; top: 48%; }
+.plan-chip-0 { left: 40.23%; top: 31.35%; }.plan-chip-1 { left: 59.77%; top: 31.35%; }
+.plan-chip-2 { left: 40.23%; top: 46%; }.plan-chip-3 { left: 59.77%; top: 46%; }
 .walk-step { padding: 64px 0; scroll-margin-top: 110px; }
 .walk-ready .walk-step { min-height: 100svh; display: flex; flex-direction: column; justify-content: center; }
 .step-brand { display: flex; align-items: center; gap: 12px; color: #c1cbd8; font-size: 12px; }
@@ -87,7 +82,7 @@ body.landing-page { overflow-x: clip; }
   .walk-finale, .sync-walkthrough:not(.walk-ready) .walk-finale { display: block; min-height: 0; padding-top: 8px; }
   .mobile-assembly { display: block; max-width: 400px; margin: auto; text-align: center; }
   .mobile-assembly-scene { position: relative; aspect-ratio: 1; isolation: isolate; }
-  .mobile-assembly-scene::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(ellipse, #a6dfff22, transparent 65%); }
+  .mobile-assembly-scene::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(ellipse, #ffffff0d, transparent 65%); }
   .mobile-assembly .plan-layer, .sync-walkthrough:not(.walk-ready) .mobile-assembly .plan-layer { top: 50%; transform: translate(-50%, calc(-50% + var(--mobile-y, 0%))); }
   .mobile-assembly .plan-layer-client { --mobile-y: -17%; }
   .mobile-assembly .plan-layer-engine { --mobile-y: 17%; }

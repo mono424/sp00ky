@@ -11,7 +11,9 @@ use tracing::info;
 
 use crate::backup::{BackupJob, BackupJobState, BackupRegistry};
 use crate::host::MaintenanceHost;
-use crate::restore::{RestoreJob, RestoreJobState, RestoreProgress, RestoreRegistry};
+use crate::restore::{
+    ContinueResult, ReplayOutcome, RestoreJob, RestoreJobState, RestoreProgress, RestoreRegistry,
+};
 use crate::s3::BackupConfig;
 
 #[derive(Clone)]
@@ -29,7 +31,9 @@ pub fn create_backup_router(state: BackupState) -> Router {
     Router::new()
         .route("/backup/create", post(create_backup))
         .route("/backup/restore", post(restore_backup))
+        .route("/backup/restore/held", post(restore_backup_held))
         .route("/backup/restore/status/:restore_id", get(restore_status_by_id))
+        .route("/backup/restore/:restore_id/continue", post(continue_restore))
         .route("/backup/status", get(backup_status))
         .route("/backup/status/:backup_id", get(backup_status_by_id))
         .with_state(state)
@@ -114,6 +118,26 @@ async fn restore_backup(
     State(state): State<BackupState>,
     Json(req): Json<RestoreRequest>,
 ) -> Result<(StatusCode, Json<RestoreResponse>), (StatusCode, String)> {
+    enqueue_restore(state, req, false).await
+}
+
+/// `POST /backup/restore/held`: a restore that stops after the main database
+/// import until Sp00ky Cloud has replayed the change feed onto it, then
+/// rebuilds the host's state from the main database. A scheduler without
+/// this route answers 404, which is how the cloud tells it cannot do a
+/// point-in-time restore before it touches any data.
+async fn restore_backup_held(
+    State(state): State<BackupState>,
+    Json(req): Json<RestoreRequest>,
+) -> Result<(StatusCode, Json<RestoreResponse>), (StatusCode, String)> {
+    enqueue_restore(state, req, true).await
+}
+
+async fn enqueue_restore(
+    state: BackupState,
+    req: RestoreRequest,
+    hold_for_replay: bool,
+) -> Result<(StatusCode, Json<RestoreResponse>), (StatusCode, String)> {
     let restore_id = req.restore_id.unwrap_or_else(|| req.backup_id.clone());
 
     if state.restore_registry.contains(&restore_id).await {
@@ -138,6 +162,7 @@ async fn restore_backup(
         backup_id: req.backup_id.clone(),
         project_slug: req.project_slug.clone(),
         storage_path: req.storage_path.clone(),
+        hold_for_replay,
     };
 
     if let Err(e) = state.restore_tx.send(job).await {
@@ -160,6 +185,7 @@ async fn restore_backup(
         restore_id = %restore_id,
         backup_id = %req.backup_id,
         queue_position,
+        hold_for_replay,
         "Restore enqueued"
     );
 
@@ -180,6 +206,30 @@ async fn restore_status_by_id(
     match state.restore_registry.get(&restore_id).await {
         Some(s) => Ok(Json(s)),
         None => Err((
+            StatusCode::NOT_FOUND,
+            format!("restore_id {} not found", restore_id),
+        )),
+    }
+}
+
+/// `POST /backup/restore/:restore_id/continue` with `{"ok": bool, "error"?:
+/// string}`: the point-in-time replay of a held restore is done (or failed),
+/// so it may rebuild the host's state and finish.
+async fn continue_restore(
+    State(state): State<BackupState>,
+    Path(restore_id): Path<String>,
+    Json(outcome): Json<ReplayOutcome>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match state.restore_registry.continue_replay(&restore_id, outcome.clone()).await {
+        ContinueResult::Delivered => {
+            info!(restore_id = %restore_id, ok = outcome.ok, "Point-in-time replay reported");
+            Ok(Json(serde_json::json!({ "restore_id": restore_id, "status": "running" })))
+        }
+        ContinueResult::NotAwaiting => Err((
+            StatusCode::CONFLICT,
+            format!("restore_id {} is not awaiting a replay", restore_id),
+        )),
+        ContinueResult::Unknown => Err((
             StatusCode::NOT_FOUND,
             format!("restore_id {} not found", restore_id),
         )),

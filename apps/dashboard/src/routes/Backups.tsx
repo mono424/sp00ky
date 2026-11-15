@@ -17,7 +17,9 @@ import type {
   BackupConfig,
   BackupsData,
   CatalogEntry,
+  KeepTiers,
   OperationResponse,
+  PointInTime,
   Overview,
   RestoreStatus,
 } from '../api/types';
@@ -56,7 +58,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
       d?.local.current_running ||
       (d?.local.queue_len ?? 0) > 0 ||
       d?.catalog.some((c) => c.status === 'pending' || c.status === 'in_progress') ||
-      d?.restores.some((r) => r.status === 'queued' || r.status === 'running');
+      d?.restores.some((r) => r.status === 'queued' || r.status === 'running' || r.status === 'awaiting_replay');
     void (busy ? refetch() : undefined);
   }, 3000);
   const slow = setInterval(refetch, 30_000);
@@ -245,7 +247,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
                 <div class="fx-big">{formatCount(completed().length)}<small>{completed().length === 1 ? 'backup' : 'backups'}</small></div>
                 <div class="fx-sub cap">
                   <span><b>{formatBytes(totalBytes())}</b></span>
-                  <Show when={d().config?.retention}><span>newest <b>{formatCount(d().config!.retention)}</b> kept</span></Show>
+                  <Show when={describeKeep(d().config?.retention, d().config?.keep)}>{(k) => <span>keeps <b>{k()}</b></span>}</Show>
                 </div>
               </FxCell>
               <StoredIn endpoint={d().s3.endpoint} bucket={d().s3.bucket} linked={d().linked} />
@@ -258,6 +260,23 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
               </FxCell>
               <SchedulePanel linked={d().linked} config={d().config} onSaved={refreshAll} />
             </section>
+
+            {/* restore to a moment ============================================ */}
+            <Show when={d().linked && d().config?.point_in_time}>
+              {(pit) => (
+                <section class="fx-row">
+                  <PointInTimePanel
+                    pit={pit()}
+                    blocked={restoreBlocked()}
+                    onSaved={refreshAll}
+                    onRestore={(r, at) => {
+                      setWatching({ id: r.restore_id, backupId: r.backup_id, label: `Data as of ${formatStamp(at)}`, sub: `point in time · from ${r.backup_id}` });
+                      refreshAll();
+                    }}
+                  />
+                </section>
+              )}
+            </Show>
 
             {/* every backup =================================================== */}
             <section class="fx-row">
@@ -325,7 +344,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
                       <For each={d().restores}>
                         {(r) => (
                           <tr class="inc-tr" onClick={() => setWatching({ id: r.restore_id, backupId: r.backup_id })}>
-                            <td><span class="fx-who"><Sq tone={r.status === 'failed' ? 'bad' : r.status === 'queued' || r.status === 'running' ? 'warn' : ''} /><span style={{ color: 'var(--ink)' }}>{r.backup_id}</span></span></td>
+                            <td><span class="fx-who"><Sq tone={r.status === 'failed' ? 'bad' : r.status === 'queued' || r.status === 'running' || r.status === 'awaiting_replay' ? 'warn' : ''} /><span style={{ color: 'var(--ink)' }}>{r.backup_id}</span></span></td>
                             <td classList={{ bad: r.status === 'failed', warn: r.status === 'running' || r.status === 'queued' }}>{r.status}</td>
                             <td class="r">{elapsed(r.started_at ?? r.enqueued_at, r.finished_at)}</td>
                             <td class="r">{relativeStamp(r.started_at ?? r.enqueued_at)}</td>
@@ -422,6 +441,32 @@ function History(props: { catalog: CatalogEntry[] }) {
 /* Schedule                                                             */
 /* ------------------------------------------------------------------ */
 
+const TIERS: ReadonlyArray<readonly [keyof KeepTiers, string]> = [
+  ['hourly', 'Hours'],
+  ['daily', 'Days'],
+  ['weekly', 'Weeks'],
+  ['monthly', 'Months'],
+  ['quarterly', 'Quarters'],
+  ['yearly', 'Years'],
+];
+
+/** backups.RecommendedPolicy in Sp00ky Cloud, for a cloud that does not send it. */
+const RECOMMENDED: KeepTiers = { hourly: 0, daily: 3, weekly: 5, monthly: 0, quarterly: 4, yearly: 0 };
+
+/** "newest 7 · 3 daily · 5 weekly", or null when everything is kept. */
+function describeKeep(retention: number | null | undefined, keep: KeepTiers | null | undefined): string | null {
+  const parts: string[] = [];
+  if (retention) parts.push(`newest ${formatCount(retention)}`);
+  for (const [tier] of TIERS) {
+    const n = keep?.[tier];
+    if (n) parts.push(`${formatCount(n)} ${tier}`);
+  }
+  return parts.length ? parts.join(' · ') : null;
+}
+
+const tierText = (keep: KeepTiers | null | undefined) =>
+  Object.fromEntries(TIERS.map(([t]) => [t, keep?.[t] ? String(keep[t]) : ''])) as Record<keyof KeepTiers, string>;
+
 function SchedulePanel(props: {
   linked: boolean;
   config: BackupConfig | null;
@@ -430,15 +475,32 @@ function SchedulePanel(props: {
   const [enabled, setEnabled] = createSignal(props.config?.enabled ?? false);
   const [schedule, setSchedule] = createSignal(props.config?.schedule ?? '');
   const [retention, setRetention] = createSignal(
-    props.config?.retention != null ? String(props.config.retention) : '',
+    props.config?.retention ? String(props.config.retention) : '',
   );
+  const [tiers, setTiers] = createSignal(tierText(props.config?.keep));
   const [saving, setSaving] = createSignal(false);
+  /** Tiers need a cloud that knows them; an older one would drop them silently. */
+  const tiered = () => props.config?.keep != null;
+  const recommended = () => props.config?.recommended ?? RECOMMENDED;
 
   const dirty = () =>
     enabled() !== (props.config?.enabled ?? false) ||
     schedule().trim() !== (props.config?.schedule ?? '') ||
-    (retention().trim() || null) !==
-      (props.config?.retention != null ? String(props.config.retention) : null);
+    retention().trim() !== (props.config?.retention ? String(props.config.retention) : '') ||
+    TIERS.some(([t]) => tiers()[t].trim() !== tierText(props.config?.keep)[t]);
+
+  const useRecommended = () => {
+    setTiers(tierText(recommended()));
+    setRetention('');
+    if (!schedule().trim()) setSchedule('0 3 * * *');
+    setEnabled(true);
+  };
+
+  /** What the tiers in the form keep, in words. */
+  const keepPreview = () => {
+    const keep = Object.fromEntries(TIERS.map(([t]) => [t, Number(tiers()[t]) || 0])) as unknown as KeepTiers;
+    return describeKeep(Number(retention()) || 0, keep) ?? 'keeps every backup';
+  };
 
   const preview = () => {
     const s = schedule().trim();
@@ -451,14 +513,30 @@ function SchedulePanel(props: {
     try {
       const body: Record<string, unknown> = { enabled: enabled() };
       if (schedule().trim()) body.schedule = schedule().trim();
-      const r = retention().trim();
-      if (r) {
-        const n = Number(r);
-        if (!Number.isInteger(n) || n < 0) {
-          toast('bad', 'Retention must be a whole number');
-          return;
+      const whole = (v: string) => {
+        const n = Number(v.trim() || '0');
+        return Number.isInteger(n) && n >= 0 && n <= 1000 ? n : null;
+      };
+      // Only what changed: an untouched field must not overwrite a default the
+      // cloud applies while nothing is stored (a managed database's policy).
+      const r = whole(retention());
+      if (r == null) {
+        toast('bad', 'Keep newest must be a whole number from 0 to 1000');
+        return;
+      }
+      if (retention().trim() !== (props.config?.retention ? String(props.config.retention) : '')) body.retention = r;
+      const stored = tierText(props.config?.keep);
+      if (tiered() && TIERS.some(([t]) => tiers()[t].trim() !== stored[t])) {
+        const keep: Record<string, number> = {};
+        for (const [t, label] of TIERS) {
+          const n = whole(tiers()[t]);
+          if (n == null) {
+            toast('bad', `${label} must be a whole number from 0 to 1000`);
+            return;
+          }
+          keep[t] = n;
         }
-        body.retention = n;
+        body.keep = keep;
       }
       await runAction<{ status: string }>({
         label: 'Backup schedule',
@@ -489,13 +567,166 @@ function SchedulePanel(props: {
             <small class="cap">{preview() ?? 'minute hour day month weekday'}</small>
           </label>
           <label class="li-field">
-            <span>Keep</span>
-            <input value={retention()} placeholder="7" inputmode="numeric" onInput={(e) => setRetention(e.currentTarget.value)} />
-            <small class="cap">newest backups · empty or 0 keeps all</small>
+            <span>Keep newest</span>
+            <input value={retention()} placeholder="0" inputmode="numeric" onInput={(e) => setRetention(e.currentTarget.value)} />
+            <small class="cap">backups, whatever their age · empty or 0 sets no count</small>
           </label>
+          <Show when={tiered()}>
+            <div class="li-field">
+              <span class="bu-tiers-head">
+                Keep one per
+                <button type="button" class="chip" onClick={useRecommended}
+                  title="3 days, then a backup a week for the month before, then a year of quarter ends">
+                  Recommended
+                </button>
+              </span>
+              <div class="bu-tiers">
+                <For each={TIERS}>
+                  {([t, label]) => (
+                    <label>
+                      <small class="cap">{label}</small>
+                      <input value={tiers()[t]} placeholder="0" inputmode="numeric"
+                        onInput={(e) => setTiers({ ...tiers(), [t]: e.currentTarget.value })} />
+                    </label>
+                  )}
+                </For>
+              </div>
+              <small class="cap">{keepPreview()} · named backups are never pruned</small>
+            </div>
+          </Show>
           <button class="btn btn-sm btn-primary bu-save" disabled={!dirty() || saving()} onClick={() => void save()}>
             {saving() ? 'Saving…' : 'Save'}
           </button>
+        </div>
+      </Show>
+    </FxCell>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Point in time                                                        */
+/* ------------------------------------------------------------------ */
+
+/** An ISO time as a datetime-local input value, in the browser's zone. */
+const localInput = (iso: string) => {
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+function PointInTimePanel(props: {
+  pit: PointInTime;
+  blocked: string | undefined;
+  onSaved: () => void;
+  onRestore: (r: { restore_id: string; backup_id: string }, at: string) => void;
+}) {
+  const [moment, setMoment] = createSignal(props.pit.window ? localInput(props.pit.window.latest) : '');
+
+  const toggle = () =>
+    runAction<{ status: string }>({
+      label: props.pit.enabled ? 'Point-in-time recovery off' : 'Point-in-time recovery on',
+      confirm: props.pit.enabled
+        ? {
+            title: 'Turn point-in-time recovery off?',
+            verb: 'Turn off',
+            consequences: [
+              'The recorded changes are deleted; restores can only reach full backups again.',
+              "The database's change feed is taken off.",
+            ],
+          }
+        : {
+            title: 'Turn point-in-time recovery on?',
+            verb: 'Turn on',
+            consequences: [
+              'The database keeps a change feed of every write (a day of it), which costs some write throughput and disk.',
+              'Changes are read every 15 minutes; a restore can then reach any moment of the last 48 hours.',
+              'A full backup starts about ten minutes later to replay from, and at least one a day after that.',
+            ],
+          },
+      request: () => api.put('/backups/config', { point_in_time: !props.pit.enabled }),
+      success: () => 'Saved',
+      after: props.onSaved,
+    });
+
+  const restoreTo = () => {
+    const t = Date.parse(moment());
+    if (Number.isNaN(t)) {
+      toast('bad', 'Pick a moment first');
+      return;
+    }
+    const at = new Date(t).toISOString();
+    void runAction<{ operation: OperationResponse['operation']; restore_id: string; backup_id: string }>({
+      label: `Restore to ${formatStamp(at)}`,
+      confirm: {
+        title: `Restore the database to ${formatStamp(at)}?`,
+        verb: 'Restore',
+        typeToConfirm: 'restore',
+        consequences: [
+          'The whole database is dropped, re-imported from the newest backup before that moment, and every change recorded up to it is replayed. Everything written after it is lost.',
+          'Ingest and queries are refused while it runs; every SSP is evicted and re-bootstraps after. On a large database this takes a while: the replica is rebuilt from the result.',
+          'Migrations must be run again afterwards (spky migrate).',
+          'Bucket file contents are not part of a backup; only their definitions are.',
+        ],
+      },
+      request: post('/backups/restore-to', { at }),
+      success: (r) => `Restore ${r.restore_id} queued`,
+      after: (r) => props.onRestore(r, at),
+    });
+  };
+
+  const outside = () => {
+    const w = props.pit.window;
+    const t = Date.parse(moment());
+    return !w || Number.isNaN(t) || t < Date.parse(w.earliest) - 60_000 || t > Date.parse(w.latest);
+  };
+
+  return (
+    <FxCell
+      label="Point in time"
+      meta={
+        <span style={{ display: 'inline-flex', 'align-items': 'center', gap: '10px' }}>
+          <Show when={props.pit.last_reading}><span>last reading {relativeStamp(props.pit.last_reading)}</span></Show>
+          <button type="button" class="chip" onClick={() => void toggle()}>{props.pit.enabled ? 'Turn off' : 'Turn on'}</button>
+        </span>
+      }
+    >
+      <Show
+        when={props.pit.enabled}
+        fallback={<div class="fx-empty cap">Off · turn it on to restore to any moment of the last 48 hours, not just to a backup</div>}
+      >
+        <div class="bu-pit">
+          <div class="fx-sub cap">
+            <Show
+              when={props.pit.window}
+              fallback={<span>Recording changes since {formatStamp(props.pit.since)} · waiting for the first backup to replay from</span>}
+            >
+              {(w) => (
+                <span>
+                  any moment from <b>{formatStamp(w().earliest)}</b> to <b>{formatStamp(w().latest)}</b> · read every 15 minutes
+                </span>
+              )}
+            </Show>
+          </div>
+          <Show when={props.pit.error}>
+            <div class="fx-sub cap bad">{props.pit.error}</div>
+          </Show>
+          <Show when={props.pit.window}>
+            {(w) => (
+              <div class="bu-pit-form">
+                <label class="li-field">
+                  <span>Restore to</span>
+                  <input type="datetime-local" step="60" value={moment()}
+                    min={localInput(w().earliest)} max={localInput(w().latest)}
+                    onInput={(e) => setMoment(e.currentTarget.value)} />
+                  <small class="cap">your time zone · {Intl.DateTimeFormat().resolvedOptions().timeZone}</small>
+                </label>
+                <button class="btn btn-sm" title={props.blocked ?? (outside() ? 'Outside the window' : undefined)}
+                  disabled={!!props.blocked || outside()} onClick={restoreTo}>
+                  Restore to this moment
+                </button>
+              </div>
+            )}
+          </Show>
         </div>
       </Show>
     </FxCell>

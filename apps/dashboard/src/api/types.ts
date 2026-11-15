@@ -539,7 +539,8 @@ export interface RestoreJobState {
   backup_id: string;
   project_slug: string;
   storage_path: string;
-  status: BackupJobStatus;
+  /** awaiting_replay: a restore to a moment, waiting for Sp00ky Cloud to replay. */
+  status: BackupJobStatus | 'awaiting_replay';
   enqueued_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -574,10 +575,42 @@ export interface CatalogEntry {
   local: BackupJobState | null;
 }
 
+/**
+ * Retention tiers: each keeps the newest backup of its last N periods (UTC,
+ * ISO weeks), skipping periods an earlier tier already holds.
+ */
+export interface KeepTiers {
+  hourly: number;
+  daily: number;
+  weekly: number;
+  monthly: number;
+  quarterly: number;
+  yearly: number;
+}
+
+/**
+ * Point-in-time recovery: every change recorded (read every 15 minutes), so a
+ * restore can reach any moment of the window.
+ */
+export interface PointInTime {
+  enabled: boolean;
+  /** Null until the first backup inside the readings settled. */
+  window: { earliest: string; latest: string } | null;
+  since: string | null;
+  last_reading: string | null;
+  error: string | null;
+}
+
 export interface BackupConfig {
   enabled: boolean;
   schedule: string | null;
+  /** Keep the newest N whatever their age. */
   retention: number | null;
+  /** Absent from a Sp00ky Cloud that predates retention tiers. */
+  keep?: KeepTiers | null;
+  recommended?: KeepTiers | null;
+  /** Absent from a Sp00ky Cloud that predates point-in-time recovery. */
+  point_in_time?: PointInTime | null;
   next_run_at: string | null;
   last_scheduled_at: string | null;
 }

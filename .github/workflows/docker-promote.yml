@@ -1,0 +1,51 @@
+name: Docker Promote
+
+# Points a channel tag (`canary`, `latest`, `alpha`) at an already published
+# release, without rebuilding. Docker Publish does this itself for new tags; this
+# is for moving a channel after the fact, e.g. `canary` onto a release that was
+# published before releases started moving it.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published release tag to point the channel at (e.g. 1.0.0-beta.1)
+        required: true
+        type: string
+      channel:
+        description: Channel tag to move
+        required: true
+        type: choice
+        options: [canary, latest, alpha]
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [mono424/spooky-ssp, mono424/spooky-scheduler, mono424/spooky-agent]
+    steps:
+      - name: Validate version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: '[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9._-]*$ ]]'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Point the channel at the release
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ inputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          docker buildx imagetools create -t "$IMAGE:$CHANNEL" "$IMAGE:$VERSION"
+          docker buildx imagetools inspect "$IMAGE:$CHANNEL" | head -3

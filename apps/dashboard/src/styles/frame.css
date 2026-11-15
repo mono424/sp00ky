@@ -3461,6 +3461,62 @@ h2 {
   justify-self: start;
 }
 
+/* point in time: the window, then a moment picker and its action */
+.bu-pit {
+  display: grid;
+  gap: 12px;
+}
+
+.bu-pit-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.bu-pit-form .li-field {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.bu-pit-form .li-field > span {
+  font: 500 10.5px var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.bu-pit-form input {
+  height: 32px;
+}
+
+/* retention tiers: six small counts, three a row */
+.bu-form .bu-tiers-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.bu-tiers {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.bu-tiers label {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.bu-tiers input {
+  height: 28px;
+  width: 100%;
+  min-width: 0;
+}
+
 /* the toggle in the frame's terms: a square track, a square knob */
 .switch-track {
   width: 30px;

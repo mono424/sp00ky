@@ -1,0 +1,239 @@
+---
+// The homepage's introduction: three sentences and the way into the live
+// demo, written in by the scroll itself. The section pins while it plays; how
+// far the reader has scrolled decides, letter by letter in reading order, how
+// much has surfaced, so scrolling back takes it away again. Each letter rises a
+// little and fades in, along a softly wavy front.
+//
+// Without JavaScript, or with reduced motion, everything is simply there.
+//
+// The button links to the demo; index.astro opens it in the demo overlay
+// (`.try-out-btn`), and a modified click still opens a new tab.
+import { DEMO_URL } from '../config/nav';
+
+interface Word {
+  text: string;
+  ghost?: boolean;
+}
+const sentences: Word[][] = [
+  [{ text: "It's" }, { text: 'sp00ky.', ghost: true }],
+  'Data changes, every screen updates.'.split(' ').map((text) => ({ text })),
+  'Reactive queries keep every tab, every device, and every user in sync, instantly.'.split(' ').map((text) => ({ text })),
+];
+
+// Every letter gets its place in one reading-order sequence; a short pause
+// separates the sentences. `--w` bends the front into a gentle wave.
+const PAUSE = 10;
+let order = 0;
+const letters = sentences.map((words, s) => {
+  if (s > 0) order += PAUSE;
+  return words.map((word) =>
+    [...word.text].map((ch) => {
+      const i = order++;
+      return { ch, i, w: Math.sin(i * 0.55).toFixed(3) };
+    }),
+  );
+});
+const ctaOrder = order + PAUSE;
+const total = ctaOrder + 1;
+---
+
+<section class="spook" data-spook data-total={total}>
+  <div class="spook-stage">
+    <p class="spook-text">
+      {
+        sentences.map((words, s) => (
+          <span class="spook-sentence">
+            <span class="sr-only">{words.map((w) => w.text).join(' ')} </span>
+            {words.map((word, w) => (
+              <>
+                <span class:list={['spook-word', { 'spook-ghost': word.ghost }]} aria-hidden="true">
+                  {letters[s][w].map(({ ch, i, w: wave }) => (
+                    <span class="spook-ch" data-i={i} style={`--w: ${wave}`}>{ch}</span>
+                  ))}
+                </span>{' '}
+              </>
+            ))}
+          </span>
+        ))
+      }
+    </p>
+    <div class="spook-cta" data-i={ctaOrder}>
+      <a class="spook-btn try-out-btn" href={DEMO_URL} target="_blank" rel="noopener">Try the live demo</a>
+    </div>
+  </div>
+</section>
+
+<style>
+  .spook {
+    --ink: #f4f4f5;
+    position: relative;
+  }
+  .spook-stage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(40px, 6vw, 72px);
+    padding: clamp(64px, 9vw, 128px) 16px;
+    text-align: center;
+  }
+  .spook-text {
+    max-width: 1100px;
+    margin: 0;
+    font-size: clamp(2.25rem, 5.2vw, 4.25rem);
+    font-weight: 500;
+    line-height: 1.08;
+    letter-spacing: -0.045em;
+    text-wrap: balance;
+    color: var(--ink);
+  }
+  .spook-word {
+    display: inline-block;
+    white-space: nowrap;
+  }
+  .spook-ch {
+    display: inline-block;
+  }
+  .spook-ghost {
+    font-family: ui-serif, Georgia, Cambria, 'Times New Roman', Times, serif;
+    font-style: italic;
+    font-weight: 400;
+    letter-spacing: -0.02em;
+    color: #a1a1aa;
+  }
+
+  /* ---- scroll-driven, once the script has taken over ---- */
+  .spook.is-live {
+    height: 440vh;
+  }
+  .spook.is-live .spook-stage {
+    position: sticky;
+    top: 0;
+    min-height: 100svh;
+  }
+  /* --r runs 0 to 1 with the scroll: no transition, so it moves exactly as the
+     page does. */
+  /* A letter comes out of a haze: it rises and sways a little, sharpens, and
+     glows faintly halfway through, as if lit from behind. */
+  .spook.is-live .spook-ch {
+    --r: 0;
+    --mid: calc(var(--r) * (1 - var(--r)));
+    opacity: var(--r);
+    filter: blur(calc((1 - var(--r)) * 3.5px));
+    transform: translateY(calc((1 - var(--r)) * (0.22em + var(--w, 0) * 0.1em))) rotate(calc((1 - var(--r)) * var(--w, 0) * 4deg));
+    text-shadow: 0 0 calc(var(--mid) * 48px) rgba(255, 255, 255, calc(var(--mid) * 1.4));
+  }
+  .spook.is-live .spook-cta {
+    --r: 0;
+    opacity: var(--r);
+    transform: translateY(calc((1 - var(--r)) * 14px));
+  }
+
+  /* ---- the button: a dark pill with a slowly turning silver edge ---- */
+  @property --spook-angle {
+    syntax: '<angle>';
+    initial-value: 0deg;
+    inherits: false;
+  }
+  .spook-btn {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    padding: 20px 36px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    background:
+      linear-gradient(#14171d, #14171d) padding-box,
+      conic-gradient(
+          from var(--spook-angle),
+          rgba(255, 255, 255, 0.12) 0deg,
+          rgba(255, 255, 255, 0.9) 50deg,
+          rgba(255, 255, 255, 0.12) 110deg,
+          rgba(255, 255, 255, 0.12) 230deg,
+          rgba(255, 255, 255, 0.55) 280deg,
+          rgba(255, 255, 255, 0.12) 330deg
+        )
+        border-box;
+    color: var(--ink);
+    font-size: 18px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+    text-decoration: none;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4), 0 20px 60px -20px rgba(0, 0, 0, 0.8);
+    animation: spook-turn 6s linear infinite;
+    transition: transform 240ms ease;
+  }
+  .spook-btn::before {
+    content: '';
+    position: absolute;
+    inset: -18px;
+    z-index: -1;
+    border-radius: inherit;
+    background: radial-gradient(closest-side, rgba(255, 255, 255, 0.1), transparent);
+    opacity: 0;
+    transition: opacity 240ms ease;
+  }
+  .spook-btn:hover,
+  .spook-btn:focus-visible {
+    transform: translateY(-1px);
+    outline: none;
+  }
+  .spook-btn:hover::before,
+  .spook-btn:focus-visible::before {
+    opacity: 1;
+  }
+  @keyframes spook-turn {
+    to {
+      --spook-angle: 360deg;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spook-btn {
+      animation: none;
+    }
+  }
+</style>
+
+<script>
+  // Ties every letter to the scroll position. The front of the reveal moves
+  // through the letters in reading order as the section scrolls; a letter
+  // fades and rises over the WIDTH letters behind the front.
+  const section = document.querySelector<HTMLElement>('[data-spook]');
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+  if (section && !reduced.matches) {
+    const items = [...section.querySelectorAll<HTMLElement>('[data-i]')].map((el) => ({ el, i: Number(el.dataset.i), r: -1 }));
+    const total = Number(section.dataset.total);
+    const WIDTH = 22;
+    // Start before the section pins (its top at 70% of the screen) and finish
+    // at 88% of the pinned scroll, so the finished text holds for a moment.
+    const LEAD = 0.7;
+    const DONE = 0.88;
+    section.classList.add('is-live');
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const top = section.getBoundingClientRect().top;
+      const lead = window.innerHeight * LEAD;
+      const travel = section.offsetHeight - window.innerHeight;
+      const span = lead + travel * DONE;
+      const progress = Math.min(1, Math.max(0, (lead - top) / span));
+      const front = progress * (total + WIDTH);
+      for (const item of items) {
+        const r = Math.min(1, Math.max(0, (front - item.i) / WIDTH));
+        const rounded = Math.round(r * 1000) / 1000;
+        if (rounded !== item.r) {
+          item.r = rounded;
+          item.el.style.setProperty('--r', String(rounded));
+        }
+      }
+    };
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(update);
+    };
+    update();
+    window.addEventListener('scroll', schedule, { passive: true });
+    window.addEventListener('resize', schedule);
+  }
+</script>

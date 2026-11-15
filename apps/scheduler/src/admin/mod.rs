@@ -396,6 +396,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/cloud/stats", get(actions::cloud_stats))
         .route("/backups", get(backups::list).post(backups::create))
         .route("/backups/config", put(backups::configure))
+        .route("/backups/restore-to", post(backups::restore_to))
         .route("/backups/:id", delete(backups::delete))
         .route(
             "/backups/:id/restore",

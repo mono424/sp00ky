@@ -1219,24 +1219,64 @@ pub enum CloudBackupCommands {
     /// Restore database from a backup
     Restore {
         /// Backup ID, full name, or unique id prefix
-        backup_id: String,
+        #[arg(required_unless_present = "at", conflicts_with = "at")]
+        backup_id: Option<String>,
+        /// Restore to a moment instead (point-in-time recovery): the newest
+        /// backup that finished before it, then every recorded change up to it.
+        /// RFC 3339 ("2026-11-15T13:45:00Z"), "2026-11-15 13:45" (UTC), or
+        /// "90m ago". Hidden while Sp00ky Cloud has the feature switched off.
+        #[arg(long, hide = true)]
+        at: Option<String>,
     },
     /// Delete a backup
     Delete {
         /// Backup ID, full name, or unique id prefix
         backup_id: String,
     },
-    /// Configure automatic backups
+    /// Configure automatic backups and how long they are kept
+    ///
+    /// Retention tiers keep the newest backup of each of the last N periods,
+    /// each tier skipping periods an earlier one already holds. On a daily
+    /// schedule `--recommended` keeps 3 dailies, 5 weeklies and 4 quarterlies:
+    /// the last three days, the whole last month, and a year of quarter ends.
+    /// Backups created with a name are never pruned.
     Configure {
         /// Enable or disable backups
         #[arg(long)]
         enabled: Option<bool>,
-        /// Cron schedule (e.g. "0 2 * * *")
+        /// Cron schedule in UTC (e.g. "0 3 * * *")
         #[arg(long)]
         schedule: Option<String>,
-        /// Number of backups to retain
+        /// Keep the newest N backups whatever their age (0 = no count limit)
         #[arg(long)]
         retention: Option<u32>,
+        /// Keep the newest backup of each of the last N hours
+        #[arg(long)]
+        keep_hourly: Option<u32>,
+        /// Keep the newest backup of each of the last N days
+        #[arg(long)]
+        keep_daily: Option<u32>,
+        /// Keep the newest backup of each of the last N weeks (ISO, Monday first)
+        #[arg(long)]
+        keep_weekly: Option<u32>,
+        /// Keep the newest backup of each of the last N months
+        #[arg(long)]
+        keep_monthly: Option<u32>,
+        /// Keep the newest backup of each of the last N quarters
+        #[arg(long)]
+        keep_quarterly: Option<u32>,
+        /// Keep the newest backup of each of the last N years
+        #[arg(long)]
+        keep_yearly: Option<u32>,
+        /// Use the recommended tiers (3 daily, 5 weekly, 4 quarterly, no count
+        /// limit); any --keep-* or --retention flag given alongside wins
+        #[arg(long)]
+        recommended: bool,
+        /// Point-in-time recovery: record every change (read every 15 minutes)
+        /// so `spky backup restore --at` can reach any moment of the last 48
+        /// hours. Hidden while Sp00ky Cloud has the feature switched off.
+        #[arg(long, hide = true)]
+        point_in_time: Option<bool>,
     },
     /// Reset the database (drop all data, re-run migrations)
     Reset {

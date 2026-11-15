@@ -110,7 +110,7 @@ export const composeCode = `services:
       - ./data:/data
 
   ssp:
-    image: ghcr.io/sp00ky-org/ssp-server:canary
+    image: ghcr.io/sp00ky-org/ssp-server:latest
     environment:
       - SPKY_DB_URL=http://surrealdb:8000
       - SPKY_DB_USER=root

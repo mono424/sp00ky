@@ -253,11 +253,12 @@ pub const TOOLS: &[ToolDef] = &[
         path_params = &[req("id", "string", "Backup id")], read_only = true),
     tool!("backup_delete", "Delete a backup from the catalog (needs the cloud link).", "DELETE", "/backups/{id}",
         path_params = &[req("id", "string", "Backup id")], destructive = true),
-    tool!("backups_configure", "Set the scheduled-backup policy (needs the cloud link).", "PUT", "/backups/config",
+    tool!("backups_configure", "Set the scheduled-backup policy (needs the cloud link). Retention tiers keep the newest backup of each of their last N periods, each skipping periods an earlier tier holds; recommended on a daily schedule: keep {daily: 3, weekly: 5, quarterly: 4} with retention 0. Named backups are never pruned.", "PUT", "/backups/config",
         body = &[
             p("enabled", "boolean", "Whether scheduled backups run"),
-            p("schedule", "string", "Standard 5-field cron, e.g. '0 3 * * *'"),
-            p("retention", "number", "How many completed backups to keep"),
+            p("schedule", "string", "Standard 5-field cron in UTC, e.g. '0 3 * * *'"),
+            p("retention", "number", "Keep the newest N completed backups whatever their age (0 = no count limit)"),
+            p("keep", "object", "Retention tiers: any of hourly, daily, weekly, monthly, quarterly, yearly, each a count of periods, e.g. {\"daily\": 3, \"weekly\": 5, \"quarterly\": 4}. A tier left out keeps its stored value"),
         ]),
 ];
 

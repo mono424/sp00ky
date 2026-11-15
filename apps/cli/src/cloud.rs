@@ -7062,14 +7062,40 @@ pub fn backup(action: CloudBackupCommands) -> Result<()> {
             enabled,
             schedule,
             retention,
+            keep_hourly,
+            keep_daily,
+            keep_weekly,
+            keep_monthly,
+            keep_quarterly,
+            keep_yearly,
+            recommended,
         } => {
+            let flags = KeepTiers {
+                hourly: keep_hourly,
+                daily: keep_daily,
+                weekly: keep_weekly,
+                monthly: keep_monthly,
+                quarterly: keep_quarterly,
+                yearly: keep_yearly,
+            };
+            let (retention, keep) = if recommended {
+                (retention.or(Some(0)), flags.or(KeepTiers::RECOMMENDED))
+            } else {
+                (retention, flags)
+            };
             let body = serde_json::json!({
                 "enabled": enabled,
                 "schedule": schedule,
                 "retention": retention,
+                "keep": keep.to_json(),
             });
             client.post(&format!("/v1/projects/{}/backups/configure", pid), &body)?;
             println!("  Backup configuration updated.");
+            if let Ok(resp) = client.get(&format!("/v1/projects/{}/backups/config", pid)) {
+                if let Ok(cfg) = resp.into_json::<serde_json::Value>() {
+                    println!("  {}", describe_backup_config(&cfg));
+                }
+            }
         }
         CloudBackupCommands::Reset { no_backup, confirm } => {
             println!();
@@ -11016,5 +11042,125 @@ mod host_move_tests {
                 "  Old data kept until: 2026-11-09T04:00:00Z",
             ]
         );
+    }
+}
+
+/// Retention tiers for `spky backup configure`: each keeps the newest backup of
+/// its last N periods. `None` leaves the stored value alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct KeepTiers {
+    hourly: Option<u32>,
+    daily: Option<u32>,
+    weekly: Option<u32>,
+    monthly: Option<u32>,
+    quarterly: Option<u32>,
+    yearly: Option<u32>,
+}
+
+impl KeepTiers {
+    /// Mirrors `backups.RecommendedPolicy` in the control plane: three days,
+    /// five calendar weeks (four only reach 24 to 29 days back mid-week), and
+    /// four quarter ends.
+    const RECOMMENDED: KeepTiers = KeepTiers {
+        hourly: Some(0),
+        daily: Some(3),
+        weekly: Some(5),
+        monthly: Some(0),
+        quarterly: Some(4),
+        yearly: Some(0),
+    };
+
+    /// Each tier set here, else the one from `other`.
+    fn or(self, other: KeepTiers) -> KeepTiers {
+        KeepTiers {
+            hourly: self.hourly.or(other.hourly),
+            daily: self.daily.or(other.daily),
+            weekly: self.weekly.or(other.weekly),
+            monthly: self.monthly.or(other.monthly),
+            quarterly: self.quarterly.or(other.quarterly),
+            yearly: self.yearly.or(other.yearly),
+        }
+    }
+
+    /// The `keep` object for POST /backups/configure, `null` when no tier is set.
+    fn to_json(self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        for (name, v) in [
+            ("hourly", self.hourly),
+            ("daily", self.daily),
+            ("weekly", self.weekly),
+            ("monthly", self.monthly),
+            ("quarterly", self.quarterly),
+            ("yearly", self.yearly),
+        ] {
+            if let Some(v) = v {
+                m.insert(name.into(), v.into());
+            }
+        }
+        if m.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(m)
+        }
+    }
+}
+
+/// One line for GET /backups/config, e.g.
+/// "Schedule 0 3 * * * (UTC). Keeps 3 daily, 5 weekly, 4 quarterly."
+fn describe_backup_config(cfg: &serde_json::Value) -> String {
+    let schedule = match (cfg["enabled"].as_bool(), cfg["schedule"].as_str()) {
+        (Some(true), Some(s)) if !s.is_empty() => format!("Schedule {s} (UTC)."),
+        (Some(true), _) => "Enabled, but no schedule set.".to_string(),
+        _ => "Scheduled backups off.".to_string(),
+    };
+    let mut keeps = Vec::new();
+    if let Some(n) = cfg["retention"].as_u64().filter(|n| *n > 0) {
+        keeps.push(format!("the newest {n}"));
+    }
+    for tier in ["hourly", "daily", "weekly", "monthly", "quarterly", "yearly"] {
+        if let Some(n) = cfg["keep"][tier].as_u64().filter(|n| *n > 0) {
+            keeps.push(format!("{n} {tier}"));
+        }
+    }
+    if keeps.is_empty() {
+        format!("{schedule} Keeps every backup.")
+    } else {
+        format!("{schedule} Keeps {}.", keeps.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod keep_tiers_tests {
+    use super::*;
+
+    #[test]
+    fn recommended_fills_only_the_tiers_not_given() {
+        let flags = KeepTiers { weekly: Some(8), ..Default::default() };
+        let keep = flags.or(KeepTiers::RECOMMENDED);
+        assert_eq!(keep.weekly, Some(8));
+        assert_eq!(keep.daily, Some(3));
+        assert_eq!(keep.quarterly, Some(4));
+        assert_eq!(keep.yearly, Some(0));
+    }
+
+    #[test]
+    fn unset_tiers_send_no_keep_object() {
+        assert!(KeepTiers::default().to_json().is_null());
+        let one = KeepTiers { daily: Some(3), ..Default::default() }.to_json();
+        assert_eq!(one, serde_json::json!({ "daily": 3 }));
+    }
+
+    #[test]
+    fn describes_a_tiered_config() {
+        let cfg = serde_json::json!({
+            "enabled": true, "schedule": "0 3 * * *", "retention": 0,
+            "keep": { "hourly": 0, "daily": 3, "weekly": 5, "monthly": 0, "quarterly": 4, "yearly": 0 },
+        });
+        assert_eq!(
+            describe_backup_config(&cfg),
+            "Schedule 0 3 * * * (UTC). Keeps 3 daily, 5 weekly, 4 quarterly."
+        );
+        let legacy = serde_json::json!({ "enabled": true, "schedule": "0 2 * * *", "retention": 7 });
+        assert_eq!(describe_backup_config(&legacy), "Schedule 0 2 * * * (UTC). Keeps the newest 7.");
     }
 }

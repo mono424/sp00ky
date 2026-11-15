@@ -1226,17 +1226,45 @@ pub enum CloudBackupCommands {
         /// Backup ID, full name, or unique id prefix
         backup_id: String,
     },
-    /// Configure automatic backups
+    /// Configure automatic backups and how long they are kept
+    ///
+    /// Retention tiers keep the newest backup of each of the last N periods,
+    /// each tier skipping periods an earlier one already holds. On a daily
+    /// schedule `--recommended` keeps 3 dailies, 5 weeklies and 4 quarterlies:
+    /// the last three days, the whole last month, and a year of quarter ends.
+    /// Backups created with a name are never pruned.
     Configure {
         /// Enable or disable backups
         #[arg(long)]
         enabled: Option<bool>,
-        /// Cron schedule (e.g. "0 2 * * *")
+        /// Cron schedule in UTC (e.g. "0 3 * * *")
         #[arg(long)]
         schedule: Option<String>,
-        /// Number of backups to retain
+        /// Keep the newest N backups whatever their age (0 = no count limit)
         #[arg(long)]
         retention: Option<u32>,
+        /// Keep the newest backup of each of the last N hours
+        #[arg(long)]
+        keep_hourly: Option<u32>,
+        /// Keep the newest backup of each of the last N days
+        #[arg(long)]
+        keep_daily: Option<u32>,
+        /// Keep the newest backup of each of the last N weeks (ISO, Monday first)
+        #[arg(long)]
+        keep_weekly: Option<u32>,
+        /// Keep the newest backup of each of the last N months
+        #[arg(long)]
+        keep_monthly: Option<u32>,
+        /// Keep the newest backup of each of the last N quarters
+        #[arg(long)]
+        keep_quarterly: Option<u32>,
+        /// Keep the newest backup of each of the last N years
+        #[arg(long)]
+        keep_yearly: Option<u32>,
+        /// Use the recommended tiers (3 daily, 5 weekly, 4 quarterly, no count
+        /// limit); any --keep-* or --retention flag given alongside wins
+        #[arg(long)]
+        recommended: bool,
     },
     /// Reset the database (drop all data, re-run migrations)
     Reset {

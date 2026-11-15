@@ -17,6 +17,7 @@ import type {
   BackupConfig,
   BackupsData,
   CatalogEntry,
+  KeepTiers,
   OperationResponse,
   Overview,
   RestoreStatus,
@@ -244,7 +245,7 @@ export function Backups(props: { overview: Overview | undefined; refresh: () => 
                 <div class="fx-big">{formatCount(completed().length)}<small>{completed().length === 1 ? 'backup' : 'backups'}</small></div>
                 <div class="fx-sub cap">
                   <span><b>{formatBytes(totalBytes())}</b></span>
-                  <Show when={d().config?.retention}><span>newest <b>{formatCount(d().config!.retention)}</b> kept</span></Show>
+                  <Show when={describeKeep(d().config?.retention, d().config?.keep)}>{(k) => <span>keeps <b>{k()}</b></span>}</Show>
                 </div>
               </FxCell>
               <StoredIn endpoint={d().s3.endpoint} bucket={d().s3.bucket} linked={d().linked} />
@@ -421,6 +422,32 @@ function History(props: { catalog: CatalogEntry[] }) {
 /* Schedule                                                             */
 /* ------------------------------------------------------------------ */
 
+const TIERS: ReadonlyArray<readonly [keyof KeepTiers, string]> = [
+  ['hourly', 'Hours'],
+  ['daily', 'Days'],
+  ['weekly', 'Weeks'],
+  ['monthly', 'Months'],
+  ['quarterly', 'Quarters'],
+  ['yearly', 'Years'],
+];
+
+/** backups.RecommendedPolicy in Sp00ky Cloud, for a cloud that does not send it. */
+const RECOMMENDED: KeepTiers = { hourly: 0, daily: 3, weekly: 5, monthly: 0, quarterly: 4, yearly: 0 };
+
+/** "newest 7 · 3 daily · 5 weekly", or null when everything is kept. */
+function describeKeep(retention: number | null | undefined, keep: KeepTiers | null | undefined): string | null {
+  const parts: string[] = [];
+  if (retention) parts.push(`newest ${formatCount(retention)}`);
+  for (const [tier] of TIERS) {
+    const n = keep?.[tier];
+    if (n) parts.push(`${formatCount(n)} ${tier}`);
+  }
+  return parts.length ? parts.join(' · ') : null;
+}
+
+const tierText = (keep: KeepTiers | null | undefined) =>
+  Object.fromEntries(TIERS.map(([t]) => [t, keep?.[t] ? String(keep[t]) : ''])) as Record<keyof KeepTiers, string>;
+
 function SchedulePanel(props: {
   linked: boolean;
   config: BackupConfig | null;
@@ -429,15 +456,32 @@ function SchedulePanel(props: {
   const [enabled, setEnabled] = createSignal(props.config?.enabled ?? false);
   const [schedule, setSchedule] = createSignal(props.config?.schedule ?? '');
   const [retention, setRetention] = createSignal(
-    props.config?.retention != null ? String(props.config.retention) : '',
+    props.config?.retention ? String(props.config.retention) : '',
   );
+  const [tiers, setTiers] = createSignal(tierText(props.config?.keep));
   const [saving, setSaving] = createSignal(false);
+  /** Tiers need a cloud that knows them; an older one would drop them silently. */
+  const tiered = () => props.config?.keep != null;
+  const recommended = () => props.config?.recommended ?? RECOMMENDED;
 
   const dirty = () =>
     enabled() !== (props.config?.enabled ?? false) ||
     schedule().trim() !== (props.config?.schedule ?? '') ||
-    (retention().trim() || null) !==
-      (props.config?.retention != null ? String(props.config.retention) : null);
+    retention().trim() !== (props.config?.retention ? String(props.config.retention) : '') ||
+    TIERS.some(([t]) => tiers()[t].trim() !== tierText(props.config?.keep)[t]);
+
+  const useRecommended = () => {
+    setTiers(tierText(recommended()));
+    setRetention('');
+    if (!schedule().trim()) setSchedule('0 3 * * *');
+    setEnabled(true);
+  };
+
+  /** What the tiers in the form keep, in words. */
+  const keepPreview = () => {
+    const keep = Object.fromEntries(TIERS.map(([t]) => [t, Number(tiers()[t]) || 0])) as unknown as KeepTiers;
+    return describeKeep(Number(retention()) || 0, keep) ?? 'keeps every backup';
+  };
 
   const preview = () => {
     const s = schedule().trim();
@@ -450,14 +494,30 @@ function SchedulePanel(props: {
     try {
       const body: Record<string, unknown> = { enabled: enabled() };
       if (schedule().trim()) body.schedule = schedule().trim();
-      const r = retention().trim();
-      if (r) {
-        const n = Number(r);
-        if (!Number.isInteger(n) || n < 0) {
-          toast('bad', 'Retention must be a whole number');
-          return;
+      const whole = (v: string) => {
+        const n = Number(v.trim() || '0');
+        return Number.isInteger(n) && n >= 0 && n <= 1000 ? n : null;
+      };
+      // Only what changed: an untouched field must not overwrite a default the
+      // cloud applies while nothing is stored (a managed database's policy).
+      const r = whole(retention());
+      if (r == null) {
+        toast('bad', 'Keep newest must be a whole number from 0 to 1000');
+        return;
+      }
+      if (retention().trim() !== (props.config?.retention ? String(props.config.retention) : '')) body.retention = r;
+      const stored = tierText(props.config?.keep);
+      if (tiered() && TIERS.some(([t]) => tiers()[t].trim() !== stored[t])) {
+        const keep: Record<string, number> = {};
+        for (const [t, label] of TIERS) {
+          const n = whole(tiers()[t]);
+          if (n == null) {
+            toast('bad', `${label} must be a whole number from 0 to 1000`);
+            return;
+          }
+          keep[t] = n;
         }
-        body.retention = n;
+        body.keep = keep;
       }
       await runAction<{ status: string }>({
         label: 'Backup schedule',
@@ -488,10 +548,33 @@ function SchedulePanel(props: {
             <small class="cap">{preview() ?? 'minute hour day month weekday'}</small>
           </label>
           <label class="li-field">
-            <span>Keep</span>
-            <input value={retention()} placeholder="7" inputmode="numeric" onInput={(e) => setRetention(e.currentTarget.value)} />
-            <small class="cap">newest backups · empty or 0 keeps all</small>
+            <span>Keep newest</span>
+            <input value={retention()} placeholder="0" inputmode="numeric" onInput={(e) => setRetention(e.currentTarget.value)} />
+            <small class="cap">backups, whatever their age · empty or 0 sets no count</small>
           </label>
+          <Show when={tiered()}>
+            <div class="li-field">
+              <span class="bu-tiers-head">
+                Keep one per
+                <button type="button" class="chip" onClick={useRecommended}
+                  title="3 days, then a backup a week for the month before, then a year of quarter ends">
+                  Recommended
+                </button>
+              </span>
+              <div class="bu-tiers">
+                <For each={TIERS}>
+                  {([t, label]) => (
+                    <label>
+                      <small class="cap">{label}</small>
+                      <input value={tiers()[t]} placeholder="0" inputmode="numeric"
+                        onInput={(e) => setTiers({ ...tiers(), [t]: e.currentTarget.value })} />
+                    </label>
+                  )}
+                </For>
+              </div>
+              <small class="cap">{keepPreview()} · named backups are never pruned</small>
+            </div>
+          </Show>
           <button class="btn btn-sm btn-primary bu-save" disabled={!dirty() || saving()} onClick={() => void save()}>
             {saving() ? 'Saving…' : 'Save'}
           </button>

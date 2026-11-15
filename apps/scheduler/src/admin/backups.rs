@@ -23,7 +23,7 @@ use std::time::Duration;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -551,8 +551,32 @@ pub struct ConfigRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Keep the newest N backups whatever their age.
     #[serde(default)]
     pub retention: Option<u32>,
+    /// Retention tiers; Sp00ky Cloud merges them into the stored ones.
+    #[serde(default)]
+    pub keep: Option<KeepTiers>,
+}
+
+/// How many periods keep their newest backup, per tier. A tier left out keeps
+/// its stored value. Unknown tiers are refused here rather than dropped, so a
+/// typo is an error instead of a policy that silently keeps less.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeepTiers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hourly: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarterly: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yearly: Option<u32>,
 }
 
 /// `PUT /admin/api/backups/config`
@@ -571,6 +595,9 @@ pub async fn configure(
     }
     if let Some(v) = req.retention {
         body.insert("retention".into(), json!(v));
+    }
+    if let Some(v) = req.keep {
+        body.insert("keep".into(), json!(v));
     }
     info!(by = %session.subject, config = ?body, "Backup schedule updated through Sp00ky Cloud");
     let (_, v) = link.post("/backups/configure", Value::Object(body)).await?;

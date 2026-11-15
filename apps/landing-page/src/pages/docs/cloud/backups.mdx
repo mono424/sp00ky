@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: Backups
-description: Create, list and restore database snapshots, and schedule them to run automatically.
+description: Create, list and restore database snapshots, schedule them, and keep days, weeks and quarters of history.
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -35,14 +35,18 @@ export const code6 = `spky backup restore <backup-id>`;
 
 export const code5 = `spky backup delete <backup-id>`;
 
-export const code4 = `# Enable daily backups at 2 AM, keep last 7
-spky backup configure --enabled true --schedule "0 2 * * *" --retention 7
+export const code4 = `# Back up daily at 2 AM UTC: keep the last 3 days, a backup a week
+# for the month before, and a year of quarter ends
+spky backup configure --enabled true --schedule "0 2 * * *" --recommended
+
+# Pick your own tiers (a tier you leave out keeps its current value)
+spky backup configure --keep-daily 7 --keep-weekly 4 --keep-monthly 12
+
+# Or simply keep the newest 30, whatever their age
+spky backup configure --retention 30
 
 # Disable automatic backups
-spky backup configure --enabled false
-
-# Change retention to keep 30 backups
-spky backup configure --retention 30`;
+spky backup configure --enabled false`;
 
 export const code3 = `spky backup reset`;
 
@@ -55,8 +59,8 @@ Commands:
   create [--name NAME]          Create a manual backup
   restore <backup-id>           Restore database from a backup
   delete <backup-id>            Delete a backup
-  configure [--enabled] [--schedule] [--retention]
-                                Configure automatic backups
+  configure [--enabled] [--schedule] [--retention] [--keep-*] [--recommended]
+                                Configure automatic backups and retention
   reset [--no-backup]           Reset the database (drop all data, re-run migrations)`;
 
 Sp00ky Cloud takes care of your backups for you. Make a snapshot whenever you want, set up a schedule, and roll back to any backup when you need to.
@@ -171,10 +175,28 @@ Set up a schedule with a cron expression:
 | Option | What it does |
 | :--- | :--- |
 | `--enabled` | Turn automatic backups on or off (`true`/`false`) |
-| `--schedule` | Cron expression for how often to back up (e.g. `"0 2 * * *"` for daily at 2 AM) |
-| `--retention` | How many backups to keep before the oldest ones get deleted |
+| `--schedule` | Cron expression in UTC for how often to back up (e.g. `"0 2 * * *"` for daily at 2 AM) |
+| `--retention` | Keep the newest N backups, whatever their age. `0` sets no count |
+| `--keep-hourly`, `--keep-daily`, `--keep-weekly`, `--keep-monthly`, `--keep-quarterly`, `--keep-yearly` | Keep the newest backup of each of the last N hours, days, weeks, months, quarters or years |
+| `--recommended` | `--keep-daily 3 --keep-weekly 5 --keep-quarterly 4` with no count limit. Any `--keep-*` or `--retention` you pass alongside wins |
 
-A pay-as-you-go project is backed up every day at 03:00 UTC and keeps the last 7, until you configure backups yourself. Scheduled backups pause while a project is stopped at its [spend cap](/docs/cloud/billing#spend-cap).
+### How retention decides
+
+Every option is a rule for what to **keep**; a completed backup that no rule keeps is deleted, from storage and from the list. With nothing set, every backup is kept.
+
+The tiers run in order: newest N, then hourly, daily, weekly, monthly, quarterly, yearly. Each keeps the newest backup of each of its last N periods, and skips any period an earlier tier already holds a backup of. That is what makes them add up: with `--recommended` on a daily schedule you keep
+
+- the last **3 days**,
+- one backup for each of the **5 weeks** before those, which always reaches at least 31 days back,
+- the last backup of each of the **4 quarters** before that, so about a year,
+
+twelve backups in all. Five weeks rather than four because weeks are calendar weeks (Monday to Sunday, UTC): four only reach 24 to 29 days back, depending on the weekday.
+
+A period only counts when it has a backup, so a night that failed widens the window instead of leaving you with fewer backups. The newest backup is always kept.
+
+**Named backups are never deleted by retention.** `spky backup create --name before-migration`, and the backup `spky backup reset` offers to take, stay until you delete them yourself.
+
+A pay-as-you-go project is backed up every day at 03:00 UTC with the recommended tiers, until you configure retention yourself. Scheduled backups pause while a project is stopped at its [spend cap](/docs/cloud/billing#spend-cap).
 
 ## Database Reset
 

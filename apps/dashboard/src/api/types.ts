@@ -574,10 +574,27 @@ export interface CatalogEntry {
   local: BackupJobState | null;
 }
 
+/**
+ * Retention tiers: each keeps the newest backup of its last N periods (UTC,
+ * ISO weeks), skipping periods an earlier tier already holds.
+ */
+export interface KeepTiers {
+  hourly: number;
+  daily: number;
+  weekly: number;
+  monthly: number;
+  quarterly: number;
+  yearly: number;
+}
+
 export interface BackupConfig {
   enabled: boolean;
   schedule: string | null;
+  /** Keep the newest N whatever their age. */
   retention: number | null;
+  /** Absent from a Sp00ky Cloud that predates retention tiers. */
+  keep?: KeepTiers | null;
+  recommended?: KeepTiers | null;
   next_run_at: string | null;
   last_scheduled_at: string | null;
 }

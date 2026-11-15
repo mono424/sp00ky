@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
+import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
 import { api } from '../api/client';
 import { PageHead } from '../components/Chrome';
 import { FxCell, Sq } from '../components/Frame';
@@ -6,11 +6,21 @@ import { runAction, post, toast } from '../components/Actions';
 import { ActivityStrip, OpCard, restoreView } from '../components/OpCard';
 import { describeCron } from '../lib/cron';
 import {
+  EMPTY_POLICY,
+  TIERS as RETENTION_TIERS,
+  cadence,
+  pastRuns,
+  periodName,
+  retain,
+  shortDate,
+  type Policy,
+  type Tier,
+} from '../lib/retention';
+import {
   elapsed,
   formatBytes,
   formatCount,
   formatStamp,
-  isAbsent,
   relativeStamp,
 } from '../lib/format';
 import type {
@@ -440,71 +450,232 @@ function History(props: { catalog: CatalogEntry[] }) {
 /* Schedule                                                             */
 /* ------------------------------------------------------------------ */
 
-const TIERS: ReadonlyArray<readonly [keyof KeepTiers, string]> = [
-  ['hourly', 'Hours'],
-  ['daily', 'Days'],
-  ['weekly', 'Weeks'],
-  ['monthly', 'Months'],
-  ['quarterly', 'Quarters'],
-  ['yearly', 'Years'],
-];
+const KEEP_TIERS = ['hourly', 'daily', 'weekly', 'monthly', 'quarterly', 'yearly'] as const satisfies ReadonlyArray<keyof KeepTiers>;
 
 /** backups.RecommendedPolicy in Sp00ky Cloud, for a cloud that does not send it. */
 const RECOMMENDED: KeepTiers = { hourly: 0, daily: 3, weekly: 5, monthly: 0, quarterly: 4, yearly: 0 };
+
+/** Sp00ky Cloud's MaxKeep: the most any one tier may hold. */
+const MAX_KEEP = 1000;
+const DAY_MS = 86_400_000;
 
 /** "newest 7 · 3 daily · 5 weekly", or null when everything is kept. */
 function describeKeep(retention: number | null | undefined, keep: KeepTiers | null | undefined): string | null {
   const parts: string[] = [];
   if (retention) parts.push(`newest ${formatCount(retention)}`);
-  for (const [tier] of TIERS) {
+  for (const tier of KEEP_TIERS) {
     const n = keep?.[tier];
     if (n) parts.push(`${formatCount(n)} ${tier}`);
   }
   return parts.length ? parts.join(' · ') : null;
 }
 
-const tierText = (keep: KeepTiers | null | undefined) =>
-  Object.fromEntries(TIERS.map(([t]) => [t, keep?.[t] ? String(keep[t]) : ''])) as Record<keyof KeepTiers, string>;
+/** The form's policy: `last` is the `retention` setting, the rest are tiers. */
+const policyOf = (c: BackupConfig | null): Policy => ({
+  last: c?.retention ?? 0,
+  hourly: c?.keep?.hourly ?? 0,
+  daily: c?.keep?.daily ?? 0,
+  weekly: c?.keep?.weekly ?? 0,
+  monthly: c?.keep?.monthly ?? 0,
+  quarterly: c?.keep?.quarterly ?? 0,
+  yearly: c?.keep?.yearly ?? 0,
+});
+const samePolicy = (a: Policy, b: Policy) => RETENTION_TIERS.every((t) => a[t] === b[t]);
 
+/** The ladder's rungs, in the order retention fills them. */
+const RUNGS: ReadonlyArray<{ tier: Tier; name: string; help: string; short: string }> = [
+  { tier: 'last', name: 'Newest', short: 'the newest, any age', help: 'The newest backups, whatever their age. Filled first, so every rung below starts where this one ends.' },
+  { tier: 'hourly', name: 'Hourly', short: 'one per hour', help: 'The newest backup of each hour' },
+  { tier: 'daily', name: 'Daily', short: 'one per day', help: 'The newest backup of each day' },
+  { tier: 'weekly', name: 'Weekly', short: 'one per week', help: 'The newest backup of each ISO week' },
+  { tier: 'monthly', name: 'Monthly', short: 'one per month', help: 'The newest backup of each month' },
+  { tier: 'quarterly', name: 'Quarterly', short: 'one per quarter', help: 'The newest backup of each quarter' },
+  { tier: 'yearly', name: 'Yearly', short: 'one per year', help: 'The newest backup of each year' },
+];
+
+/* The cron shapes the schedule line can edit; anything else is typed. */
+type Shape = { freq: 'hourly' | 'daily' | 'weekly' | 'cron'; hour: number; minute: number; dow: number };
+
+function shapeOf(cron: string): Shape {
+  const s = cron.trim().split(/\s+/).join(' ');
+  const fallback: Shape = { freq: 'cron', hour: 3, minute: 0, dow: 1 };
+  let m = /^(\d{1,2}) \* \* \* \*$/.exec(s);
+  if (m) return Number(m[1]) < 60 ? { ...fallback, freq: 'hourly', minute: Number(m[1]) } : fallback;
+  m = /^(\d{1,2}) (\d{1,2}) \* \* (\*|[0-7])$/.exec(s);
+  if (!m || Number(m[1]) > 59 || Number(m[2]) > 23) return fallback;
+  const at = { hour: Number(m[2]), minute: Number(m[1]) };
+  return m[3] === '*' ? { ...fallback, ...at, freq: 'daily' } : { ...fallback, ...at, freq: 'weekly', dow: Number(m[3]) % 7 };
+}
+
+function cronOf(s: Shape): string {
+  if (s.freq === 'hourly') return `${s.minute} * * * *`;
+  if (s.freq === 'weekly') return `${s.minute} ${s.hour} * * ${s.dow}`;
+  return `${s.minute} ${s.hour} * * *`;
+}
+
+const WEEK = [1, 2, 3, 4, 5, 6, 0];
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const clock = (h: number, m: number) => `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+/** Half hours, plus the stored time when it falls between them. */
+const times = (h: number, m: number) => {
+  const all = Array.from({ length: 48 }, (_, i) => [i >> 1, (i & 1) * 30] as const);
+  return m % 30 ? [[h, m] as const, ...all] : all;
+};
+const minutes = (m: number) => ([0, 15, 30, 45].includes(m) ? [0, 15, 30, 45] : [m, 0, 15, 30, 45]);
+/** A typed cron line in words, always saying it is UTC. */
+const cronWords = (cron: string) => {
+  const words = describeCron(cron) ?? 'custom expression';
+  return words.includes('UTC') ? words : `${words} (UTC)`;
+};
+/** Width for a select showing `text`: mono, so characters plus the caret's room. */
+const selWidth = (text: string) => `calc(${text.length}ch + 16px)`;
+
+/** Axis marks under the lanes, in days ago. */
+const TICKS: ReadonlyArray<readonly [number, string]> = [
+  [0, 'now'], [1, '1d'], [7, '1w'], [30.4, '1m'], [91, '3m'], [182, '6m'], [365, '1y'], [730, '2y'], [1826, '5y'],
+];
+
+/** The count a period comes back with when it is added. */
+const ADD_COUNT: Record<Tier, number> = { last: 7, hourly: 24, daily: 7, weekly: 4, monthly: 12, quarterly: 4, yearly: 3 };
+
+/** A bare number; its − and + show while the row is hovered or focused. */
+function Count(props: { value: number; label: string; onChange: (n: number) => void }) {
+  const set = (n: number) => props.onChange(Math.max(0, Math.min(MAX_KEEP, n)));
+  return (
+    <span class="bu-count">
+      <button type="button" aria-label={`Fewer: ${props.label}`} disabled={props.value <= 0} onClick={() => set(props.value - 1)}>−</button>
+      <input
+        value={props.value}
+        inputmode="numeric"
+        aria-label={props.label}
+        onInput={(e) => {
+          const raw = e.currentTarget.value.trim();
+          if (/^\d+$/.test(raw)) set(Number(raw));
+        }}
+        onKeyDown={(e) => {
+          if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+          e.preventDefault();
+          set(props.value + (e.key === 'ArrowUp' ? 1 : -1));
+        }}
+        onBlur={(e) => {
+          if (e.currentTarget.value.trim() === '') set(0);
+          else e.currentTarget.value = String(props.value);
+        }}
+      />
+      <button type="button" aria-label={`More: ${props.label}`} disabled={props.value >= MAX_KEEP} onClick={() => set(props.value + 1)}>+</button>
+    </span>
+  );
+}
+
+/**
+ * The schedule as one sentence, then retention as a row per period in use,
+ * each drawing the backups it keeps on that schedule today on a shared log
+ * timeline (newest left). Periods fill in order and each skips what the one
+ * above already holds, so the rows step down and to the right: a staircase.
+ * Hovering a row puts the dates it covers in the header.
+ */
 function SchedulePanel(props: {
   linked: boolean;
   config: BackupConfig | null;
   onSaved: () => void;
 }) {
+  const storedSchedule = () => props.config?.schedule || '0 3 * * *';
   const [enabled, setEnabled] = createSignal(props.config?.enabled ?? false);
-  const [schedule, setSchedule] = createSignal(props.config?.schedule ?? '');
-  const [retention, setRetention] = createSignal(
-    props.config?.retention ? String(props.config.retention) : '',
-  );
-  const [tiers, setTiers] = createSignal(tierText(props.config?.keep));
+  const [schedule, setSchedule] = createSignal(storedSchedule());
+  const [typing, setTyping] = createSignal(shapeOf(storedSchedule()).freq === 'cron');
+  const [policy, setPolicy] = createSignal<Policy>(policyOf(props.config));
+  const [hot, setHot] = createSignal<Tier | null>(null);
   const [saving, setSaving] = createSignal(false);
   /** Tiers need a cloud that knows them; an older one would drop them silently. */
   const tiered = () => props.config?.keep != null;
-  const recommended = () => props.config?.recommended ?? RECOMMENDED;
+  const recommended = (): Policy => ({ ...EMPTY_POLICY, ...(props.config?.recommended ?? RECOMMENDED) });
+
+  const shape = createMemo(() => shapeOf(schedule()));
+  const freq = () => (typing() ? 'cron' : shape().freq === 'weekly' ? `w${shape().dow}` : shape().freq);
+  const freqLabel = () => {
+    const f = freq();
+    return f === 'cron' ? 'cron expression' : f === 'hourly' ? 'hour' : f === 'daily' ? 'day' : DAY_NAMES[shape().dow]!;
+  };
+
+  /** The time of day last chosen, so a detour through hourly does not lose it. */
+  let clockAt = { hour: 3, minute: 0 };
+  createEffect(() => {
+    const s = shape();
+    if (s.freq === 'daily' || s.freq === 'weekly') clockAt = { hour: s.hour, minute: s.minute };
+  });
+
+  const setFreq = (v: string) => {
+    if (v === 'cron') return setTyping(true);
+    const base = v === 'hourly' ? shape() : { ...shape(), ...clockAt };
+    setTyping(false);
+    if (v === 'hourly' || v === 'daily') setSchedule(cronOf({ ...base, freq: v }));
+    else setSchedule(cronOf({ ...base, freq: 'weekly', dow: Number(v.slice(1)) }));
+  };
+
+  const setTier = (t: Tier, n: number) => setPolicy({ ...policy(), [t]: n });
+
+  /** What the policy keeps on this schedule, as of now. */
+  const sim = createMemo(() => {
+    const now = Date.now();
+    const exact = cadence(schedule(), now);
+    const c = exact ?? cadence('0 3 * * *', now)!;
+    const p = policy();
+    return { now, approx: !exact, step: c.stepMs, r: retain(p, pastRuns(c, p)) };
+  });
+  const oldest = () => sim().r.kept[sim().r.kept.length - 1]?.at;
+
+  /**
+   * Every period has a row whether it is used or not, so adding or removing
+   * one never moves the others. Hourly only shows on an hourly schedule.
+   */
+  const available = () =>
+    tiered()
+      ? RUNGS.filter((g) => g.tier !== 'hourly' || sim().step < DAY_MS || policy().hourly > 0)
+      : RUNGS.filter((g) => g.tier === 'last');
+
+  /** Log scale, so the last few days and the last year both read. */
+  const span = () => Math.max(35, ((sim().now - (oldest() ?? sim().now)) / DAY_MS) * 1.1);
+  const pctDays = (days: number) => (Math.log1p(Math.max(0, days)) / Math.log1p(span())) * 100;
+  const pct = (t: number) => pctDays((sim().now - t) / DAY_MS);
+  /** Axis labels under the lanes, skipping any that would run into the one before. */
+  const ticks = createMemo(() => {
+    let prev = -Infinity;
+    return TICKS.filter(([d]) => {
+      if (d > span() || pctDays(d) - prev < 17) return false;
+      prev = pctDays(d);
+      return true;
+    });
+  });
+  const keptBy = (t: Tier) => sim().r.kept.filter((k) => k.tier === t);
+
+  /** The periods a row covers: "10 Nov → 12 Nov", "Q4 2025 → Q3". */
+  const reach = (t: Tier) => {
+    if (!policy()[t]) return 'off';
+    const mine = keptBy(t);
+    if (!mine.length) return 'nothing yet';
+    const name = (m: { at: number }) => periodName(t, m.at, sim().now);
+    return mine.length === 1 ? name(mine[0]!) : `${name(mine[mine.length - 1]!)} → ${name(mine[0]!)}`;
+  };
+
+  /** The total, or while a row is hovered, the dates it covers or what adding it keeps. */
+  const headline = () => {
+    const t = hot();
+    if (t) {
+      const g = RUNGS.find((r) => r.tier === t)!;
+      return policy()[t] ? `${g.name}: ${reach(t)}` : `Add ${g.name.toLowerCase()}: ${g.short}`;
+    }
+    if (!sim().r.prunes) return 'keeps everything';
+    return `${formatCount(sim().r.kept.length)} kept, back to ${shortDate(oldest()!, sim().now)}${sim().approx ? ' (as if nightly)' : ''}`;
+  };
 
   const dirty = () =>
     enabled() !== (props.config?.enabled ?? false) ||
-    schedule().trim() !== (props.config?.schedule ?? '') ||
-    retention().trim() !== (props.config?.retention ? String(props.config.retention) : '') ||
-    TIERS.some(([t]) => tiers()[t].trim() !== tierText(props.config?.keep)[t]);
+    schedule().trim() !== storedSchedule() ||
+    !samePolicy(policy(), policyOf(props.config));
 
   const useRecommended = () => {
-    setTiers(tierText(recommended()));
-    setRetention('');
-    if (!schedule().trim()) setSchedule('0 3 * * *');
+    setPolicy(recommended());
     setEnabled(true);
-  };
-
-  /** What the tiers in the form keep, in words. */
-  const keepPreview = () => {
-    const keep = Object.fromEntries(TIERS.map(([t]) => [t, Number(tiers()[t]) || 0])) as unknown as KeepTiers;
-    return describeKeep(Number(retention()) || 0, keep) ?? 'keeps every backup';
-  };
-
-  const preview = () => {
-    const s = schedule().trim();
-    if (!s) return null;
-    return describeCron(s) ?? 'custom expression';
   };
 
   const save = async () => {
@@ -512,30 +683,13 @@ function SchedulePanel(props: {
     try {
       const body: Record<string, unknown> = { enabled: enabled() };
       if (schedule().trim()) body.schedule = schedule().trim();
-      const whole = (v: string) => {
-        const n = Number(v.trim() || '0');
-        return Number.isInteger(n) && n >= 0 && n <= 1000 ? n : null;
-      };
       // Only what changed: an untouched field must not overwrite a default the
       // cloud applies while nothing is stored (a managed database's policy).
-      const r = whole(retention());
-      if (r == null) {
-        toast('bad', 'Keep newest must be a whole number from 0 to 1000');
-        return;
-      }
-      if (retention().trim() !== (props.config?.retention ? String(props.config.retention) : '')) body.retention = r;
-      const stored = tierText(props.config?.keep);
-      if (tiered() && TIERS.some(([t]) => tiers()[t].trim() !== stored[t])) {
-        const keep: Record<string, number> = {};
-        for (const [t, label] of TIERS) {
-          const n = whole(tiers()[t]);
-          if (n == null) {
-            toast('bad', `${label} must be a whole number from 0 to 1000`);
-            return;
-          }
-          keep[t] = n;
-        }
-        body.keep = keep;
+      const p = policy();
+      const stored = policyOf(props.config);
+      if (p.last !== stored.last) body.retention = p.last;
+      if (tiered() && KEEP_TIERS.some((t) => p[t] !== stored[t])) {
+        body.keep = Object.fromEntries(KEEP_TIERS.map((t) => [t, p[t]]));
       }
       await runAction<{ status: string }>({
         label: 'Backup schedule',
@@ -549,51 +703,138 @@ function SchedulePanel(props: {
   };
 
   return (
-    <FxCell label="Schedule" meta={<Show when={props.config?.last_scheduled_at && !isAbsent(props.config?.last_scheduled_at)}><span>last ran {relativeStamp(props.config!.last_scheduled_at)}</span></Show>}>
-      <Show
-        when={props.linked}
-        fallback={<div class="fx-empty cap">Scheduled backups need a project linked to Sp00ky Cloud, then spky backup configure</div>}
-      >
-        <div class="bu-form">
+    <FxCell
+      label="Schedule"
+      class="bu-sched"
+      meta={
+        <Show when={props.linked}>
           <label class="switch">
             <input type="checkbox" checked={enabled()} onChange={(e) => setEnabled(e.currentTarget.checked)} />
             <span class="switch-track" />
             <span class="cap">{enabled() ? 'On' : 'Off'}</span>
           </label>
-          <label class="li-field">
-            <span>Cron, UTC</span>
-            <input class="mono" value={schedule()} placeholder="0 3 * * *" spellcheck={false} onInput={(e) => setSchedule(e.currentTarget.value)} />
-            <small class="cap">{preview() ?? 'minute hour day month weekday'}</small>
-          </label>
-          <label class="li-field">
-            <span>Keep newest</span>
-            <input value={retention()} placeholder="0" inputmode="numeric" onInput={(e) => setRetention(e.currentTarget.value)} />
-            <small class="cap">backups, whatever their age · empty or 0 sets no count</small>
-          </label>
-          <Show when={tiered()}>
-            <div class="li-field">
-              <span class="bu-tiers-head">
-                Keep one per
-                <button type="button" class="chip" onClick={useRecommended}
-                  title="3 days, then a backup a week for the month before, then a year of quarter ends">
-                  Recommended
-                </button>
-              </span>
-              <div class="bu-tiers">
-                <For each={TIERS}>
-                  {([t, label]) => (
-                    <label>
-                      <small class="cap">{label}</small>
-                      <input value={tiers()[t]} placeholder="0" inputmode="numeric"
-                        onInput={(e) => setTiers({ ...tiers(), [t]: e.currentTarget.value })} />
-                    </label>
-                  )}
+        </Show>
+      }
+    >
+      <Show
+        when={props.linked}
+        fallback={<div class="fx-empty cap">Scheduled backups need a project linked to Sp00ky Cloud, then spky backup configure</div>}
+      >
+        {/* when it runs, as a sentence ======================================== */}
+        <div class="bu-when" classList={{ off: !enabled() }}>
+          <span>Every</span>
+          <select class="bu-sel" aria-label="How often" style={{ width: selWidth(freqLabel()) }} onChange={(e) => setFreq(e.currentTarget.value)}>
+            <option value="hourly" selected={freq() === 'hourly'}>hour</option>
+            <option value="daily" selected={freq() === 'daily'}>day</option>
+            <For each={WEEK}>{(d) => <option value={`w${d}`} selected={freq() === `w${d}`}>{DAY_NAMES[d]}</option>}</For>
+            <option value="cron" selected={freq() === 'cron'}>cron expression</option>
+          </select>
+          <Show when={!typing()}>
+            <Show
+              when={shape().freq === 'hourly'}
+              fallback={
+                <>
+                  <span>at</span>
+                  <select
+                    class="bu-sel"
+                    aria-label="Time, UTC"
+                    style={{ width: selWidth('00:00') }}
+                    onChange={(e) => {
+                      const [h, m] = e.currentTarget.value.split(':').map(Number);
+                      setSchedule(cronOf({ ...shape(), hour: h!, minute: m! }));
+                    }}
+                  >
+                    <For each={times(shape().hour, shape().minute)}>
+                      {([h, m]) => <option value={`${h}:${m}`} selected={h === shape().hour && m === shape().minute}>{clock(h, m)}</option>}
+                    </For>
+                  </select>
+                  <span>UTC</span>
+                </>
+              }
+            >
+              <span>at minute</span>
+              <select
+                class="bu-sel"
+                aria-label="Minute"
+                style={{ width: selWidth(':00') }}
+                onChange={(e) => setSchedule(cronOf({ ...shape(), minute: Number(e.currentTarget.value) }))}
+              >
+                <For each={minutes(shape().minute)}>
+                  {(m) => <option value={m} selected={m === shape().minute}>:{String(m).padStart(2, '0')}</option>}
                 </For>
-              </div>
-              <small class="cap">{keepPreview()} · named backups are never pruned</small>
-            </div>
+              </select>
+            </Show>
           </Show>
-          <button class="btn btn-sm btn-primary bu-save" disabled={!dirty() || saving()} onClick={() => void save()}>
+          <Show when={typing()}>
+            <input class="mono bu-cron" value={schedule()} placeholder="0 3 * * *" spellcheck={false}
+              aria-label="Cron expression, UTC" onInput={(e) => setSchedule(e.currentTarget.value)} />
+            <small class="bu-cron-words">{cronWords(schedule())}</small>
+          </Show>
+        </div>
+
+        {/* what it keeps: a row per period, each on a shared timeline ========= */}
+        <div class="fx-head bu-keep-head">
+          <span class="cap">Retention</span>
+          <span class="fx-meta cap" classList={{ warn: !sim().r.prunes }}>{headline()}</span>
+        </div>
+
+        <div class="bu-stairs" onMouseLeave={() => setHot(null)}>
+          <For each={available()}>
+            {(g) => (
+              <Show
+                when={policy()[g.tier] > 0}
+                fallback={
+                  <button type="button" class="bu-stair off" classList={{ hot: hot() === g.tier }} title={g.help}
+                    onClick={() => setTier(g.tier, ADD_COUNT[g.tier])}
+                    onMouseEnter={() => setHot(g.tier)} onFocus={() => setHot(g.tier)} onBlur={() => setHot(null)}>
+                    <span class="bu-stair-name">{g.name}</span>
+                    <span />
+                    <span class="bu-lane" />
+                    <span class="bu-stair-act" aria-hidden="true">+</span>
+                  </button>
+                }
+              >
+                <div class="bu-stair" classList={{ hot: hot() === g.tier }} title={`${g.help}: ${reach(g.tier)}`}
+                  onMouseEnter={() => setHot(g.tier)}>
+                  <span class="bu-stair-name">{g.name}</span>
+                  <Count value={policy()[g.tier]} label={g.name} onChange={(n) => setTier(g.tier, n)} />
+                  <div class="bu-lane">
+                    <For each={ticks().slice(1)}>{([d]) => <span class="bu-lane-grid" style={{ left: `${pctDays(d)}%` }} />}</For>
+                    <Show when={keptBy(g.tier).length > 1}>
+                      <u style={{
+                        left: `${pct(keptBy(g.tier)[0]!.at)}%`,
+                        width: `${pct(keptBy(g.tier)[keptBy(g.tier).length - 1]!.at) - pct(keptBy(g.tier)[0]!.at)}%`,
+                      }} />
+                    </Show>
+                    <For each={keptBy(g.tier)}>{(k) => <i style={{ left: `${pct(k.at)}%` }} />}</For>
+                  </div>
+                  <button type="button" class="bu-stair-act" aria-label={`Remove ${g.name.toLowerCase()}`}
+                    title={`Remove ${g.name.toLowerCase()}`} onClick={() => setTier(g.tier, 0)}>×</button>
+                </div>
+              </Show>
+            )}
+          </For>
+          <div class="bu-stair bu-stair-axis">
+            <span class="bu-stair-rec">
+              <Show when={tiered()}>
+                <Show when={!samePolicy(policy(), recommended())} fallback={<span>Recommended</span>}>
+                  <button type="button" class="bu-link" onClick={useRecommended}
+                    title="3 days, then one a week for the month before, then four quarter ends">
+                    Use recommended
+                  </button>
+                </Show>
+              </Show>
+            </span>
+            <div class="bu-lane-axis" aria-hidden="true">
+              <For each={ticks()}>{([d, label], i) => <span classList={{ first: i() === 0 }} style={{ left: `${pctDays(d)}%` }}>{label}</span>}</For>
+            </div>
+            <span />
+          </div>
+        </div>
+
+        <div class="bu-foot">
+          <small>Named backups are never pruned</small>
+          <button class="btn btn-sm btn-primary" disabled={!dirty() || saving()} onClick={() => void save()}>
             {saving() ? 'Saving…' : 'Save'}
           </button>
         </div>

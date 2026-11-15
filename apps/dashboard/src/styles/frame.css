@@ -3428,37 +3428,345 @@ h2 {
   background: repeating-linear-gradient(135deg, rgba(241, 180, 64, 0.7) 0 3px, transparent 3px 6px);
 }
 
-/* the schedule form, stacked in its cell */
-.bu-form {
-  display: grid;
-  gap: 16px;
-  align-content: start;
+/* the schedule: one sentence, then a strip of what is kept and a row per period */
+.bu-sched .fx-meta .switch {
+  gap: 8px;
 }
 
-.bu-form .li-field {
-  display: grid;
-  gap: 6px;
-  margin: 0;
+.bu-when {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 7px;
+  font-size: 14px;
+  color: var(--ink-faint);
+  transition: opacity 0.15s;
 }
 
-.bu-form .li-field > span {
+.bu-when.off {
+  opacity: 0.45;
+}
+
+/* a select that reads as a word of the sentence */
+.bu-sel {
+  width: auto;
+  height: auto;
+  padding: 0 14px 1px 0;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  border-bottom: 1px dotted rgba(255, 255, 255, 0.22);
+  background: transparent
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%23707070'/%3E%3C/svg%3E")
+    no-repeat right 1px center / 7px 4px;
+  font: 500 13px var(--mono);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.bu-sel:hover,
+.bu-sel:focus {
+  border-bottom-color: var(--accent);
+  box-shadow: none;
+}
+
+.bu-cron {
+  flex: 1 1 100%;
+  height: 30px;
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.bu-cron-words {
+  flex: 1 1 100%;
+  font: 400 11px var(--mono);
+  color: var(--ink-ghost);
+}
+
+.bu-keep-head {
+  margin-top: 28px;
+}
+
+.bu-link {
+  padding: 0;
+  border: 0;
+  background: none;
   font: 500 10.5px var(--mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-faint);
 }
 
-.bu-form .li-field input {
-  height: 32px;
+.bu-link:hover {
+  color: var(--ink);
 }
 
-.bu-form small {
-  font-size: 9.5px;
+/* the staircase: a row per period, its backups on a shared log timeline */
+.bu-stairs {
+  display: grid;
+}
+
+.bu-stair {
+  display: grid;
+  grid-template-columns: 72px 56px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 6px;
+  width: calc(100% + 16px);
+  height: 30px;
+  margin: 0 -8px;
+  padding: 0 8px;
+}
+
+/* an unused period: the whole row is the button that adds it */
+button.bu-stair {
+  border: 0;
+  background: none;
+  font: inherit;
+  text-align: left;
+  color: inherit;
+}
+
+.bu-stair.off .bu-stair-name {
   color: var(--ink-ghost);
 }
 
-.bu-save {
-  justify-self: start;
+.bu-stair.off:hover .bu-stair-name,
+.bu-stair.off:focus-visible .bu-stair-name {
+  color: var(--ink-dim);
+}
+
+/* add on an unused row, remove on a used one (shown while hovered) */
+.bu-stair-act {
+  width: 14px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: 400 13px/22px var(--mono);
+  text-align: center;
+  color: var(--ink-ghost);
+}
+
+.bu-stair:not(.off) .bu-stair-act {
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.bu-stair:not(.off):hover .bu-stair-act,
+.bu-stair:not(.off):focus-within .bu-stair-act {
+  opacity: 1;
+}
+
+.bu-stair:not(.off) .bu-stair-act:hover,
+.bu-stair.off:hover .bu-stair-act {
+  color: var(--ink);
+}
+
+@media (hover: none) {
+  .bu-stair:not(.off) .bu-stair-act {
+    opacity: 1;
+  }
+}
+
+.bu-stair:hover,
+.bu-stair.hot {
+  background: var(--bg-hover);
+}
+
+.bu-stair-name {
+  font-size: 13px;
+  color: var(--ink-dim);
+  cursor: default;
+}
+
+.bu-stair.hot .bu-stair-name {
+  color: var(--ink);
+}
+
+.bu-lane {
+  position: relative;
+  height: 100%;
+  margin-right: 3px;
+}
+
+.bu-lane::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--line);
+}
+
+.bu-stair.off .bu-lane::before {
+  display: none;
+}
+
+.bu-lane-grid {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line-soft);
+}
+
+/* the stretch a period covers, then one mark per backup it keeps */
+.bu-lane u {
+  position: absolute;
+  top: calc(50% - 1px);
+  height: 2px;
+  background: rgba(156, 165, 211, 0.35);
+}
+
+.bu-lane i {
+  position: absolute;
+  top: calc(50% - 2.5px);
+  width: 5px;
+  height: 5px;
+  margin-left: -2.5px;
+  background: var(--accent);
+}
+
+.bu-stair.hot .bu-lane u {
+  background: rgba(156, 165, 211, 0.6);
+}
+
+.bu-stair.hot .bu-lane i {
+  background: var(--accent-strong);
+}
+
+.bu-stair-axis,
+.bu-stair-axis:hover {
+  height: 22px;
+  background: none;
+}
+
+.bu-stair-rec {
+  grid-column: 1 / 3;
+  font-size: 11.5px;
+  color: var(--ink-ghost);
+  white-space: nowrap;
+}
+
+.bu-stair-rec .bu-link {
+  font: 400 11.5px var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-faint);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.bu-stair-rec .bu-link:hover {
+  color: var(--ink);
+}
+
+.bu-lane-axis {
+  position: relative;
+  height: 100%;
+  margin-right: 3px;
+}
+
+.bu-lane-axis span {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  font: 500 9px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-ghost);
+  white-space: nowrap;
+}
+
+.bu-lane-axis span.first {
+  transform: none;
+}
+
+.bu-keep-head .fx-meta {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bu-keep-head .fx-meta.warn {
+  color: var(--warn);
+}
+
+.bu-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+}
+
+.bu-count button {
+  width: 14px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: 400 13px/1 var(--mono);
+  color: var(--ink-faint);
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.bu-stair:hover .bu-count button,
+.bu-count:focus-within button {
+  opacity: 1;
+}
+
+.bu-count button:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.bu-stair:hover .bu-count button:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+@media (hover: none) {
+  .bu-count button {
+    opacity: 1;
+  }
+}
+
+.bu-count input {
+  width: 3.5ch;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  background: none;
+  text-align: center;
+  font: 500 13px var(--mono);
+  color: var(--ink);
+}
+
+.bu-count input:hover {
+  border-bottom-color: var(--line-cross);
+}
+
+.bu-count input:focus {
+  border-bottom-color: var(--accent);
+  box-shadow: none;
+}
+
+.bu-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.bu-foot small {
+  font: 400 11px var(--mono);
+  color: var(--ink-ghost);
 }
 
 /* point in time: the window, then a moment picker and its action */
@@ -3489,32 +3797,6 @@ h2 {
 
 .bu-pit-form input {
   height: 32px;
-}
-
-/* retention tiers: six small counts, three a row */
-.bu-form .bu-tiers-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.bu-tiers {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.bu-tiers label {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-}
-
-.bu-tiers input {
-  height: 28px;
-  width: 100%;
-  min-width: 0;
 }
 
 /* the toggle in the frame's terms: a square track, a square knob */

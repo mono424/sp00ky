@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: Backups
-description: Create, list and restore database snapshots, schedule them, keep days, weeks and quarters of history, and restore to any moment of the last 48 hours.
+description: Create, list and restore database snapshots, schedule them, and keep days, weeks and quarters of history.
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -48,16 +48,6 @@ spky backup configure --retention 30
 # Disable automatic backups
 spky backup configure --enabled false`;
 
-export const codePitr = `# Turn point-in-time recovery on
-spky backup configure --point-in-time true
-
-# See which moments a restore can reach
-spky backup configure
-
-# Restore to a moment (UTC), or to a span back from now
-spky backup restore --at "2026-11-15 13:45"
-spky backup restore --at "90m ago"`;
-
 export const code3 = `spky backup reset`;
 
 export const code2 = `spky backup reset --no-backup`;
@@ -68,9 +58,8 @@ Commands:
   list                          List backups
   create [--name NAME]          Create a manual backup
   restore <backup-id>           Restore database from a backup
-  restore --at <moment>         Restore to a moment (point-in-time recovery)
   delete <backup-id>            Delete a backup
-  configure [--enabled] [--schedule] [--retention] [--keep-*] [--recommended] [--point-in-time]
+  configure [--enabled] [--schedule] [--retention] [--keep-*] [--recommended]
                                 Configure automatic backups and retention
   reset [--no-backup]           Reset the database (drop all data, re-run migrations)`;
 
@@ -148,7 +137,7 @@ If the main database gets wiped but the snapshot replica fails to import, the sc
 
 ## From the dashboard
 
-The scheduler's [admin dashboard](/docs/reference/admin-dashboard#backups) has a Backups tab that does everything above except `reset`: create, list, restore, delete, configure the schedule and retention, and turn [point-in-time recovery](#point-in-time-recovery) on and restore to a moment. It shows the same catalog as `spky backup list`, joined to what the scheduler itself knows about each backup, and a restore there reports the real stages as the scheduler moves through them (`queued`, `running`, main database restored, replica restored, done). It goes through Sp00ky Cloud like `spky backup restore`, so the signing keys are renewed the same way, and migrations still have to be run again afterwards.
+The scheduler's [admin dashboard](/docs/reference/admin-dashboard#backups) has a Backups tab that does everything above except `reset`: create, list, restore, delete, and configure the schedule and retention. It shows the same catalog as `spky backup list`, joined to what the scheduler itself knows about each backup, and a restore there reports the real stages as the scheduler moves through them (`queued`, `running`, main database restored, replica restored, done). It goes through Sp00ky Cloud like `spky backup restore`, so the signing keys are renewed the same way, and migrations still have to be run again afterwards.
 
 <Note>
 **How the dashboard talks to Sp00ky Cloud.** The control plane injects `SPKY_CLOUD_API_URL` and `SPKY_CLOUD_PROJECT` into the scheduler container (only the scheduler, never the SSPs). The scheduler then calls an allow-listed route family, `/v1/internal/projects/{slug}/…` (restart, deployment status, and the backup routes minus `reset`), authenticated with the project's existing `SPKY_AUTH_SECRET`. No new credential is created. A control plane that supports this lists `scheduler_link` under `features` in its `/health` response; a scheduler without the link still works and marks those actions as unavailable.
@@ -208,35 +197,6 @@ A period only counts when it has a backup, so a night that failed widens the win
 **Named backups are never deleted by retention.** `spky backup create --name before-migration`, and the backup `spky backup reset` offers to take, stay until you delete them yourself.
 
 A pay-as-you-go project is backed up every day at 03:00 UTC with the recommended tiers, until you configure retention yourself. Scheduled backups pause while a project is stopped at its [spend cap](/docs/cloud/billing#spend-cap).
-
-## Point-in-time recovery
-
-A daily backup can lose a day of work. With point-in-time recovery on, Sp00ky Cloud also records every change to the database, and a restore can reach **any moment of the last 48 hours**, not just the moment a backup was taken.
-
-<CodeBlock
-  code={codePitr}
-  lang="bash"
-/>
-
-`--at` takes RFC 3339 (`2026-11-15T13:45:00Z`), a date and time in UTC (`2026-11-15 13:45`), or a span back from now (`90m ago`, `2h ago`, `1d ago`). The dashboard's Backups tab has the same restore, with a picker in your own time zone.
-
-### How it works
-
-The database keeps a change feed (`CHANGEFEED 1d` on the database), and Sp00ky Cloud reads it **every 15 minutes** into a file next to your backups. These are not backups of their own: each holds the rows the transactions of those 15 minutes wrote, exactly as they were written.
-
-A restore to a moment loads the newest full backup that finished before it, then replays the recorded transactions from that backup's start up to the moment, one transaction at a time and in order, so the result is the database exactly as it was then. Tables made after the backup come back with their definitions and permissions.
-
-Some things follow from that:
-
-- **The newest moment you can reach is the last reading**, at most about 17 minutes ago. If the database itself is lost, the changes since the last reading are lost with it.
-- **It needs full backups to replay from.** Turning it on starts one about ten minutes later (a backup has to begin after the recording does to be replayed from), so the first moments become reachable once that backup has finished. While it is on, Sp00ky Cloud starts one whenever the newest is more than a day old, schedule or not. Every backup a restore within the 48 hours may start from is kept whatever your retention says.
-- **A restore, a database upgrade or a project move starts a new recording.** The moments before it stay reachable until they leave the window, but no restore replays across it. A backup is started to reopen the window.
-- **A restore takes no last reading first.** Undoing a restore you regret reaches the last reading before it, up to about 17 minutes earlier.
-- **Writes cost a little more.** Every transaction also writes its change into the feed, and the database keeps a day of it on disk.
-- **Schema changes land at 15-minute resolution.** The feed carries rows, not `DEFINE` statements, so each reading also records the definitions (fields, indexes, events) of every table that changed, and a restore applies them at the reading's start. Database-wide definitions (functions, params, accesses) are not recorded; your migrations and `spky deploy` set those, and migrations run again after a restore anyway.
-- **It does not work with `sync.transport: changefeed`** yet, which reads the whole database's feed for its own ingest. Turning it on there reports the problem instead.
-
-`spky backup configure` prints the window a restore can reach. Turning point-in-time recovery off takes the feed off the database and deletes the recordings.
 
 ## Database Reset
 

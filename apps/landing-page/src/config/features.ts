@@ -89,9 +89,9 @@ export const cloudFeatures: Feature[] = [
     slug: 'automatic-backups',
     iconKey: 'backup',
     title: 'Automatic Backups',
-    desc: 'Continuous point-in-time snapshots, 1-click restore.',
+    desc: 'Scheduled snapshots with days, weeks and quarters of history, 1-click restore.',
     longDesc:
-      'Continuous snapshots run in the background. Roll back to any point in time with a single click. No tickets, no pipelines, no downtime.',
+      'Backups run on a schedule in the background and keep days, weeks and quarters of history. Restore any of them with a single command or click. No tickets, no pipelines.',
     group: 'cloud',
     href: '/cloud/automatic-backups',
   },

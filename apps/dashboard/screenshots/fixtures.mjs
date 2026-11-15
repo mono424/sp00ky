@@ -984,13 +984,6 @@ export const BACKUPS = {
     retention: 0,
     keep: { hourly: 0, daily: 3, weekly: 5, monthly: 0, quarterly: 4, yearly: 0 },
     recommended: { hourly: 0, daily: 3, weekly: 5, monthly: 0, quarterly: 4, yearly: 0 },
-    point_in_time: {
-      enabled: true,
-      window: { earliest: iso(48 * 3_600_000), latest: iso(9 * 60_000) },
-      since: iso(9 * 24 * 3_600_000),
-      last_reading: iso(9 * 60_000),
-      error: null,
-    },
     next_run_at: new Date(NOW + 16 * 3_600_000).toISOString(),
     last_scheduled_at: iso(8 * 3_600_000),
   },

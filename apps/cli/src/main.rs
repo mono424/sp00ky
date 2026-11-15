@@ -1221,11 +1221,11 @@ pub enum CloudBackupCommands {
         /// Backup ID, full name, or unique id prefix
         #[arg(required_unless_present = "at", conflicts_with = "at")]
         backup_id: Option<String>,
-        /// Restore to a moment instead (point-in-time recovery, needs
-        /// `configure --point-in-time true`): the newest backup that finished
-        /// before it, then every recorded change up to it. RFC 3339
-        /// ("2026-11-15T13:45:00Z"), "2026-11-15 13:45" (UTC), or "90m ago"
-        #[arg(long)]
+        /// Restore to a moment instead (point-in-time recovery): the newest
+        /// backup that finished before it, then every recorded change up to it.
+        /// RFC 3339 ("2026-11-15T13:45:00Z"), "2026-11-15 13:45" (UTC), or
+        /// "90m ago". Hidden while Sp00ky Cloud has the feature switched off.
+        #[arg(long, hide = true)]
         at: Option<String>,
     },
     /// Delete a backup
@@ -1273,8 +1273,9 @@ pub enum CloudBackupCommands {
         #[arg(long)]
         recommended: bool,
         /// Point-in-time recovery: record every change (read every 15 minutes)
-        /// so `spky backup restore --at` can reach any moment of the last 48 hours
-        #[arg(long)]
+        /// so `spky backup restore --at` can reach any moment of the last 48
+        /// hours. Hidden while Sp00ky Cloud has the feature switched off.
+        #[arg(long, hide = true)]
         point_in_time: Option<bool>,
     },
     /// Reset the database (drop all data, re-run migrations)

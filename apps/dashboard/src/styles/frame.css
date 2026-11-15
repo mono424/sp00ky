@@ -3501,111 +3501,119 @@ h2 {
   color: var(--ink);
 }
 
-/* the strip: newest left on a log scale, a soft band per period in use */
-.bu-strip {
-  position: relative;
-  height: 18px;
-  margin-right: 3px;
-}
-
-.bu-band {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  background: rgba(255, 255, 255, 0.04);
-  border-left: 2px solid var(--bg);
-  transition: background 0.12s;
-}
-
-.bu-band:nth-of-type(even) {
-  background: rgba(255, 255, 255, 0.075);
-}
-
-.bu-band.hot {
-  background: rgba(156, 165, 211, 0.16);
-}
-
-.bu-strip i {
-  position: absolute;
-  top: 6px;
-  width: 6px;
-  height: 6px;
-  margin-left: -3px;
-  background: var(--accent);
-  pointer-events: none;
-  transition: opacity 0.12s;
-}
-
-.bu-strip.has-hot i:not(.hot) {
-  opacity: 0.3;
-}
-
-.bu-strip i.hot {
-  background: var(--accent-strong);
-}
-
-.bu-axis {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 7px;
-  font: 400 10.5px var(--mono);
-  color: var(--ink-ghost);
-}
-
-.bu-axis b {
-  font-weight: 500;
-  color: var(--ink-dim);
-}
-
-.bu-axis.warn {
-  color: var(--warn);
-}
-
-/* a row per period: name, count, the periods it covers */
-.bu-rows {
+/* the staircase: a row per period, its backups on a shared log timeline */
+.bu-stairs {
   display: grid;
-  margin-top: 16px;
 }
 
-.bu-row {
+.bu-stair {
   display: grid;
-  grid-template-columns: 84px auto minmax(0, 1fr);
+  grid-template-columns: 72px auto minmax(0, 1fr);
   align-items: center;
   gap: 8px;
-  height: 32px;
+  height: 30px;
   margin: 0 -8px;
   padding: 0 8px;
 }
 
-.bu-row:hover,
-.bu-row.hot {
+.bu-stair:hover,
+.bu-stair.hot {
   background: var(--bg-hover);
 }
 
-.bu-row-name {
+.bu-stair-name {
   font-size: 13px;
   color: var(--ink-dim);
   cursor: default;
 }
 
-.bu-row.hot .bu-row-name {
+.bu-stair.hot .bu-stair-name {
   color: var(--ink);
 }
 
-.bu-row-reach {
-  overflow: hidden;
-  text-align: right;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font: 400 11px var(--mono);
-  color: var(--ink-faint);
+.bu-stair.off .bu-stair-name,
+.bu-stair.off .bu-count input {
+  color: var(--ink-ghost);
 }
 
-.bu-row.off .bu-row-name,
-.bu-row.off .bu-row-reach,
-.bu-row.off .bu-count input {
+.bu-lane {
+  position: relative;
+  height: 100%;
+  margin-right: 3px;
+}
+
+.bu-lane::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--line);
+}
+
+.bu-lane-grid {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line-soft);
+}
+
+/* the stretch a period covers, then one mark per backup it keeps */
+.bu-lane u {
+  position: absolute;
+  top: calc(50% - 1px);
+  height: 2px;
+  background: rgba(156, 165, 211, 0.35);
+}
+
+.bu-lane i {
+  position: absolute;
+  top: calc(50% - 2.5px);
+  width: 5px;
+  height: 5px;
+  margin-left: -2.5px;
+  background: var(--accent);
+}
+
+.bu-stair.hot .bu-lane u {
+  background: rgba(156, 165, 211, 0.6);
+}
+
+.bu-stair.hot .bu-lane i {
+  background: var(--accent-strong);
+}
+
+.bu-stair-axis,
+.bu-stair-axis:hover {
+  height: 18px;
+  background: none;
+}
+
+.bu-lane-axis {
+  position: relative;
+  height: 100%;
+  margin-right: 3px;
+}
+
+.bu-lane-axis span {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  font: 500 9px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   color: var(--ink-ghost);
+  white-space: nowrap;
+}
+
+.bu-lane-axis span.first {
+  transform: none;
+}
+
+.bu-keep-head .fx-meta.warn {
+  color: var(--warn);
 }
 
 .bu-count {
@@ -3614,7 +3622,7 @@ h2 {
 }
 
 .bu-count button {
-  width: 18px;
+  width: 14px;
   height: 22px;
   padding: 0;
   border: 0;
@@ -3625,7 +3633,7 @@ h2 {
   transition: opacity 0.12s;
 }
 
-.bu-row:hover .bu-count button,
+.bu-stair:hover .bu-count button,
 .bu-count:focus-within button {
   opacity: 1;
 }
@@ -3634,7 +3642,7 @@ h2 {
   color: var(--ink);
 }
 
-.bu-row:hover .bu-count button:disabled {
+.bu-stair:hover .bu-count button:disabled {
   opacity: 0.25;
   cursor: default;
 }
@@ -3646,7 +3654,7 @@ h2 {
 }
 
 .bu-count input {
-  width: 4ch;
+  width: 3.5ch;
   height: 22px;
   padding: 0;
   border: 0;
@@ -3669,8 +3677,22 @@ h2 {
 .bu-add {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 4px 14px;
   margin-top: 10px;
+}
+
+.bu-add-rec {
+  margin-left: auto;
+  font: 500 10px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-ghost);
+}
+
+.bu-add-rec .bu-link {
+  font-size: 10px;
+  letter-spacing: 0.08em;
 }
 
 .bu-add button {

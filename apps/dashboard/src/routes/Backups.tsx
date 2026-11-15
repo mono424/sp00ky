@@ -531,6 +531,11 @@ const cronWords = (cron: string) => {
 /** Width for a select showing `text`: mono, so characters plus the caret's room. */
 const selWidth = (text: string) => `calc(${text.length}ch + 16px)`;
 
+/** Axis marks under the lanes, in days ago. */
+const TICKS: ReadonlyArray<readonly [number, string]> = [
+  [0, 'now'], [1, '1d'], [7, '1w'], [30.4, '1m'], [91, '3m'], [182, '6m'], [365, '1y'], [730, '2y'], [1826, '5y'],
+];
+
 /** The count a period comes back with when it is added. */
 const ADD_COUNT: Record<Tier, number> = { last: 7, hourly: 24, daily: 7, weekly: 4, monthly: 12, quarterly: 4, yearly: 3 };
 
@@ -562,11 +567,11 @@ function Count(props: { value: number; label: string; onChange: (n: number) => v
 }
 
 /**
- * The schedule as one sentence, then retention: a strip of the backups the
- * policy keeps on that schedule today, and a row per period in use. Periods
- * fill in order, each skipping what the one above already holds, so on the
- * strip they sit side by side in bands, newest left; hovering a row lights
- * its band.
+ * The schedule as one sentence, then retention as a row per period in use,
+ * each drawing the backups it keeps on that schedule today on a shared log
+ * timeline (newest left). Periods fill in order and each skips what the one
+ * above already holds, so the rows step down and to the right: a staircase.
+ * Hovering a row puts the dates it covers in the header.
  */
 function SchedulePanel(props: {
   linked: boolean;
@@ -637,27 +642,34 @@ function SchedulePanel(props: {
 
   /** Log scale, so the last few days and the last year both read. */
   const span = () => Math.max(35, ((sim().now - (oldest() ?? sim().now)) / DAY_MS) * 1.1);
-  const pct = (t: number) => (Math.log1p(Math.max(0, (sim().now - t) / DAY_MS)) / Math.log1p(span())) * 100;
-  /** One band per period in use, from halfway to its neighbours. */
-  const bands = createMemo(() => {
-    const groups = available()
-      .map((g) => ({ ...g, kept: sim().r.kept.filter((k) => k.tier === g.tier) }))
-      .filter((g) => g.kept.length > 0);
-    return groups.map((g, i) => {
-      const prev = groups[i - 1], next = groups[i + 1];
-      const start = prev ? (pct(prev.kept[prev.kept.length - 1]!.at) + pct(g.kept[0]!.at)) / 2 : 0;
-      const end = next ? (pct(g.kept[g.kept.length - 1]!.at) + pct(next.kept[0]!.at)) / 2 : 100;
-      return { tier: g.tier, name: g.name, start, end };
+  const pctDays = (days: number) => (Math.log1p(Math.max(0, days)) / Math.log1p(span())) * 100;
+  const pct = (t: number) => pctDays((sim().now - t) / DAY_MS);
+  /** Axis labels under the lanes, skipping any that would run into the one before. */
+  const ticks = createMemo(() => {
+    let prev = -Infinity;
+    return TICKS.filter(([d]) => {
+      if (d > span() || pctDays(d) - prev < 17) return false;
+      prev = pctDays(d);
+      return true;
     });
   });
+  const keptBy = (t: Tier) => sim().r.kept.filter((k) => k.tier === t);
 
   /** The periods a row covers: "10 Nov → 12 Nov", "Q4 2025 → Q3". */
   const reach = (t: Tier) => {
     if (!policy()[t]) return 'off';
-    const mine = sim().r.kept.filter((k) => k.tier === t);
+    const mine = keptBy(t);
     if (!mine.length) return 'nothing yet';
     const name = (m: { at: number }) => periodName(t, m.at, sim().now);
     return mine.length === 1 ? name(mine[0]!) : `${name(mine[mine.length - 1]!)} → ${name(mine[0]!)}`;
+  };
+
+  /** The total, or while a row is hovered, the dates that row covers. */
+  const headline = () => {
+    const t = hot();
+    if (t) return `${RUNGS.find((g) => g.tier === t)!.name}: ${reach(t)}`;
+    if (!sim().r.prunes) return 'keeps everything';
+    return `${formatCount(sim().r.kept.length)} kept, back to ${shortDate(oldest()!, sim().now)}${sim().approx ? ' (as if nightly)' : ''}`;
   };
 
   const dirty = () =>
@@ -765,12 +777,51 @@ function SchedulePanel(props: {
           </Show>
         </div>
 
-        {/* what it keeps ====================================================== */}
+        {/* what it keeps: a row per period, each on a shared timeline ========= */}
         <div class="fx-head bu-keep-head">
           <span class="cap">Retention</span>
+          <span class="fx-meta cap" classList={{ warn: !sim().r.prunes }}>{headline()}</span>
+        </div>
+
+        <div class="bu-stairs" onMouseLeave={() => setHot(null)}>
+          <For each={rows()}>
+            {(g) => (
+              <div class="bu-stair" classList={{ off: !policy()[g.tier], hot: hot() === g.tier }}
+                title={`${g.help}: ${reach(g.tier)}`}
+                onMouseEnter={() => setHot(policy()[g.tier] ? g.tier : null)}>
+                <span class="bu-stair-name">{g.name}</span>
+                <Count value={policy()[g.tier]} label={g.name} onChange={(n) => setTier(g.tier, n)} />
+                <div class="bu-lane">
+                  <For each={ticks().slice(1)}>{([d]) => <span class="bu-lane-grid" style={{ left: `${pctDays(d)}%` }} />}</For>
+                  <Show when={keptBy(g.tier).length > 1}>
+                    <u style={{
+                      left: `${pct(keptBy(g.tier)[0]!.at)}%`,
+                      width: `${pct(keptBy(g.tier)[keptBy(g.tier).length - 1]!.at) - pct(keptBy(g.tier)[0]!.at)}%`,
+                    }} />
+                  </Show>
+                  <For each={keptBy(g.tier)}>{(k) => <i style={{ left: `${pct(k.at)}%` }} />}</For>
+                </div>
+              </div>
+            )}
+          </For>
+          <Show when={sim().r.prunes}>
+            <div class="bu-stair bu-stair-axis" aria-hidden="true">
+              <span />
+              <span />
+              <div class="bu-lane-axis">
+                <For each={ticks()}>{([d, label], i) => <span classList={{ first: i() === 0 }} style={{ left: `${pctDays(d)}%` }}>{label}</span>}</For>
+              </div>
+            </div>
+          </Show>
+        </div>
+
+        <div class="bu-add">
+          <For each={addable()}>
+            {(g) => <button type="button" title={g.help} onClick={() => add(g.tier)}>+ {g.name.toLowerCase()}</button>}
+          </For>
           <Show when={tiered()}>
-            <span class="fx-meta">
-              <Show when={!samePolicy(policy(), recommended())} fallback={<span class="cap">recommended</span>}>
+            <span class="bu-add-rec">
+              <Show when={!samePolicy(policy(), recommended())} fallback={<span>recommended</span>}>
                 <button type="button" class="bu-link" onClick={useRecommended}
                   title="3 days, then one a week for the month before, then four quarter ends">
                   use recommended
@@ -779,46 +830,6 @@ function SchedulePanel(props: {
             </span>
           </Show>
         </div>
-
-        <Show when={sim().r.prunes} fallback={<div class="bu-axis warn">Nothing is pruned, storage grows with every run</div>}>
-          <div class="bu-strip" classList={{ 'has-hot': !!hot() }}>
-            <For each={bands()}>
-              {(b) => (
-                <div class="bu-band" classList={{ hot: hot() === b.tier }} title={`${b.name}: ${reach(b.tier)}`}
-                  style={{ left: `${b.start}%`, width: `${b.end - b.start}%` }}
-                  onMouseEnter={() => setHot(b.tier)} onMouseLeave={() => setHot(null)} />
-              )}
-            </For>
-            <For each={sim().r.kept}>{(k) => <i classList={{ hot: hot() === k.tier }} style={{ left: `${pct(k.at)}%` }} />}</For>
-          </div>
-          <div class="bu-axis">
-            <span>now</span>
-            <span>
-              <b>{formatCount(sim().r.kept.length)}</b> kept, back to <b>{shortDate(oldest()!, sim().now)}</b>
-              <Show when={sim().approx}> (as if nightly)</Show>
-            </span>
-          </div>
-        </Show>
-
-        <div class="bu-rows" onMouseLeave={() => setHot(null)}>
-          <For each={rows()}>
-            {(g) => (
-              <div class="bu-row" classList={{ off: !policy()[g.tier], hot: hot() === g.tier }}
-                onMouseEnter={() => setHot(policy()[g.tier] ? g.tier : null)}>
-                <span class="bu-row-name" title={g.help}>{g.name}</span>
-                <Count value={policy()[g.tier]} label={g.name} onChange={(n) => setTier(g.tier, n)} />
-                <span class="bu-row-reach">{reach(g.tier)}</span>
-              </div>
-            )}
-          </For>
-        </div>
-        <Show when={addable().length > 0}>
-          <div class="bu-add">
-            <For each={addable()}>
-              {(g) => <button type="button" title={g.help} onClick={() => add(g.tier)}>+ {g.name.toLowerCase()}</button>}
-            </For>
-          </div>
-        </Show>
 
         <div class="bu-foot">
           <small>Named backups are never pruned</small>

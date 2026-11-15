@@ -3428,12 +3428,18 @@ h2 {
   background: repeating-linear-gradient(135deg, rgba(241, 180, 64, 0.7) 0 3px, transparent 3px 6px);
 }
 
-/* the schedule: when it runs on one line, then retention as a ladder */
+/* the schedule: one sentence, then a strip of what is kept and a row per period */
 .bu-sched .fx-meta .switch {
   gap: 8px;
 }
 
 .bu-when {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 7px;
+  font-size: 14px;
+  color: var(--ink-faint);
   transition: opacity 0.15s;
 }
 
@@ -3441,225 +3447,153 @@ h2 {
   opacity: 0.45;
 }
 
-.bu-line {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--ink-dim);
-}
-
+/* a select that reads as a word of the sentence */
 .bu-sel {
   width: auto;
-  height: 28px;
-  padding: 0 24px 0 10px;
+  height: auto;
+  padding: 0 14px 1px 0;
   appearance: none;
   -webkit-appearance: none;
-  background: rgba(255, 255, 255, 0.015)
+  border: 0;
+  border-bottom: 1px dotted rgba(255, 255, 255, 0.22);
+  background: transparent
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%23707070'/%3E%3C/svg%3E")
-    no-repeat right 9px center / 8px 5px;
-  border-color: var(--line);
-  font: 400 12px var(--mono);
+    no-repeat right 1px center / 7px 4px;
+  font: 500 13px var(--mono);
   color: var(--ink);
   cursor: pointer;
 }
 
-.bu-sel:hover {
-  border-color: rgba(255, 255, 255, 0.16);
+.bu-sel:hover,
+.bu-sel:focus {
+  border-bottom-color: var(--accent);
+  box-shadow: none;
 }
 
 .bu-cron {
+  flex: 1 1 100%;
   height: 30px;
-  margin-top: 10px;
+  margin-top: 6px;
   font-size: 13px;
 }
 
-.bu-sub {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 12px;
-  margin-top: 10px;
-  font: 400 11px/1.6 var(--mono);
+.bu-cron-words {
+  flex: 1 1 100%;
+  font: 400 11px var(--mono);
   color: var(--ink-ghost);
 }
 
-.bu-sub b {
-  font-weight: 400;
+.bu-keep-head {
+  margin-top: 28px;
+}
+
+.bu-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: 500 10.5px var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   color: var(--ink-faint);
 }
 
-/* a hairline across the whole cell between the two halves */
-.bu-rule {
-  height: 1px;
-  margin: 20px calc(-1 * var(--pad)) 18px;
-  background: var(--line);
+.bu-link:hover {
+  color: var(--ink);
 }
 
-/* the timeline: a lane per rung in use over a log axis, newest left */
-.bu-tl {
-  display: grid;
-  grid-template-columns: 64px minmax(0, 1fr);
-  margin-top: -2px;
-}
-
-.bu-tl-names {
-  display: grid;
-  grid-auto-rows: 14px;
-  row-gap: 3px;
-  padding-bottom: 18px;
-}
-
-.bu-tl-names span {
-  font: 500 9px/14px var(--mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--ink-ghost);
-  white-space: nowrap;
-  transition: color 0.12s;
-}
-
-.bu-tl-names span.hot {
-  color: var(--ink-dim);
-}
-
-.bu-tl-plot {
+/* the strip: newest left on a log scale, a soft band per period in use */
+.bu-strip {
   position: relative;
-  display: grid;
-  grid-auto-rows: 14px;
-  row-gap: 3px;
-  margin-right: 5px;
+  height: 18px;
+  margin-right: 3px;
 }
 
-.bu-tl-guide {
+.bu-band {
   position: absolute;
   top: 0;
-  bottom: 18px;
-  width: 1px;
-  background: var(--line-soft);
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 2px solid var(--bg);
+  transition: background 0.12s;
 }
 
-.bu-tl-lane {
-  position: relative;
-  transition: opacity 0.12s;
+.bu-band:nth-of-type(even) {
+  background: rgba(255, 255, 255, 0.075);
 }
 
-.bu-tl-lane::before {
-  content: '';
+.bu-band.hot {
+  background: rgba(156, 165, 211, 0.16);
+}
+
+.bu-strip i {
   position: absolute;
-  left: 0;
-  right: 0;
-  top: 7px;
-  height: 1px;
-  background: var(--line);
-}
-
-.bu-tl-lane i,
-.bu-key i {
-  position: absolute;
-  top: 4px;
+  top: 6px;
   width: 6px;
   height: 6px;
   margin-left: -3px;
   background: var(--accent);
+  pointer-events: none;
+  transition: opacity 0.12s;
 }
 
-.bu-tl-lane i.held,
-.bu-key i.held {
-  background: var(--bg);
-  border: 1px solid var(--ink-faint);
+.bu-strip.has-hot i:not(.hot) {
+  opacity: 0.3;
 }
 
-.bu-tl.has-hot .bu-tl-lane:not(.hot) {
-  opacity: 0.22;
-}
-
-.bu-tl-lane.hot i:not(.held) {
+.bu-strip i.hot {
   background: var(--accent-strong);
 }
 
-.bu-tl-ticks {
-  position: relative;
-  height: 18px;
-}
-
-.bu-tl-ticks span {
-  position: absolute;
-  top: 5px;
-  transform: translateX(-50%);
-  font: 500 9px var(--mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+.bu-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 7px;
+  font: 400 10.5px var(--mono);
   color: var(--ink-ghost);
-  white-space: nowrap;
 }
 
-.bu-tl-ticks span:first-child {
-  transform: none;
-}
-
-.bu-sum {
-  display: grid;
-  gap: 2px;
-  margin: 6px 0 14px;
-  font: 400 11.5px/1.6 var(--mono);
-  color: var(--ink-faint);
-}
-
-.bu-sum b {
+.bu-axis b {
   font-weight: 500;
-  color: var(--ink);
+  color: var(--ink-dim);
 }
 
-.bu-sum.warn {
+.bu-axis.warn {
   color: var(--warn);
 }
 
-.bu-key {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 10.5px;
-  color: var(--ink-ghost);
-}
-
-.bu-key i {
-  position: static;
-  margin: 0 0 0 4px;
-  flex: none;
-}
-
-.bu-key i:first-child {
-  margin-left: 0;
-}
-
-/* the ladder: one rung per period, filled top to bottom */
-.bu-rung {
+/* a row per period: name, count, the periods it covers */
+.bu-rows {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  margin-top: 16px;
+}
+
+.bu-row {
+  display: grid;
+  grid-template-columns: 84px auto minmax(0, 1fr);
   align-items: center;
-  gap: 12px;
-  height: 40px;
-  padding: 0 2px;
-  border-top: 1px solid var(--line-soft);
+  gap: 8px;
+  height: 32px;
+  margin: 0 -8px;
+  padding: 0 8px;
 }
 
-.bu-rung:last-child {
-  border-bottom: 1px solid var(--line-soft);
-}
-
-.bu-rung:hover {
+.bu-row:hover,
+.bu-row.hot {
   background: var(--bg-hover);
 }
 
-.bu-rung-name {
+.bu-row-name {
   font-size: 13px;
-  font-weight: 500;
-  color: var(--ink);
+  color: var(--ink-dim);
   cursor: default;
 }
 
-.bu-rung-reach {
+.bu-row.hot .bu-row-name {
+  color: var(--ink);
+}
+
+.bu-row-reach {
   overflow: hidden;
   text-align: right;
   text-overflow: ellipsis;
@@ -3668,57 +3602,89 @@ h2 {
   color: var(--ink-faint);
 }
 
-.bu-rung.off .bu-rung-name,
-.bu-rung.off .bu-rung-reach {
+.bu-row.off .bu-row-name,
+.bu-row.off .bu-row-reach,
+.bu-row.off .bu-count input {
   color: var(--ink-ghost);
 }
 
-.bu-step {
-  display: inline-grid;
-  grid-template-columns: 24px 36px 24px;
-  height: 26px;
-  border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.015);
+.bu-count {
+  display: inline-flex;
+  align-items: center;
 }
 
-.bu-step button {
+.bu-count button {
+  width: 18px;
+  height: 22px;
+  padding: 0;
   border: 0;
   background: none;
   font: 400 13px/1 var(--mono);
   color: var(--ink-faint);
+  opacity: 0;
+  transition: opacity 0.12s;
 }
 
-.bu-step button:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.05);
+.bu-row:hover .bu-count button,
+.bu-count:focus-within button {
+  opacity: 1;
+}
+
+.bu-count button:hover:not(:disabled) {
   color: var(--ink);
 }
 
-.bu-step button:disabled {
-  opacity: 0.35;
+.bu-row:hover .bu-count button:disabled {
+  opacity: 0.25;
   cursor: default;
 }
 
-.bu-step input {
-  width: 100%;
-  min-width: 0;
-  height: 100%;
+@media (hover: none) {
+  .bu-count button {
+    opacity: 1;
+  }
+}
+
+.bu-count input {
+  width: 4ch;
+  height: 22px;
   padding: 0;
   border: 0;
-  border-left: 1px solid var(--line-soft);
-  border-right: 1px solid var(--line-soft);
+  border-bottom: 1px solid transparent;
   background: none;
   text-align: center;
-  font: 500 12px var(--mono);
+  font: 500 13px var(--mono);
   color: var(--ink);
 }
 
-.bu-step input:focus {
-  box-shadow: none;
-  background: rgba(156, 165, 211, 0.1);
+.bu-count input:hover {
+  border-bottom-color: var(--line-cross);
 }
 
-.bu-step.zero input {
+.bu-count input:focus {
+  border-bottom-color: var(--accent);
+  box-shadow: none;
+}
+
+.bu-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 10px;
+}
+
+.bu-add button {
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  font: 500 10px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   color: var(--ink-ghost);
+}
+
+.bu-add button:hover {
+  color: var(--ink-dim);
 }
 
 .bu-foot {
@@ -3727,7 +3693,7 @@ h2 {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-top: 18px;
+  margin-top: 22px;
 }
 
 .bu-foot small {

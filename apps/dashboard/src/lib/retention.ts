@@ -28,16 +28,7 @@ export interface Retention {
   prunes: boolean;
   /** The backups the policy keeps, newest first. */
   kept: Mark[];
-  /**
-   * Periods a tier passed over because an earlier tier already holds a backup
-   * of them, marked at that backup. They are why a tier reaches further back
-   * than its own count suggests.
-   */
-  held: Mark[];
 }
-
-/** At most this many held marks per tier; past it they only pile up. */
-const HELD_PER_TIER = 60;
 
 function isoWeek(d: Date): string {
   const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -70,27 +61,18 @@ function period(tier: Tier, index: number, d: Date): string {
 /** What `policy` keeps of `backups` (epoch ms, newest first). */
 export function retain(policy: Policy, backups: readonly number[]): Retention {
   const prunes = TIERS.some((t) => policy[t] > 0);
-  if (!prunes) return { prunes, kept: backups.map((at) => ({ at, tier: 'last' as Tier })), held: [] };
+  if (!prunes) return { prunes, kept: backups.map((at) => ({ at, tier: 'last' as Tier })) };
 
   const dates = backups.map((t) => new Date(t));
   const keptBy: (Tier | null)[] = backups.map(() => null);
-  const held: Mark[] = [];
   for (const tier of TIERS) {
     const want = policy[tier];
     if (want <= 0) continue;
     const covered = new Set<string>();
     for (let i = 0; i < backups.length; i++) if (keptBy[i]) covered.add(period(tier, i, dates[i]!));
     const taken = new Set<string>();
-    const passed = new Set<string>();
     for (let i = 0; i < backups.length; i++) {
-      if (keptBy[i]) {
-        const key = period(tier, i, dates[i]!);
-        if (!passed.has(key) && !taken.has(key) && passed.size < HELD_PER_TIER) {
-          passed.add(key);
-          held.push({ at: backups[i]!, tier });
-        }
-        continue;
-      }
+      if (keptBy[i]) continue;
       const key = period(tier, i, dates[i]!);
       if (covered.has(key) || taken.has(key)) continue;
       if (taken.size >= want) break;
@@ -100,10 +82,7 @@ export function retain(policy: Policy, backups: readonly number[]): Retention {
   }
   const kept: Mark[] = [];
   for (let i = 0; i < backups.length; i++) if (keptBy[i]) kept.push({ at: backups[i]!, tier: keptBy[i]! });
-  // A held mark only means something inside the stretch its tier walked.
-  const oldestOf = new Map<Tier, number>();
-  for (const k of kept) oldestOf.set(k.tier, k.at);
-  return { prunes, kept, held: held.filter((h) => h.at >= (oldestOf.get(h.tier) ?? Infinity)) };
+  return { prunes, kept };
 }
 
 /* ---- the schedule, as a run of backups ------------------------------------ */

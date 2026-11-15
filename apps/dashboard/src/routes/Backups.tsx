@@ -13,7 +13,6 @@ import {
   periodName,
   retain,
   shortDate,
-  spanWords,
   type Policy,
   type Tier,
 } from '../lib/retention';
@@ -22,7 +21,6 @@ import {
   formatBytes,
   formatCount,
   formatStamp,
-  isAbsent,
   relativeStamp,
 } from '../lib/format';
 import type {
@@ -531,17 +529,16 @@ const cronWords = (cron: string) => {
   return words.includes('UTC') ? words : `${words} (UTC)`;
 };
 /** Width for a select showing `text`: mono, so characters plus the caret's room. */
-const selWidth = (text: string) => `calc(${text.length}ch + 36px)`;
+const selWidth = (text: string) => `calc(${text.length}ch + 16px)`;
 
-/** Axis marks for the timeline, in days ago. */
-const TICKS: ReadonlyArray<readonly [number, string]> = [
-  [0, 'now'], [1, '1d'], [7, '1w'], [30.4, '1m'], [91, '3m'], [182, '6m'], [365, '1y'], [730, '2y'], [1826, '5y'],
-];
+/** The count a period comes back with when it is added. */
+const ADD_COUNT: Record<Tier, number> = { last: 7, hourly: 24, daily: 7, weekly: 4, monthly: 12, quarterly: 4, yearly: 3 };
 
-function Stepper(props: { value: number; label: string; onChange: (n: number) => void }) {
+/** A bare number; its − and + show while the row is hovered or focused. */
+function Count(props: { value: number; label: string; onChange: (n: number) => void }) {
   const set = (n: number) => props.onChange(Math.max(0, Math.min(MAX_KEEP, n)));
   return (
-    <span class="bu-step" classList={{ zero: !props.value }}>
+    <span class="bu-count">
       <button type="button" aria-label={`Fewer: ${props.label}`} disabled={props.value <= 0} onClick={() => set(props.value - 1)}>−</button>
       <input
         value={props.value}
@@ -565,11 +562,11 @@ function Stepper(props: { value: number; label: string; onChange: (n: number) =>
 }
 
 /**
- * The schedule on one line, then retention as a ladder of rungs filled in
- * order, over a timeline of the backups it would keep on that schedule today.
- * The timeline has a lane per rung in use: a filled mark is a backup the rung
- * keeps, a hollow one a period a rung above already holds, which is why a rung
- * reaches further back than its own count.
+ * The schedule as one sentence, then retention: a strip of the backups the
+ * policy keeps on that schedule today, and a row per period in use. Periods
+ * fill in order, each skipping what the one above already holds, so on the
+ * strip they sit side by side in bands, newest left; hovering a row lights
+ * its band.
  */
 function SchedulePanel(props: {
   linked: boolean;
@@ -581,6 +578,8 @@ function SchedulePanel(props: {
   const [schedule, setSchedule] = createSignal(storedSchedule());
   const [typing, setTyping] = createSignal(shapeOf(storedSchedule()).freq === 'cron');
   const [policy, setPolicy] = createSignal<Policy>(policyOf(props.config));
+  /** Rows on screen besides those with a count: ones added or emptied here. */
+  const [shown, setShown] = createSignal<ReadonlySet<Tier>>(new Set());
   const [hot, setHot] = createSignal<Tier | null>(null);
   const [saving, setSaving] = createSignal(false);
   /** Tiers need a cloud that knows them; an older one would drop them silently. */
@@ -609,7 +608,10 @@ function SchedulePanel(props: {
     else setSchedule(cronOf({ ...base, freq: 'weekly', dow: Number(v.slice(1)) }));
   };
 
-  const setTier = (t: Tier, n: number) => setPolicy({ ...policy(), [t]: n });
+  const setTier = (t: Tier, n: number) => {
+    if (n === 0) setShown(new Set([...shown(), t]));
+    setPolicy({ ...policy(), [t]: n });
+  };
 
   /** What the policy keeps on this schedule, as of now. */
   const sim = createMemo(() => {
@@ -620,39 +622,36 @@ function SchedulePanel(props: {
     return { now, approx: !exact, step: c.stepMs, r: retain(p, pastRuns(c, p)) };
   });
   const oldest = () => sim().r.kept[sim().r.kept.length - 1]?.at;
-  const rungs = () =>
+
+  const available = () =>
     tiered()
       ? RUNGS.filter((g) => g.tier !== 'hourly' || sim().step < DAY_MS || policy().hourly > 0)
       : RUNGS.filter((g) => g.tier === 'last');
-  const lanes = createMemo(() => {
-    const { r } = sim();
-    if (!r.prunes) return [];
-    return rungs()
-      .filter((g) => policy()[g.tier] > 0)
-      .map((g) => ({
-        ...g,
-        kept: r.kept.filter((k) => k.tier === g.tier).map((k) => k.at),
-        held: r.held.filter((h) => h.tier === g.tier).map((h) => h.at),
-      }));
-  });
-  const anyHeld = () => lanes().some((l) => l.held.length > 0);
-  /** Log scale: a week is as readable as a year. */
-  const span = () => Math.max(35, ((sim().now - (oldest() ?? sim().now)) / DAY_MS) * 1.12);
-  const pct = (daysAgo: number) => (Math.log1p(Math.max(0, daysAgo)) / Math.log1p(span())) * 100;
-  const x = (daysAgo: number) => `${pct(daysAgo)}%`;
-  const at = (t: number) => x((sim().now - t) / DAY_MS);
-  /** Axis labels, skipping any that would run into the one before. */
-  const tickLabels = createMemo(() => {
-    let prev = -Infinity;
-    return TICKS.filter(([d]) => {
-      if (d > span() || pct(d) - prev < 10) return false;
-      prev = pct(d);
-      return true;
+  const inUse = (t: Tier) => policy()[t] > 0 || shown().has(t);
+  const rows = () => available().filter((g) => inUse(g.tier));
+  const addable = () => available().filter((g) => !inUse(g.tier));
+  const add = (t: Tier) => {
+    setShown(new Set([...shown(), t]));
+    setPolicy({ ...policy(), [t]: ADD_COUNT[t] });
+  };
+
+  /** Log scale, so the last few days and the last year both read. */
+  const span = () => Math.max(35, ((sim().now - (oldest() ?? sim().now)) / DAY_MS) * 1.1);
+  const pct = (t: number) => (Math.log1p(Math.max(0, (sim().now - t) / DAY_MS)) / Math.log1p(span())) * 100;
+  /** One band per period in use, from halfway to its neighbours. */
+  const bands = createMemo(() => {
+    const groups = available()
+      .map((g) => ({ ...g, kept: sim().r.kept.filter((k) => k.tier === g.tier) }))
+      .filter((g) => g.kept.length > 0);
+    return groups.map((g, i) => {
+      const prev = groups[i - 1], next = groups[i + 1];
+      const start = prev ? (pct(prev.kept[prev.kept.length - 1]!.at) + pct(g.kept[0]!.at)) / 2 : 0;
+      const end = next ? (pct(g.kept[g.kept.length - 1]!.at) + pct(next.kept[0]!.at)) / 2 : 100;
+      return { tier: g.tier, name: g.name, start, end };
     });
   });
-  const when = (t: number) => shortDate(t, sim().now);
 
-  /** The periods a rung covers: "10 Nov → 12 Nov", "Q4 2025 → Q3". */
+  /** The periods a row covers: "10 Nov → 12 Nov", "Q4 2025 → Q3". */
   const reach = (t: Tier) => {
     if (!policy()[t]) return 'off';
     const mine = sim().r.kept.filter((k) => k.tier === t);
@@ -668,6 +667,7 @@ function SchedulePanel(props: {
 
   const useRecommended = () => {
     setPolicy(recommended());
+    setShown(new Set<Tier>());
     setEnabled(true);
   };
 
@@ -713,129 +713,112 @@ function SchedulePanel(props: {
         when={props.linked}
         fallback={<div class="fx-empty cap">Scheduled backups need a project linked to Sp00ky Cloud, then spky backup configure</div>}
       >
-        {/* when it runs ======================================================= */}
+        {/* when it runs, as a sentence ======================================== */}
         <div class="bu-when" classList={{ off: !enabled() }}>
-          <div class="bu-line">
-            <span>Every</span>
-            <select class="bu-sel" aria-label="How often" style={{ width: selWidth(freqLabel()) }} onChange={(e) => setFreq(e.currentTarget.value)}>
-              <option value="hourly" selected={freq() === 'hourly'}>hour</option>
-              <option value="daily" selected={freq() === 'daily'}>day</option>
-              <For each={WEEK}>{(d) => <option value={`w${d}`} selected={freq() === `w${d}`}>{DAY_NAMES[d]}</option>}</For>
-              <option value="cron" selected={freq() === 'cron'}>cron expression</option>
-            </select>
-            <Show when={!typing()}>
-              <Show
-                when={shape().freq === 'hourly'}
-                fallback={
-                  <>
-                    <span>at</span>
-                    <select
-                      class="bu-sel"
-                      aria-label="Time, UTC"
-                      style={{ width: selWidth('00:00') }}
-                      onChange={(e) => {
-                        const [h, m] = e.currentTarget.value.split(':').map(Number);
-                        setSchedule(cronOf({ ...shape(), hour: h!, minute: m! }));
-                      }}
-                    >
-                      <For each={times(shape().hour, shape().minute)}>
-                        {([h, m]) => <option value={`${h}:${m}`} selected={h === shape().hour && m === shape().minute}>{clock(h, m)}</option>}
-                      </For>
-                    </select>
-                    <span>UTC</span>
-                  </>
-                }
+          <span>Every</span>
+          <select class="bu-sel" aria-label="How often" style={{ width: selWidth(freqLabel()) }} onChange={(e) => setFreq(e.currentTarget.value)}>
+            <option value="hourly" selected={freq() === 'hourly'}>hour</option>
+            <option value="daily" selected={freq() === 'daily'}>day</option>
+            <For each={WEEK}>{(d) => <option value={`w${d}`} selected={freq() === `w${d}`}>{DAY_NAMES[d]}</option>}</For>
+            <option value="cron" selected={freq() === 'cron'}>cron expression</option>
+          </select>
+          <Show when={!typing()}>
+            <Show
+              when={shape().freq === 'hourly'}
+              fallback={
+                <>
+                  <span>at</span>
+                  <select
+                    class="bu-sel"
+                    aria-label="Time, UTC"
+                    style={{ width: selWidth('00:00') }}
+                    onChange={(e) => {
+                      const [h, m] = e.currentTarget.value.split(':').map(Number);
+                      setSchedule(cronOf({ ...shape(), hour: h!, minute: m! }));
+                    }}
+                  >
+                    <For each={times(shape().hour, shape().minute)}>
+                      {([h, m]) => <option value={`${h}:${m}`} selected={h === shape().hour && m === shape().minute}>{clock(h, m)}</option>}
+                    </For>
+                  </select>
+                  <span>UTC</span>
+                </>
+              }
+            >
+              <span>at minute</span>
+              <select
+                class="bu-sel"
+                aria-label="Minute"
+                style={{ width: selWidth(':00') }}
+                onChange={(e) => setSchedule(cronOf({ ...shape(), minute: Number(e.currentTarget.value) }))}
               >
-                <span>at minute</span>
-                <select
-                  class="bu-sel"
-                  aria-label="Minute"
-                  style={{ width: selWidth(':00') }}
-                  onChange={(e) => setSchedule(cronOf({ ...shape(), minute: Number(e.currentTarget.value) }))}
-                >
-                  <For each={minutes(shape().minute)}>
-                    {(m) => <option value={m} selected={m === shape().minute}>:{String(m).padStart(2, '0')}</option>}
-                  </For>
-                </select>
-              </Show>
+                <For each={minutes(shape().minute)}>
+                  {(m) => <option value={m} selected={m === shape().minute}>:{String(m).padStart(2, '0')}</option>}
+                </For>
+              </select>
             </Show>
-          </div>
+          </Show>
           <Show when={typing()}>
             <input class="mono bu-cron" value={schedule()} placeholder="0 3 * * *" spellcheck={false}
               aria-label="Cron expression, UTC" onInput={(e) => setSchedule(e.currentTarget.value)} />
+            <small class="bu-cron-words">{cronWords(schedule())}</small>
           </Show>
-          <div class="bu-sub">
-            <Show when={typing()} fallback={<span>cron <b>{schedule().trim()}</b></span>}>
-              <span><b>{cronWords(schedule())}</b></span>
-            </Show>
-            <Show when={props.config?.last_scheduled_at && !isAbsent(props.config?.last_scheduled_at)}>
-              <span>last ran {relativeStamp(props.config!.last_scheduled_at)}</span>
-            </Show>
-          </div>
         </div>
 
-        <div class="bu-rule" />
-
         {/* what it keeps ====================================================== */}
-        <div class="fx-head">
+        <div class="fx-head bu-keep-head">
           <span class="cap">Retention</span>
           <Show when={tiered()}>
             <span class="fx-meta">
-              <button type="button" class="chip" aria-pressed={samePolicy(policy(), recommended())} onClick={useRecommended}
-                title="3 days, then one a week for the month before, then four quarter ends">
-                Recommended
-              </button>
+              <Show when={!samePolicy(policy(), recommended())} fallback={<span class="cap">recommended</span>}>
+                <button type="button" class="bu-link" onClick={useRecommended}
+                  title="3 days, then one a week for the month before, then four quarter ends">
+                  use recommended
+                </button>
+              </Show>
             </span>
           </Show>
         </div>
 
-        <Show
-          when={sim().r.prunes}
-          fallback={<div class="bu-sum warn">Nothing is pruned · storage grows with every run</div>}
-        >
-          <div class="bu-tl" classList={{ 'has-hot': !!hot() }} onMouseLeave={() => setHot(null)}>
-            <div class="bu-tl-names">
-              <For each={lanes()}>
-                {(l) => <span classList={{ hot: hot() === l.tier }} onMouseEnter={() => setHot(l.tier)}>{l.name}</span>}
-              </For>
-            </div>
-            <div class="bu-tl-plot">
-              <For each={TICKS.filter(([d]) => d > 0 && d <= span())}>{([d]) => <span class="bu-tl-guide" style={{ left: x(d) }} />}</For>
-              <For each={lanes()}>
-                {(l) => (
-                  <div class="bu-tl-lane" classList={{ hot: hot() === l.tier }} onMouseEnter={() => setHot(l.tier)}>
-                    <For each={l.held}>{(t) => <i class="held" style={{ left: at(t) }} title={`${formatStamp(new Date(t).toISOString())} · held by a rung above`} />}</For>
-                    <For each={l.kept}>{(t) => <i style={{ left: at(t) }} title={`${formatStamp(new Date(t).toISOString())} · ${l.name.toLowerCase()}`} />}</For>
-                  </div>
-                )}
-              </For>
-              <div class="bu-tl-ticks">
-                <For each={tickLabels()}>{([d, label]) => <span style={{ left: x(d) }}>{label}</span>}</For>
-              </div>
-            </div>
+        <Show when={sim().r.prunes} fallback={<div class="bu-axis warn">Nothing is pruned, storage grows with every run</div>}>
+          <div class="bu-strip" classList={{ 'has-hot': !!hot() }}>
+            <For each={bands()}>
+              {(b) => (
+                <div class="bu-band" classList={{ hot: hot() === b.tier }} title={`${b.name}: ${reach(b.tier)}`}
+                  style={{ left: `${b.start}%`, width: `${b.end - b.start}%` }}
+                  onMouseEnter={() => setHot(b.tier)} onMouseLeave={() => setHot(null)} />
+              )}
+            </For>
+            <For each={sim().r.kept}>{(k) => <i classList={{ hot: hot() === k.tier }} style={{ left: `${pct(k.at)}%` }} />}</For>
           </div>
-          <div class="bu-sum">
+          <div class="bu-axis">
+            <span>now</span>
             <span>
-              <b>{formatCount(sim().r.kept.length)}</b> kept · back to <b>{when(oldest()!)}</b> ({spanWords(sim().now - oldest()!)})
-              <Show when={sim().approx}> · drawn as one a night</Show>
+              <b>{formatCount(sim().r.kept.length)}</b> kept, back to <b>{shortDate(oldest()!, sim().now)}</b>
+              <Show when={sim().approx}> (as if nightly)</Show>
             </span>
-            <Show when={anyHeld()}>
-              <span class="bu-key"><i /> kept <i class="held" /> held by a rung above</span>
-            </Show>
           </div>
         </Show>
 
-        <div class="bu-rungs" onMouseLeave={() => setHot(null)}>
-          <For each={rungs()}>
+        <div class="bu-rows" onMouseLeave={() => setHot(null)}>
+          <For each={rows()}>
             {(g) => (
-              <div class="bu-rung" classList={{ off: !policy()[g.tier] }} onMouseEnter={() => setHot(policy()[g.tier] ? g.tier : null)}>
-                <span class="bu-rung-name" title={g.help}>{g.name}</span>
-                <span class="bu-rung-reach">{reach(g.tier)}</span>
-                <Stepper value={policy()[g.tier]} label={g.name} onChange={(n) => setTier(g.tier, n)} />
+              <div class="bu-row" classList={{ off: !policy()[g.tier], hot: hot() === g.tier }}
+                onMouseEnter={() => setHot(policy()[g.tier] ? g.tier : null)}>
+                <span class="bu-row-name" title={g.help}>{g.name}</span>
+                <Count value={policy()[g.tier]} label={g.name} onChange={(n) => setTier(g.tier, n)} />
+                <span class="bu-row-reach">{reach(g.tier)}</span>
               </div>
             )}
           </For>
         </div>
+        <Show when={addable().length > 0}>
+          <div class="bu-add">
+            <For each={addable()}>
+              {(g) => <button type="button" title={g.help} onClick={() => add(g.tier)}>+ {g.name.toLowerCase()}</button>}
+            </For>
+          </div>
+        </Show>
 
         <div class="bu-foot">
           <small>Named backups are never pruned</small>

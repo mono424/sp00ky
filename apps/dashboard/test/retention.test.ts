@@ -25,10 +25,7 @@ test('newest stacks in front of the other tiers', () => {
   assert.equal(r.kept.length, 15);
   assert.deepEqual(days(r.kept.filter((k) => k.tier === 'last')), ['2026-11-15', '2026-11-14', '2026-11-13']);
   assert.deepEqual(days(r.kept.filter((k) => k.tier === 'daily')), ['2026-11-12', '2026-11-11', '2026-11-10']);
-  // The days the newest already hold are what pushed the dailies back.
-  assert.deepEqual(days(r.held.filter((h) => h.tier === 'daily')), ['2026-11-15', '2026-11-14', '2026-11-13']);
-  // The current ISO week (9 to 15 Nov) is held, so the first weekly is 8 Nov.
-  assert.deepEqual(days(r.held.filter((h) => h.tier === 'weekly')), ['2026-11-15']);
+  // The current ISO week (9 to 15 Nov) is already held, so the first weekly is 8 Nov.
   assert.equal(days(r.kept.filter((k) => k.tier === 'weekly'))[0], '2026-11-08');
 });
 

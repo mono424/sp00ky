@@ -3508,12 +3508,64 @@ h2 {
 
 .bu-stair {
   display: grid;
-  grid-template-columns: 72px auto minmax(0, 1fr);
+  grid-template-columns: 72px 56px minmax(0, 1fr) 14px;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  width: calc(100% + 16px);
   height: 30px;
   margin: 0 -8px;
   padding: 0 8px;
+}
+
+/* an unused period: the whole row is the button that adds it */
+button.bu-stair {
+  border: 0;
+  background: none;
+  font: inherit;
+  text-align: left;
+  color: inherit;
+}
+
+.bu-stair.off .bu-stair-name {
+  color: var(--ink-ghost);
+}
+
+.bu-stair.off:hover .bu-stair-name,
+.bu-stair.off:focus-visible .bu-stair-name {
+  color: var(--ink-dim);
+}
+
+/* add on an unused row, remove on a used one (shown while hovered) */
+.bu-stair-act {
+  width: 14px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: 400 13px/22px var(--mono);
+  text-align: center;
+  color: var(--ink-ghost);
+}
+
+.bu-stair:not(.off) .bu-stair-act {
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+
+.bu-stair:not(.off):hover .bu-stair-act,
+.bu-stair:not(.off):focus-within .bu-stair-act {
+  opacity: 1;
+}
+
+.bu-stair:not(.off) .bu-stair-act:hover,
+.bu-stair.off:hover .bu-stair-act {
+  color: var(--ink);
+}
+
+@media (hover: none) {
+  .bu-stair:not(.off) .bu-stair-act {
+    opacity: 1;
+  }
 }
 
 .bu-stair:hover,
@@ -3531,11 +3583,6 @@ h2 {
   color: var(--ink);
 }
 
-.bu-stair.off .bu-stair-name,
-.bu-stair.off .bu-count input {
-  color: var(--ink-ghost);
-}
-
 .bu-lane {
   position: relative;
   height: 100%;
@@ -3550,6 +3597,10 @@ h2 {
   top: 50%;
   height: 1px;
   background: var(--line);
+}
+
+.bu-stair.off .bu-lane::before {
+  display: none;
 }
 
 .bu-lane-grid {
@@ -3587,8 +3638,28 @@ h2 {
 
 .bu-stair-axis,
 .bu-stair-axis:hover {
-  height: 18px;
+  height: 22px;
   background: none;
+}
+
+.bu-stair-rec {
+  grid-column: 1 / 3;
+  font-size: 11.5px;
+  color: var(--ink-ghost);
+  white-space: nowrap;
+}
+
+.bu-stair-rec .bu-link {
+  font: 400 11.5px var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--ink-faint);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.bu-stair-rec .bu-link:hover {
+  color: var(--ink);
 }
 
 .bu-lane-axis {
@@ -3612,6 +3683,14 @@ h2 {
   transform: none;
 }
 
+.bu-keep-head .fx-meta {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .bu-keep-head .fx-meta.warn {
   color: var(--warn);
 }
@@ -3619,6 +3698,8 @@ h2 {
 .bu-count {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  width: 56px;
 }
 
 .bu-count button {
@@ -3672,41 +3753,6 @@ h2 {
 .bu-count input:focus {
   border-bottom-color: var(--accent);
   box-shadow: none;
-}
-
-.bu-add {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 14px;
-  margin-top: 10px;
-}
-
-.bu-add-rec {
-  margin-left: auto;
-  font: 500 10px var(--mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--ink-ghost);
-}
-
-.bu-add-rec .bu-link {
-  font-size: 10px;
-  letter-spacing: 0.08em;
-}
-
-.bu-add button {
-  padding: 2px 0;
-  border: 0;
-  background: none;
-  font: 500 10px var(--mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--ink-ghost);
-}
-
-.bu-add button:hover {
-  color: var(--ink-dim);
 }
 
 .bu-foot {

@@ -3428,37 +3428,311 @@ h2 {
   background: repeating-linear-gradient(135deg, rgba(241, 180, 64, 0.7) 0 3px, transparent 3px 6px);
 }
 
-/* the schedule form, stacked in its cell */
-.bu-form {
-  display: grid;
-  gap: 16px;
-  align-content: start;
+/* the schedule: when it runs on one line, then retention as a ladder */
+.bu-sched .fx-meta .switch {
+  gap: 8px;
 }
 
-.bu-form .li-field {
-  display: grid;
-  gap: 6px;
-  margin: 0;
+.bu-when {
+  transition: opacity 0.15s;
 }
 
-.bu-form .li-field > span {
-  font: 500 10.5px var(--mono);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--ink-faint);
+.bu-when.off {
+  opacity: 0.45;
 }
 
-.bu-form .li-field input {
-  height: 32px;
+.bu-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--ink-dim);
 }
 
-.bu-form small {
-  font-size: 9.5px;
+.bu-sel {
+  width: auto;
+  height: 28px;
+  padding: 0 24px 0 10px;
+  appearance: none;
+  -webkit-appearance: none;
+  background: rgba(255, 255, 255, 0.015)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%23707070'/%3E%3C/svg%3E")
+    no-repeat right 9px center / 8px 5px;
+  border-color: var(--line);
+  font: 400 12px var(--mono);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.bu-sel:hover {
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.bu-cron {
+  height: 30px;
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.bu-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 10px;
+  font: 400 11px/1.6 var(--mono);
   color: var(--ink-ghost);
 }
 
-.bu-save {
-  justify-self: start;
+.bu-sub b {
+  font-weight: 400;
+  color: var(--ink-faint);
+}
+
+/* a hairline across the whole cell between the two halves */
+.bu-rule {
+  height: 1px;
+  margin: 20px calc(-1 * var(--pad)) 18px;
+  background: var(--line);
+}
+
+/* the timeline: a lane per rung in use over a log axis, newest left */
+.bu-tl {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  margin-top: -2px;
+}
+
+.bu-tl-names {
+  display: grid;
+  grid-auto-rows: 14px;
+  row-gap: 3px;
+  padding-bottom: 18px;
+}
+
+.bu-tl-names span {
+  font: 500 9px/14px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-ghost);
+  white-space: nowrap;
+  transition: color 0.12s;
+}
+
+.bu-tl-names span.hot {
+  color: var(--ink-dim);
+}
+
+.bu-tl-plot {
+  position: relative;
+  display: grid;
+  grid-auto-rows: 14px;
+  row-gap: 3px;
+  margin-right: 5px;
+}
+
+.bu-tl-guide {
+  position: absolute;
+  top: 0;
+  bottom: 18px;
+  width: 1px;
+  background: var(--line-soft);
+}
+
+.bu-tl-lane {
+  position: relative;
+  transition: opacity 0.12s;
+}
+
+.bu-tl-lane::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 7px;
+  height: 1px;
+  background: var(--line);
+}
+
+.bu-tl-lane i,
+.bu-key i {
+  position: absolute;
+  top: 4px;
+  width: 6px;
+  height: 6px;
+  margin-left: -3px;
+  background: var(--accent);
+}
+
+.bu-tl-lane i.held,
+.bu-key i.held {
+  background: var(--bg);
+  border: 1px solid var(--ink-faint);
+}
+
+.bu-tl.has-hot .bu-tl-lane:not(.hot) {
+  opacity: 0.22;
+}
+
+.bu-tl-lane.hot i:not(.held) {
+  background: var(--accent-strong);
+}
+
+.bu-tl-ticks {
+  position: relative;
+  height: 18px;
+}
+
+.bu-tl-ticks span {
+  position: absolute;
+  top: 5px;
+  transform: translateX(-50%);
+  font: 500 9px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-ghost);
+  white-space: nowrap;
+}
+
+.bu-tl-ticks span:first-child {
+  transform: none;
+}
+
+.bu-sum {
+  display: grid;
+  gap: 2px;
+  margin: 6px 0 14px;
+  font: 400 11.5px/1.6 var(--mono);
+  color: var(--ink-faint);
+}
+
+.bu-sum b {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.bu-sum.warn {
+  color: var(--warn);
+}
+
+.bu-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--ink-ghost);
+}
+
+.bu-key i {
+  position: static;
+  margin: 0 0 0 4px;
+  flex: none;
+}
+
+.bu-key i:first-child {
+  margin-left: 0;
+}
+
+/* the ladder: one rung per period, filled top to bottom */
+.bu-rung {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  height: 40px;
+  padding: 0 2px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.bu-rung:last-child {
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.bu-rung:hover {
+  background: var(--bg-hover);
+}
+
+.bu-rung-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink);
+  cursor: default;
+}
+
+.bu-rung-reach {
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 400 11px var(--mono);
+  color: var(--ink-faint);
+}
+
+.bu-rung.off .bu-rung-name,
+.bu-rung.off .bu-rung-reach {
+  color: var(--ink-ghost);
+}
+
+.bu-step {
+  display: inline-grid;
+  grid-template-columns: 24px 36px 24px;
+  height: 26px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.bu-step button {
+  border: 0;
+  background: none;
+  font: 400 13px/1 var(--mono);
+  color: var(--ink-faint);
+}
+
+.bu-step button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ink);
+}
+
+.bu-step button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.bu-step input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--line-soft);
+  border-right: 1px solid var(--line-soft);
+  background: none;
+  text-align: center;
+  font: 500 12px var(--mono);
+  color: var(--ink);
+}
+
+.bu-step input:focus {
+  box-shadow: none;
+  background: rgba(156, 165, 211, 0.1);
+}
+
+.bu-step.zero input {
+  color: var(--ink-ghost);
+}
+
+.bu-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.bu-foot small {
+  font: 400 11px var(--mono);
+  color: var(--ink-ghost);
 }
 
 /* point in time: the window, then a moment picker and its action */
@@ -3489,32 +3763,6 @@ h2 {
 
 .bu-pit-form input {
   height: 32px;
-}
-
-/* retention tiers: six small counts, three a row */
-.bu-form .bu-tiers-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.bu-tiers {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.bu-tiers label {
-  display: grid;
-  gap: 4px;
-  margin: 0;
-}
-
-.bu-tiers input {
-  height: 28px;
-  width: 100%;
-  min-width: 0;
 }
 
 /* the toggle in the frame's terms: a square track, a square knob */

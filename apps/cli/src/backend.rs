@@ -1939,19 +1939,21 @@ pub enum DeployEnv {
 const DEFAULT_SURREALDB_VERSION: &str = "v3.1.0-beta.3";
 
 /// The experimental capabilities a SurrealDB of `tag` is started with. Buckets
-/// (`files`) are experimental up to 3.x and stable in 4.0, which refuses to
-/// start when told to allow a target it no longer has ("invalid experimental
-/// target name"). A tag without a version (`latest`, `nightly`) is taken for
-/// 4.x, where those tags point now.
+/// (`files`) are experimental up to 3.x and in the 4.0.0 betas, and stable from
+/// 4.0.0, which refuses to start when told to allow a target it no longer has
+/// ("invalid experimental target name"). A tag without a version (`latest`,
+/// `nightly`) is taken for 4.x, where those tags point now.
 pub fn surreal_experimental_caps(tag: &str) -> &'static str {
+    let tag = tag.trim().trim_start_matches('v');
     let major = tag
-        .trim()
-        .trim_start_matches('v')
         .split(|c: char| !c.is_ascii_digit())
         .next()
         .and_then(|m| m.parse::<u32>().ok())
         .unwrap_or(4);
-    if major >= 4 { "surrealism" } else { "surrealism,files" }
+    let pre_release_4 = tag
+        .strip_prefix("4.0.0-")
+        .is_some_and(|pre| ["alpha", "beta", "rc"].iter().any(|w| pre.starts_with(w)));
+    if major >= 4 && !pre_release_4 { "surrealism" } else { "surrealism,files" }
 }
 const DEFAULT_SSP_VERSION: &str = DEFAULT_VERSION_CHANNEL;
 const DEFAULT_SCHEDULER_VERSION: &str = DEFAULT_VERSION_CHANNEL;
@@ -3728,7 +3730,11 @@ mod version_tests {
         assert_eq!(surreal_experimental_caps("v3.3.5"), "surrealism,files");
         assert_eq!(surreal_experimental_caps("v3.1.0-beta.3"), "surrealism,files");
         assert_eq!(surreal_experimental_caps("v4.0.1"), "surrealism");
-        assert_eq!(surreal_experimental_caps("v4.0.0-beta.1"), "surrealism");
+        assert_eq!(surreal_experimental_caps("v4.0.0"), "surrealism");
+        assert_eq!(surreal_experimental_caps("v4.0.0-dev"), "surrealism");
+        // The 4.0.0 betas still gate DEFINE BUCKET behind `files`.
+        assert_eq!(surreal_experimental_caps("v4.0.0-beta.1"), "surrealism,files");
+        assert_eq!(surreal_experimental_caps("v4.0.0-beta.1-dev"), "surrealism,files");
         assert_eq!(surreal_experimental_caps("latest"), "surrealism");
     }
 

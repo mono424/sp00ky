@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { RecordId } from 'surrealdb';
 import { pureWriteOpResult, SqliteCacheEngine } from './sqlite-cache-engine';
 import { stubTransport } from './sqlite-transport.fixture';
@@ -569,6 +569,27 @@ describe('create() tx result shaping (fast path parity)', () => {
   });
 });
 
+
+// patch() applies RFC6902 ops through fast-json-patch's default export (a
+// named import broke loading dist/index.js in Node ESM). Exercise the call so
+// a regression to an unusable binding fails here, not only at build time.
+describe('SqliteCacheEngine.patch', () => {
+  it('applies RFC6902 ops read-modify-write and stores the result', async () => {
+    const engine = new SqliteCacheEngine({ namespace: 'n', database: 'd' } as any, makeLogger());
+    vi.spyOn(engine, 'getById').mockResolvedValue({ id: 'game:1', title: 'a', tags: ['x'] });
+    const upsert = vi.spyOn(engine, 'upsert').mockResolvedValue(undefined);
+    await engine.patch('game', 'game:1', [
+      { op: 'replace', path: '/title', value: 'b' },
+      { op: 'add', path: '/tags/-', value: 'y' },
+    ]);
+    expect(upsert).toHaveBeenCalledWith(
+      'game',
+      'game:1',
+      { id: 'game:1', title: 'b', tags: ['x', 'y'] },
+      'replace'
+    );
+  });
+});
 
 // The circuit snapshot + version scan the boot-time prime reads through this
 // engine. Bytes and meta must round-trip as ONE batch (a reader must never see

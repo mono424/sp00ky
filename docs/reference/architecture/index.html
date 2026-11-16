@@ -52,7 +52,7 @@
 <span class="line"></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        subgraph sched [Scheduler]</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">            Scheduler[Scheduler Core]</span></span>
-<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">            Replica[(Snapshot Replica&lt;br/&gt;RocksDB)]</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">            Replica[(Snapshot Replica&lt;br/&gt;SurrealKV)]</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">            WAL[WAL]</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">        end</span></span>
 <span class="line"></span>
@@ -86,7 +86,7 @@
 <p><strong>Scheduler</strong> (Port 9667 by default)</p>
 <ul>
 <li>Central coordinator for all SSP instances</li>
-<li>Maintains a persistent <strong>Snapshot Replica</strong> (RocksDB-backed embedded SurrealDB) of database state</li>
+<li>Maintains a persistent <strong>Snapshot Replica</strong> (an embedded SurrealDB on SurrealKV) of database state</li>
 <li>Writes all events to a <strong>Write-Ahead Log (WAL)</strong> for crash recovery</li>
 <li>Distributes data updates to all SSPs via HTTP</li>
 <li>Exposes <strong>proxy endpoints</strong> (<code>/proxy/query</code>, <code>/proxy/signin</code>, <code>/proxy/use</code>) so SSPs can self-bootstrap by querying the snapshot directly</li>
@@ -109,7 +109,7 @@
 <pre class="astro-code astro-code-themes github-light github-dark" style="background-color:#fff;--shiki-dark-bg:#24292e;color:#24292e;--shiki-dark:#e1e4e8;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word" tabindex="0" data-language="mermaid"><code><span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">sequenceDiagram</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    participant SSP</span></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    participant Scheduler</span></span>
-<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    participant Replica as Snapshot Replica (RocksDB)</span></span>
+<span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    participant Replica as Snapshot Replica (SurrealKV)</span></span>
 <span class="line"></span>
 <span class="line"><span style="color:#24292E;--shiki-dark:#E1E4E8">    Note over SSP: Startup</span></span>
 <span class="line"></span>

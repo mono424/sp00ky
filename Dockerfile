@@ -3,7 +3,8 @@
 # Build a specific image with: docker buildx build --target ssp ...
 # or                          docker buildx build --target scheduler ...
 
-FROM rust:1.93-bookworm AS chef
+# SurrealDB 4.0.1 pulls in sysinfo 0.39, which needs rustc 1.95.
+FROM rust:1.96-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler \
         cmake \

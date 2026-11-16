@@ -1314,6 +1314,33 @@ mod tests {
         assert_eq!(batch.records[2].op, ChangeOp::Update, "INCLUDE ORIGINAL keeps an update an update");
     }
 
+    /// Keyed ledger rows (`_00_version:[game:a]`, see
+    /// `ssp_protocol::version_ledger`) stamp `_00_rv` like the random-id ones,
+    /// and a migration step (a legacy row deleted, its keyed row written, no
+    /// record change) forwards nothing. Shapes captured from 3.3.5 and 4.0.1
+    /// on 2026-11-16 (identical).
+    #[test]
+    fn keyed_ledger_rows_stamp_versions_and_a_migration_step_forwards_nothing() {
+        let result = json!([
+            {"changes":[{"update":{"id":"_00_version:[game:a]","record_id":"game:a","version":1}},{"update":{"id":"game:a","x":1}}],"versionstamp":117628150302965760u64},
+            {"changes":[{"current":{"id":"_00_version:[game:a]","record_id":"game:a","version":2},"update":[{"op":"replace","path":"/version","value":1}]},{"current":{"id":"game:a","x":2},"update":[{"op":"replace","path":"/x","value":1}]}],"versionstamp":117628150303096832u64},
+            {"changes":[{"delete":{"id":"_00_version:legacy1","original":{"id":"_00_version:legacy1","record_id":"game:b","version":4}}},{"update":{"id":"_00_version:[game:b]","record_id":"game:b","version":4}}],"versionstamp":117628150303096833u64},
+            {"changes":[{"delete":{"id":"_00_version:[game:a]"}},{"delete":{"id":"game:a"}}],"versionstamp":117628150303096834u64}
+        ]);
+        let batch = parse_show_changes(&result);
+        let got: Vec<(&str, ChangeOp, Option<i64>)> =
+            batch.records.iter().map(|r| (r.id.as_str(), r.op, r.rv)).collect();
+        assert_eq!(
+            got,
+            [
+                ("game:a", ChangeOp::Create, Some(1)),
+                ("game:a", ChangeOp::Update, Some(2)),
+                ("game:a", ChangeOp::Delete, None),
+            ]
+        );
+        assert_eq!(batch.records[1].record.as_ref().unwrap()["_00_rv"], 2);
+    }
+
     #[test]
     fn parses_create_update_delete_with_version_join() {
         let batch = parse_show_changes(&fixture());

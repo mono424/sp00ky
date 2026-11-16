@@ -2930,14 +2930,18 @@ pub(crate) async fn wait_for_row_committed(
     while start.elapsed() < timeout {
         let result = {
             let Ok(_probe) = probes.acquire().await else { return false; };
+            // The keyed ledger row by key; a row from before keyed rows by
+            // its `record_id` (top level, where the index is used).
             db.query(
-                "SELECT VALUE version FROM ONLY _00_version WHERE record_id = type::record($rid) LIMIT 1",
+                "LET $spky_rid = type::record($rid); \
+                 RETURN type::record('_00_version', [$spky_rid]).version \
+                 ?? (SELECT VALUE version FROM ONLY _00_version WHERE record_id = $spky_rid LIMIT 1);",
                 &[("rid", json!(row_id))],
             )
             .await
         };
         if let Ok(rows) = result {
-            if let Some(v) = rows.first().and_then(|v| v.as_i64()) {
+            if let Some(v) = rows.last().and_then(|v| v.as_i64()) {
                 if v >= expected_version {
                     return true;
                 }

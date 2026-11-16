@@ -17,6 +17,7 @@ pub mod log_ring;
 pub mod restore;
 pub mod routes;
 pub mod s3;
+pub mod version_ledger;
 
 pub use backend_health::{
     create_health_cache, create_shared_configs, set_pool_backing, start_backend_health_monitor,

@@ -533,21 +533,39 @@ pub struct Replica {
     range_build: std::sync::Mutex<Option<RangeBuild>>,
 }
 
-/// How upstream plans the per-row `_00_version` lookup: SurrealDB 3 and 4 plan
-/// the two forms of it the opposite way, and the wrong one scans the ledger for
-/// every row (see [`ssp_protocol::VersionLookup`]). Measured on 46k ledger rows:
-/// 3.3.5 bound 53 ms / `$parent.id` 899 ms, 4.0.1 bound 910 ms / `$parent.id`
-/// 48 ms. A server whose version cannot be read gets the SurrealDB 3 form.
+/// How a scan of upstream starting now reads row versions from the
+/// `_00_version` ledger: by key alone once no legacy (random id) row remains,
+/// else by key with the legacy lookup as a fallback in the form this server
+/// plans as an index read (see [`ssp_protocol::VersionLookup`]). Resolved per
+/// scan: the ledger migration finishing and a server upgrade both change it
+/// under a running scheduler. A probe that fails keeps the fallback, which is
+/// always correct.
 pub(crate) async fn upstream_version_lookup<C: surrealdb::Connection>(
     db: &surrealdb::Surreal<C>,
 ) -> ssp_protocol::VersionLookup {
-    match db.version().await {
-        Ok(v) => ssp_protocol::VersionLookup::for_server(&v.to_string()),
+    use ssp_protocol::version_ledger;
+    let head = async {
+        let mut response = db.query(version_ledger::HEAD_QUERY).await?;
+        response.take::<surrealdb::types::Value>(0)
+    };
+    let legacy = match head.await {
+        Ok(head) => version_ledger::head_is_legacy(&head.into_json_value()),
         Err(e) => {
-            warn!(error = %e, "Could not read the upstream SurrealDB version; using the 3.x version lookup");
-            ssp_protocol::VersionLookup::default()
+            warn!(error = %e, "Could not probe the upstream version ledger; reading legacy rows too");
+            true
         }
+    };
+    if !legacy {
+        return ssp_protocol::VersionLookup::Keyed;
     }
+    let server = match db.version().await {
+        Ok(v) => Some(v.to_string()),
+        Err(e) => {
+            warn!(error = %e, "Could not read the upstream SurrealDB version; using the 3.x legacy lookup");
+            None
+        }
+    };
+    ssp_protocol::VersionLookup::for_ledger(server.as_deref(), true)
 }
 
 impl Replica {
@@ -3640,6 +3658,50 @@ mod tests {
         assert_eq!(read.len(), ids.len(), "a row was read twice");
         let want: BTreeSet<String> = want.into_iter().collect();
         assert_eq!(read.into_iter().cloned().collect::<BTreeSet<_>>(), want);
+    }
+
+    /// Row versions come from the keyed ledger row (`_00_version:[game:a]`),
+    /// from a legacy (random id) one while any remain, and from the row's own
+    /// `_00_rv` without either; once no legacy row is left the scan reads by
+    /// key alone, whatever the server.
+    #[tokio::test]
+    async fn row_versions_come_from_keyed_and_legacy_ledger_rows() -> Result<()> {
+        let (_tmp, db) = source_db().await?;
+        db.query(
+            "CREATE game:k SET n = 1; CREATE game:l SET n = 2; CREATE game:n SET n = 3, _00_rv = 4; \
+             CREATE _00_version:[game:k] SET record_id = game:k, version = 7; \
+             CREATE _00_version:abc SET record_id = game:l, version = 3;",
+        )
+        .await?
+        .check()?;
+        let versions = |rows: Vec<Value>| -> BTreeMap<String, i64> {
+            rows.into_iter()
+                .map(|r| (r["id"].as_str().unwrap().to_string(), r["_00_rv"].as_i64().unwrap()))
+                .collect()
+        };
+        let want: BTreeMap<String, i64> =
+            [("game:k".to_string(), 7), ("game:l".to_string(), 3), ("game:n".to_string(), 4)].into();
+
+        assert_ne!(upstream_version_lookup(&db).await, ssp_protocol::VersionLookup::Keyed, "a legacy row remains");
+        let rows = std::sync::Mutex::new(Vec::new());
+        Replica::page_table_by(&db, "game", &BTreeSet::new(), 100, |page| {
+            rows.lock().unwrap().extend(page);
+            std::future::ready(Ok(()))
+        })
+        .await?;
+        assert_eq!(versions(rows.into_inner().unwrap()), want);
+        let ids: Vec<String> = want.keys().cloned().collect();
+        let by_id = Replica::fetch_rows_by_id(&db, "game", &ids, &BTreeSet::new()).await?;
+        assert_eq!(versions(by_id.into_values().collect()), want);
+
+        // The migration moved the legacy row.
+        db.query("DELETE _00_version:abc; CREATE _00_version:[game:l] SET record_id = game:l, version = 3;")
+            .await?
+            .check()?;
+        assert_eq!(upstream_version_lookup(&db).await, ssp_protocol::VersionLookup::Keyed);
+        let by_id = Replica::fetch_rows_by_id(&db, "game", &ids, &BTreeSet::new()).await?;
+        assert_eq!(versions(by_id.into_values().collect()), want);
+        Ok(())
     }
 
     #[tokio::test]

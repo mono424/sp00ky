@@ -2935,6 +2935,41 @@ async fn ledger_snapshot_recovery_sees_low_version_updates_and_deletions() {
         fresh.read().await.compute_table_hashes());
 }
 
+/// A bootstrap reads each row's version from its keyed ledger row
+/// (`_00_version:[thread:k]`) and from a legacy (random id) one while any
+/// remain; once no legacy row is left the scan reads by key alone. A row with
+/// neither still loads.
+#[tokio::test]
+async fn bootstrap_reads_keyed_and_legacy_ledger_versions() {
+    let raw = Arc::new(Surreal::new::<Mem>(()).await.unwrap());
+    raw.use_ns("t").use_db("t").await.unwrap();
+    raw.query("DEFINE TABLE thread SCHEMALESS PERMISSIONS FULL; \
+        CREATE thread:k SET title = 'k'; CREATE thread:l SET title = 'l'; CREATE thread:n SET title = 'n'; \
+        CREATE _00_version:[thread:k] SET record_id = thread:k, version = 7; \
+        CREATE _00_version:abc SET record_id = thread:l, version = 3;")
+        .await.unwrap().check().unwrap();
+    let db = MemDb::new(Arc::clone(&raw));
+    let versions = |circuit: &Circuit| {
+        assert!(circuit.contains("thread", "thread:n"));
+        ["thread:k", "thread:l"].map(|id| circuit.store.get_record_version_by_key(id))
+    };
+
+    let schema = ssp_node::bootstrap::load_schema(&db).await.unwrap();
+    assert_ne!(schema.version_lookup, ssp_protocol::VersionLookup::Keyed, "a legacy row remains");
+    let circuit = Arc::new(RwLock::new(Circuit::new()));
+    ssp_node::bootstrap::rebuild_from_db(&db, &circuit, 200).await.unwrap();
+    assert_eq!(versions(&*circuit.read().await), [Some(7), Some(3)]);
+
+    // The migration moved the legacy row.
+    raw.query("DELETE _00_version:abc; CREATE _00_version:[thread:l] SET record_id = thread:l, version = 3;")
+        .await.unwrap().check().unwrap();
+    let schema = ssp_node::bootstrap::load_schema(&db).await.unwrap();
+    assert_eq!(schema.version_lookup, ssp_protocol::VersionLookup::Keyed);
+    let circuit = Arc::new(RwLock::new(Circuit::new()));
+    ssp_node::bootstrap::rebuild_from_db(&db, &circuit, 200).await.unwrap();
+    assert_eq!(versions(&*circuit.read().await), [Some(7), Some(3)]);
+}
+
 #[tokio::test]
 async fn publication_saturation_rejects_ingest_before_circuit_and_job_side_effects() {
     let h = build(HarnessOpts { job_tables: vec![("job", "http://worker")], ..Default::default() }).await;

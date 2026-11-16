@@ -1006,6 +1006,20 @@ pub async fn run_server() -> anyhow::Result<()> {
         }
     }
 
+    // Move legacy `_00_version` rows to keyed ids (see
+    // `maintenance::version_ledger`). Standalone only: in cluster mode the
+    // scheduler runs it, and two runners would only race each other's
+    // conflicts.
+    if config.scheduler_url.is_none() {
+        maintenance::version_ledger::spawn_migration(maintenance::db::DbConfig {
+            url: config.db_addr.clone(),
+            namespace: config.db_ns.clone(),
+            database: config.db_db.clone(),
+            username: config.db_user.clone(),
+            password: config.db_pass.clone(),
+        });
+    }
+
     // Declarative schedules (`schedules:` / `workflows:` in sp00ky.yml). Same
     // singlenode-only reasoning as the recovery sweep: in cluster mode the
     // scheduler service is the single ticker, so an SSP that also ticked would

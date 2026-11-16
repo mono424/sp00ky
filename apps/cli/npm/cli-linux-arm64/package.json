@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/cli-linux-arm64",
-  "version": "1.0.0-beta.2",
+  "version": "1.0.0-beta.3",
   "description": "Linux ARM64 binary for @spooky-sync/cli",
   "license": "MIT",
   "os": [

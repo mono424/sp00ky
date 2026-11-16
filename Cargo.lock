@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "maintenance"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5779,7 +5779,7 @@ dependencies = [
 
 [[package]]
 name = "push-core"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -6933,7 +6933,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7488,7 +7488,7 @@ dependencies = [
 
 [[package]]
 name = "sp00ky-cli"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7576,7 +7576,7 @@ dependencies = [
 
 [[package]]
 name = "spooky-core"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7607,7 +7607,7 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -7635,7 +7635,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-ffi"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -7646,7 +7646,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-node"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7674,7 +7674,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-portable"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7697,7 +7697,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-protocol"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -7708,7 +7708,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-server"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7746,7 +7746,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-wasm"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.3"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",

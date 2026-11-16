@@ -936,12 +936,26 @@ fn read_stored_schema_hash(client: &dyn MigrationDB, id: &str) -> Option<String>
     None
 }
 
+/// `_00_schema_state` as `meta_tables_remote.surql` defines it, created only
+/// when missing.
+const SCHEMA_STATE_DDL: &str = "DEFINE TABLE IF NOT EXISTS _00_schema_state SCHEMAFULL PERMISSIONS NONE; \
+DEFINE FIELD IF NOT EXISTS hash ON TABLE _00_schema_state TYPE string; \
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE _00_schema_state TYPE datetime VALUE time::now(); ";
+
 /// Record the applied schema hash for `id` in `_00_schema_state` (best-effort:
 /// a failure here only costs a redundant re-apply next time, so it warns rather
 /// than failing the migration).
 fn record_schema_hash(client: &dyn MigrationDB, id: &str, hash: &str) {
+    // The table is defined here, the way meta_tables_remote.surql defines it,
+    // before its first row: the remote functions' hash is recorded before the
+    // internal schema runs, and a row written into a not-yet-defined table
+    // made the internal schema's `DEFINE FIELD OVERWRITE hash ... TYPE string`
+    // a change of a SCHEMAFULL table with rows, which a database at
+    // compatibility level 4 (created on SurrealDB 4) refuses without MIGRATE
+    // EXISTING ROWS. Every first `migrate apply` on a fresh 4.x database
+    // failed there. IF NOT EXISTS leaves an existing definition alone.
     let q = format!(
-        "UPSERT _00_schema_state:{id} SET hash = '{hash}', updated_at = time::now();",
+        "{SCHEMA_STATE_DDL}UPSERT _00_schema_state:{id} SET hash = '{hash}', updated_at = time::now();",
         id = id,
         hash = hash
     );
@@ -2070,7 +2084,7 @@ mod tests {
         assert_eq!(upserts(&q), 1, "normal path stores the config: {q:?}");
         let internal_hash = q
             .iter()
-            .find_map(|s| s.strip_prefix("UPSERT _00_schema_state:internal SET hash = '"))
+            .find_map(|s| s.split_once("UPSERT _00_schema_state:internal SET hash = '").map(|(_, rest)| rest))
             .map(|rest| rest.split('\'').next().unwrap().to_string())
             .expect("internal hash recorded");
 

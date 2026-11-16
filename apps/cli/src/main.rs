@@ -32,6 +32,7 @@ mod push_db_tests;
 mod version_ledger_tests;
 mod push_sync;
 mod query;
+mod query_lint;
 mod scaffold;
 mod dag_render;
 mod schedules;
@@ -3030,6 +3031,13 @@ fn handle_lint(config_path: &Path) -> Result<()> {
                     }
                 }
             }
+        }
+    }
+
+    // 4b. Event and function bodies SurrealDB 4 runs as table scans.
+    for (file, found) in query_lint::lint_project(&config, base_dir) {
+        for f in found {
+            warnings.push(format!("{file}: {f}"));
         }
     }
 

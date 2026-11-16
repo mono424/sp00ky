@@ -114,6 +114,8 @@ pub fn run(emit_json: bool, project_dir: &Path, treat_warn_as_ok: bool) -> Resul
         checks.extend(check_legacy_recurring_fields(cfg, project_dir));
         // 5b. Security: migrations carrying the redacted-key placeholder
         checks.push(check_redacted_access_keys(cfg, project_dir));
+        // 5c. Event and function bodies SurrealDB 4 runs as table scans
+        checks.push(check_body_index_scans(cfg, project_dir));
     }
 
     // 6. Docker availability — warn (not fail). Local-dev users only need
@@ -341,6 +343,36 @@ fn check_redacted_access_keys(cfg: &Sp00kyConfig, project_dir: &Path) -> Check {
             ),
         )
     }
+}
+
+/// Statements in `DEFINE EVENT` / `DEFINE FUNCTION` bodies that SurrealDB
+/// 4.0.1 plans as table scans (see `query_lint`). A warning: they are correct,
+/// and fast on 3.x, but one write through such an event reads the whole table.
+fn check_body_index_scans(cfg: &Sp00kyConfig, project_dir: &Path) -> Check {
+    let found = crate::query_lint::lint_project(cfg, project_dir);
+    let total: usize = found.iter().map(|(_, f)| f.len()).sum();
+    if total == 0 {
+        return Check::pass("body-index-scans", Some("no event or function body filters by a parameter in a shape SurrealDB 4 scans".to_string()));
+    }
+    let mut owners: Vec<String> = found
+        .iter()
+        .flat_map(|(_, fs)| fs.iter().map(|f| f.owner.clone()))
+        .collect();
+    owners.dedup();
+    let shown: Vec<String> = owners.iter().take(8).cloned().collect();
+    Check::warn(
+        "body-index-scans",
+        "bind event values with `LET $x = $after.x;` at the top of the body, write through \
+         `UPDATE (SELECT VALUE id FROM t WHERE ...) SET ...` / `DELETE (SELECT VALUE id FROM t WHERE ...)`, \
+         and match lists with `FOR $v IN $list { ... = $v }`; `spky lint` prints each statement with its rewrite"
+            .to_string(),
+        format!(
+            "{total} statement(s) in {} event/function bodies scan their table on SurrealDB 4.0.1: {}{}",
+            owners.len(),
+            shown.join(", "),
+            if owners.len() > shown.len() { ", ..." } else { "" }
+        ),
+    )
 }
 
 fn check_docker() -> Check {

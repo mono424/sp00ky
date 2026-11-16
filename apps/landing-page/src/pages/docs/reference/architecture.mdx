@@ -75,7 +75,7 @@ graph TD
 
         subgraph sched [Scheduler]
             Scheduler[Scheduler Core]
-            Replica[(Snapshot Replica<br/>RocksDB)]
+            Replica[(Snapshot Replica<br/>SurrealKV)]
             WAL[WAL]
         end
 
@@ -111,7 +111,7 @@ graph TD
 
 **Scheduler** (Port 9667 by default)
 - Central coordinator for all SSP instances
-- Maintains a persistent **Snapshot Replica** (RocksDB-backed embedded SurrealDB) of database state
+- Maintains a persistent **Snapshot Replica** (an embedded SurrealDB on SurrealKV) of database state
 - Writes all events to a **Write-Ahead Log (WAL)** for crash recovery
 - Distributes data updates to all SSPs via HTTP
 - Exposes **proxy endpoints** (`/proxy/query`, `/proxy/signin`, `/proxy/use`) so SSPs can self-bootstrap by querying the snapshot directly
@@ -137,7 +137,7 @@ When an SSP starts up with scheduler integration enabled:
 sequenceDiagram
     participant SSP
     participant Scheduler
-    participant Replica as Snapshot Replica (RocksDB)
+    participant Replica as Snapshot Replica (SurrealKV)
 
     Note over SSP: Startup
 

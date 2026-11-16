@@ -18,10 +18,11 @@ impl Drop for Container {
 #[ignore = "requires Docker"]
 async fn terminal_observers_reuse_the_scheduler_session() {
     let container = Container(format!("spky-observer-sessions-{}", std::process::id()));
+    let image = surreal_image();
     let output = std::process::Command::new("docker").args([
         "run", "-d", "--name", &container.0, "-p", "127.0.0.1::8000",
         "-e", "SURREAL_HTTP_MAX_ATTACHED_SESSIONS=4",
-        "surrealdb/surrealdb:v3.1.5", "start", "--user", "root", "--pass", "root",
+        &image, "start", "--user", "root", "--pass", "root",
     ]).output().unwrap();
     assert!(output.status.success(), "Docker fixture failed");
     let port = std::process::Command::new("docker")
@@ -59,4 +60,10 @@ async fn terminal_observers_reuse_the_scheduler_session() {
     // is the regression check that catches accumulated attached sessions.
     let probe = connect_http(&cfg).await.expect("observers exhausted the HTTP session limit");
     probe.query("RETURN 1").await.unwrap().check().unwrap();
+}
+
+/// The SurrealDB image the Docker tests run against: `SPKY_TEST_SURREALDB_IMAGE`,
+/// so the same tests prove both server lines (e.g. `surrealdb/surrealdb:v4.0.1`).
+fn surreal_image() -> String {
+    std::env::var("SPKY_TEST_SURREALDB_IMAGE").unwrap_or_else(|_| "surrealdb/surrealdb:v3.1.5".to_string())
 }

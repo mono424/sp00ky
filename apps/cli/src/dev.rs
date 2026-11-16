@@ -533,7 +533,7 @@ fn run_direct_mode(
             "-e".into(),
             "SURREAL_LOG=info".into(),
             "-e".into(),
-            "SURREAL_CAPS_ALLOW_EXPERIMENTAL=surrealism,files".into(),
+            format!("SURREAL_CAPS_ALLOW_EXPERIMENTAL={}", crate::backend::surreal_experimental_caps(&versions.surrealdb)),
             surreal_image.clone(),
             "start".into(),
             "--bind".into(),

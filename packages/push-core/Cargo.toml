@@ -44,5 +44,5 @@ getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 serde_yaml = "0.9"
-surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
+surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem"] }
 tokio = { version = "1", features = ["full"] }

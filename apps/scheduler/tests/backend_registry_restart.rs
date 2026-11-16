@@ -53,7 +53,7 @@ async fn a_restart_restores_the_pushed_backends() {
             &container.0,
             "-p",
             "127.0.0.1::8000",
-            "surrealdb/surrealdb:v3.1.5",
+            &surreal_image(),
             "start",
             "--user",
             "root",
@@ -166,4 +166,10 @@ async fn a_restart_restores_the_pushed_backends() {
         .map(|b| b.name.clone())
         .collect();
     assert_eq!(names, vec!["envonly"]);
+}
+
+/// The SurrealDB image the Docker tests run against: `SPKY_TEST_SURREALDB_IMAGE`,
+/// so the same tests prove both server lines (e.g. `surrealdb/surrealdb:v4.0.1`).
+fn surreal_image() -> String {
+    std::env::var("SPKY_TEST_SURREALDB_IMAGE").unwrap_or_else(|_| "surrealdb/surrealdb:v3.1.5".to_string())
 }

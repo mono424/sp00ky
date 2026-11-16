@@ -21,7 +21,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
-surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
+surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem"] }
 
 ssp = { path = "../../packages/ssp" }
 ssp-protocol = { path = "../../packages/ssp-protocol" }

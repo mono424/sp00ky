@@ -953,7 +953,18 @@ pub async fn view_history(
         return Err(api_error(StatusCode::BAD_REQUEST, "Unknown kind. Use registration, ingest or ingest_batch."));
     }
     let Some(db) = state.db() else { return Err(db_unavailable()) };
-    let stored = rows(&db, "SELECT samples FROM ONLY _00_sync_evidence:slow_operations;").await?;
+    // The SSP makes the table with its first slow operation; until then
+    // SurrealDB answers an error ("The table ... does not exist"), not nothing.
+    let stored = match db.handle().query("SELECT samples FROM ONLY _00_sync_evidence:slow_operations;").await
+        .and_then(|mut r| r.take::<Vec<Value>>(0))
+    {
+        Ok(rows) => rows,
+        Err(e) if crate::replica::is_missing_error(&e) => Vec::new(),
+        Err(e) => {
+            db.note_error(&format!("{e:#}"));
+            return Err(api_error(StatusCode::BAD_GATEWAY, format!("Database query failed: {e}")));
+        }
+    };
     let samples = stored.first().and_then(|row| row["samples"].as_array())
         .map(Vec::as_slice).unwrap_or(&[]);
     Ok(Json(history_payload(samples, &params, now_ms())))

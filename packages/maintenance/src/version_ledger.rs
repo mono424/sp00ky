@@ -158,6 +158,53 @@ pub fn spawn_migration(config: DbConfig) {
 mod tests {
     use super::*;
 
+    /// The runner end to end over the SDK's HTTP engine, against a server
+    /// that holds a legacy ledger in `kv`/`kv`. Skipped unless
+    /// `SPKY_LEDGER_TEST_URL` names one (e.g. `http://127.0.0.1:8000`, root/root):
+    ///
+    /// ```sh
+    /// SPKY_LEDGER_TEST_URL=http://127.0.0.1:8000 cargo test -p maintenance version_ledger -- --nocapture
+    /// ```
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runs_against_a_server() {
+        let Ok(url) = std::env::var("SPKY_LEDGER_TEST_URL") else {
+            eprintln!("SPKY_LEDGER_TEST_URL unset; skipping");
+            return;
+        };
+        let config = DbConfig {
+            url,
+            namespace: "kv".into(),
+            database: "kv".into(),
+            username: "root".into(),
+            password: "root".into(),
+        };
+        let db = ReconnectingDb::connect(&config).await.expect("connect");
+        let ledger = Ledger(Arc::clone(&db));
+        let head = ledger
+            .query_last(version_ledger::HEAD_QUERY)
+            .await
+            .expect("probe");
+        eprintln!("head before: {head}");
+        let started = Instant::now();
+        run_migration(Arc::clone(&db)).await;
+        eprintln!("migrated in {:?}", started.elapsed());
+        let head = ledger
+            .query_last(version_ledger::HEAD_QUERY)
+            .await
+            .expect("probe");
+        assert!(!version_ledger::head_is_legacy(&head), "{head}");
+        let errors = ledger
+            .query_last(
+                "BEGIN; CREATE _00_version:dup SET record_id = other:k1, version = 1; COMMIT;",
+            )
+            .await;
+        let e = errors.expect_err("the UNIQUE index still guards record_id");
+        assert!(
+            e.contains("idx_record_id"),
+            "the cause, not the generic transaction error: {e}"
+        );
+    }
+
     #[test]
     fn backoff_grows_and_is_capped() {
         assert_eq!(backoff(0), Duration::from_secs(5));

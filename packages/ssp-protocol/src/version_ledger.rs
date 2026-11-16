@@ -179,8 +179,10 @@ pub struct MigrationOptions {
 
 impl Default for MigrationOptions {
     fn default() -> Self {
-        // Measured on a 3M row ledger: a 1000-row step is about 100 ms on
-        // SurrealDB 4.0.1 (SurrealKV) and 3.3.5 (RocksDB) alike.
+        // Measured on 3M-row ledgers (2026-11-16, local Docker): a 1000-row
+        // step takes about 100 ms on SurrealDB 4.0.1 converted from 3.x and
+        // 130-150 ms on a fresh 4.0.1 (SurrealKV both), 350 ms on 3.3.5
+        // (RocksDB), flat from the first step to the last.
         Self {
             batch: 1000,
             pause_ms: 20,

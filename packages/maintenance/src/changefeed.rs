@@ -346,7 +346,7 @@ pub fn parse_show_changes(result: &Value) -> ParsedBatch {
                     out.skipped += 1;
                     continue;
                 };
-                if table == "_00_version" {
+                if table == "_00_version" || without_own_feed(&table) {
                     out.skipped += 1;
                     continue;
                 }
@@ -381,7 +381,7 @@ pub fn parse_show_changes(result: &Value) -> ParsedBatch {
                 out.skipped += 1;
                 continue;
             };
-            if table == "_00_version" || table == "_00_query" {
+            if table == "_00_version" || table == "_00_query" || without_own_feed(&table) {
                 out.skipped += 1;
                 continue;
             }
@@ -401,6 +401,17 @@ pub fn parse_show_changes(result: &Value) -> ParsedBatch {
         }
     }
     out
+}
+
+/// An internal table that has no changefeed of its own, so its changes reach
+/// the feed only while a database-wide one is armed: a SurrealDB upgrade arms
+/// `DEFINE DATABASE ... CHANGEFEED` for its replay, which feeds every table.
+/// Forwarding those would hand the ingest what it never takes, such as the
+/// SSPs' own `_00_list_ref_user_*` writes coming back to every SSP. User tables
+/// without a feed of their own are left to the ingest's `@nosync` guard: a
+/// synced one (a relation) is welcome on the path it was missing from.
+fn without_own_feed(table: &str) -> bool {
+    table.starts_with("_00_") && !CHANGEFEED_META_TABLES.contains(&table)
 }
 
 /// Whether a cursor has fallen behind the feed's retention. SurrealDB answers
@@ -1278,6 +1289,29 @@ mod tests {
         assert_eq!(stamp_ms(117271319528996864), 1789418327774);
         assert_eq!(stamp_from_ms(1789418327774) >> 16, 1789418327774);
         assert!(stamp_from_ms(1789418327774) <= 117271319528996864);
+    }
+
+    #[test]
+    fn a_database_wide_feed_leaves_internal_tables_without_their_own_out() {
+        // What SHOW CHANGES FOR DATABASE answers while an upgrade's
+        // `DEFINE DATABASE ... CHANGEFEED 3d INCLUDE ORIGINAL` is armed: every
+        // table, internal ones included.
+        let result = json!([{
+            "versionstamp": 7u64 << 16,
+            "changes": [
+                {"update": {"id": "thread:a", "title": "t"}},
+                {"update": {"id": "_00_list_ref_user_alice:x", "in": "thread:a"}},
+                {"delete": {"id": "_00_sync_evidence:slow_operations"}},
+                {"update": {"id": "_00_heartbeat:probe", "at": 1}},
+                {"current": {"id": "_00_user_feature:f", "variant": "on"}, "update": []},
+                {"update": {"id": "commented_on:r", "in": "user:a", "out": "thread:a"}}
+            ]
+        }]);
+        let batch = parse_show_changes(&result);
+        let tables: Vec<&str> = batch.records.iter().map(|r| r.table.as_str()).collect();
+        assert_eq!(tables, ["thread", "_00_heartbeat", "_00_user_feature", "commented_on"]);
+        assert_eq!(batch.skipped, 2);
+        assert_eq!(batch.records[2].op, ChangeOp::Update, "INCLUDE ORIGINAL keeps an update an update");
     }
 
     #[test]

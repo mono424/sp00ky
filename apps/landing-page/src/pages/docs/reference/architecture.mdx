@@ -288,6 +288,24 @@ tunnel. The `http` transport makes one call to the scheduler per write, and
 that call crosses the tunnel, which adds a small network cost to each write.
 `changefeed` has no call inside the transaction.
 
+### Row versions
+
+Every synced record has a version in the `_00_version` table, which the
+generated events bump in the writing transaction and which reaches clients as
+`_00_rv`; a client refetches a row when that number moves. The version row is
+keyed by its record (`_00_version:[game:a]`), so the events and every scan read
+and write it by key, at the same cost whatever the number of records and on
+every SurrealDB version. Releases up to 1.0.0-beta.3 gave version rows random
+ids and found them through an index, which SurrealDB 4 does not use inside an
+event: on a large app every write scanned the whole table.
+
+After an upgrade from such a release, the scheduler (or, in single-node mode,
+the SSP) moves the old rows to their new ids in the background, a few
+minutes per million rows, logging `Version ledger migration in progress` and
+then `Version ledger migrated`. Nothing waits for it: a write moves its own
+record's row if the migration has not reached it yet, and scans read both kinds
+until it is done.
+
 ### Schema changes
 
 Adding, changing or removing a table needs no restart and no re-clone. The

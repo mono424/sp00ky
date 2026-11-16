@@ -237,6 +237,7 @@ is always the committed file's.
 - **Migrations are checksum-tracked.** Editing a previously-applied migration file won't silently re-run; `spky migrate status` flags it. Use `--fix-checksums` only when you're sure the change is semantically a no-op.
 - **`sp00ky.yml` is the entry point.** The CLI never crawls for `.surql`; everything is wired explicitly through the config.
 - **Generation modes matter.** The `--mode` flag (`singlenode`, `cluster`, `surrealism`) changes what the generated client connects to. Default is `singlenode` (HTTP to a single SSP). `surrealism` embeds the WASM stream processor in-browser.
+- **Ledger accesses in generated events are key accesses.** `_00_version` rows are keyed by their record (`type::record('_00_version', [$after.id])`, see `docs/version-ledger.md`). Never add a `WHERE record_id = $after.id` (or any `UPDATE`/`DELETE ... WHERE` on a parameter) to an event body: SurrealDB 4.0.1 scans the table for it inside an event. `cargo test -p sp00ky-cli version_ledger` (plus `-- --include-ignored --test-threads=1` for the Docker 3.3.5/4.0.1 runs) fails if a write's cost grows with the ledger.
 - **Don't commit the bin output.** The Rust binary is built per-platform and shipped via the npm tarball under `dist/`.
 
 ## Pointers

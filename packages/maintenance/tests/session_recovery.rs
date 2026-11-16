@@ -142,7 +142,7 @@ async fn run_scenario() {
         .expect("reconnecting handle should work again after refresh");
 }
 
-/// A SurrealDB 3.1.5 container on a free port, removed on drop.
+/// A SurrealDB container ([`surreal_image`]) on a free port, removed on drop.
 struct Server {
     name: String,
     url: String,
@@ -153,7 +153,7 @@ impl Server {
         let _ = docker(&["rm", "-f", name]);
         let run = docker(&[
             "run", "-d", "--name", name, "-p", "127.0.0.1::8000",
-            "surrealdb/surrealdb:v3.1.5", "start", "--user", "root", "--pass", "root",
+            &surreal_image(), "start", "--user", "root", "--pass", "root",
         ]);
         assert!(run.status.success(), "docker run failed: {}", String::from_utf8_lossy(&run.stderr));
         let port = docker(&["port", name, "8000"]);
@@ -269,4 +269,10 @@ async fn refresh_under_load_never_wedges_the_shared_session() {
     assert_eq!(wedged, 0, "{wedged} of 150 bursts wedged");
     assert!(db.rotations() > 0, "the run never rotated, so rotation was not exercised");
     assert_eq!(db.reconnect_metrics().0, 1, "no probe should have needed a reconnect");
+}
+
+/// The SurrealDB image the Docker tests run against: `SPKY_TEST_SURREALDB_IMAGE`,
+/// so the same tests prove both server lines (e.g. `surrealdb/surrealdb:v4.0.1`).
+fn surreal_image() -> String {
+    std::env::var("SPKY_TEST_SURREALDB_IMAGE").unwrap_or_else(|_| "surrealdb/surrealdb:v3.1.5".to_string())
 }

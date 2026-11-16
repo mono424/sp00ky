@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use surrealdb::engine::local::{Db as MemEngine, Mem};
-use surrealdb::opt::capabilities::{Capabilities, ExperimentalFeature};
+use surrealdb::opt::capabilities::Capabilities;
 use surrealdb::opt::Config;
 use surrealdb::Surreal;
 
@@ -80,7 +80,7 @@ DEFINE TABLE _00_push_subscription SCHEMALESS;
 "#;
 
 async fn setup() -> MemDb {
-    let capabilities = Capabilities::all().with_experimental_feature_allowed(ExperimentalFeature::Files);
+    let capabilities = Capabilities::all();
     let db = Surreal::new::<Mem>(Config::new().capabilities(capabilities)).await.unwrap();
     db.use_ns("t").use_db("t").await.unwrap();
     db.query(SCHEMA).await.unwrap().check().unwrap();
@@ -712,7 +712,7 @@ async fn deleting_a_user_takes_their_internal_rows() {
 
 #[tokio::test]
 async fn a_project_without_users_says_so() {
-    let capabilities = Capabilities::all().with_experimental_feature_allowed(ExperimentalFeature::Files);
+    let capabilities = Capabilities::all();
     let inner = Surreal::new::<Mem>(Config::new().capabilities(capabilities)).await.unwrap();
     inner.use_ns("t").use_db("t").await.unwrap();
     let db = MemDb(Arc::new(inner));
@@ -735,7 +735,14 @@ fn feature_schema() -> &'static str {
 
 async fn setup_flags() -> MemDb {
     let db = setup().await;
+    // The fixture's `_00_user_feature` predates `evaluated_at`. SurrealDB 4, in
+    // a database at compatibility level 4 (one created on 4.x), refuses a new
+    // field whose TYPE does not accept NONE on a SCHEMAFULL table that has rows,
+    // so the row steps aside while the deployed definitions go in, and comes
+    // back with them.
+    db.0.query("DELETE _00_user_feature;").await.unwrap().check().unwrap();
     db.0.query(feature_schema()).await.unwrap().check().unwrap();
+    db.0.query("CREATE _00_user_feature SET user = user:alice, key = 'beta', variant = 'on';").await.unwrap().check().unwrap();
     db
 }
 

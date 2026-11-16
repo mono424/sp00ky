@@ -23,10 +23,21 @@ fn main() -> Result<()> {
         .unwrap_or(4);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
+        // The replica is an embedded SurrealDB 4, whose planner, lowering and
+        // drop recurse on the calling thread, where running out of stack aborts
+        // the process. The server raises its own threads' stacks for the same
+        // reason; tokio's default of 2 MiB overflowed on a permission-checked
+        // query in tests.
+        .thread_stack_size(EMBEDDED_DB_STACK)
         .enable_all()
         .build()?
         .block_on(run())
 }
+
+/// Stack for every runtime thread (workers and the blocking pool): what an
+/// embedded SurrealDB 4 needs. Reserved, not committed: a thread only uses the
+/// pages it touches.
+const EMBEDDED_DB_STACK: usize = 8 * 1024 * 1024;
 
 async fn run() -> Result<()> {
     // Initialize tracing. Without RUST_LOG, keep third-party crates at warn so

@@ -3779,9 +3779,14 @@ async fn warm_registration_stages_and_slow_evidence_include_metadata_wait() {
     // The background write need not be on the request path, but must retain a
     // slow warm request once scheduled.
     for _ in 0..100 {
-        let evidence = h.raw_db.query("SELECT samples FROM ONLY _00_sync_evidence:slow_operations").await.unwrap()
-            .take::<surrealdb::types::Value>(0).unwrap().into_json_value();
-        if evidence["samples"].as_array().is_some_and(|samples| !samples.is_empty()) { return; }
+        // Until the first write the table does not exist, which SurrealDB 4
+        // answers with an error rather than nothing.
+        if let Ok(evidence) = h.raw_db.query("SELECT samples FROM ONLY _00_sync_evidence:slow_operations").await.unwrap()
+            .take::<surrealdb::types::Value>(0)
+        {
+            let evidence = evidence.into_json_value();
+            if evidence["samples"].as_array().is_some_and(|samples| !samples.is_empty()) { return; }
+        }
         tokio::task::yield_now().await;
     }
     panic!("slow warm evidence was not persisted");

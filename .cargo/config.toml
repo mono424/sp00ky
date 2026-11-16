@@ -1,0 +1,7 @@
+[env]
+# Tests run an embedded SurrealDB 4 (kv-mem, and SurrealKV for the scheduler's
+# replica), which recurses on the calling thread and overflows the 2 MiB a test
+# thread gets by default; unoptimised frames are several times larger than in a
+# release build. The binaries set their own runtime stacks (scheduler,
+# ssp-portable).
+RUST_MIN_STACK = "8388608"

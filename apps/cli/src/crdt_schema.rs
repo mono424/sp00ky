@@ -542,7 +542,8 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
             "\n-- `{table}`: a deleted record takes its canonical documents along; the\n\
              -- SSP sweep removes orphaned log and presence rows.\n\
              DEFINE EVENT OVERWRITE _00_crdt_cleanup ON TABLE {table} WHEN $event = \"DELETE\" THEN {{\n\
-             \x20   DELETE {DOC_TABLE} WHERE doc = $before.id;\n\
+             \x20   LET $doc = $before.id;\n\
+             \x20   DELETE (SELECT VALUE id FROM {DOC_TABLE} WHERE doc = $doc);\n\
              }};\n"
         ));
     }

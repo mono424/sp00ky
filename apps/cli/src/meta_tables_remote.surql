@@ -430,6 +430,12 @@ DEFINE FIELD OVERWRITE payload ON TABLE _00_user_feature TYPE option<object> FLE
 -- flag posted once per user even when no assignment moved.
 DEFINE FIELD OVERWRITE evaluated_at ON TABLE _00_user_feature TYPE datetime DEFAULT time::now();
 DEFINE INDEX OVERWRITE idx_user_feature_user_key ON TABLE _00_user_feature COLUMNS user, key UNIQUE;
+-- Every flag-wide read filters on `key` alone: the scheduler's sweep
+-- (`SELECT VALUE <string>user FROM _00_user_feature WHERE key = $key`, per flag
+-- every 30 s), `fn::feature::materialize`, `spky flag` and the admin pages. The
+-- (user, key) index above cannot serve that (key is its second column), so each
+-- of them read the whole table: 1.6 s per flag on WhitePawn under SurrealDB 4.0.1.
+DEFINE INDEX OVERWRITE idx_user_feature_key ON TABLE _00_user_feature COLUMNS key;
 
 -- Stable hash for percentage rollouts. Combines flag key and user id
 -- so the same (flag, user) pair always lands in the same bucket 0..99
@@ -543,11 +549,20 @@ DEFINE FUNCTION OVERWRITE fn::feature::assign($flag: object, $ranked: array, $us
     LET $variant = IF $win = NONE { $flag.default_variant ?? 'off' } ELSE { $win.variant };
     LET $payload = ($flag.payloads ?? {})[$variant];
 
-    UPSERT _00_user_feature
-        SET evaluated_at = IF variant = $variant AND payload = $payload AND evaluated_at != NONE
-                { evaluated_at } ELSE { time::now() },
-            user = $user, key = $key, variant = $variant, payload = $payload
-        WHERE user = $user AND key = $key;
+    -- Find the row first, then write it by id. `UPSERT _00_user_feature ...
+    -- WHERE user = $user AND key = $key` inside a function body is a scan of
+    -- the whole table on SurrealDB 4.0.1 (an UPDATE / UPSERT / DELETE ... WHERE
+    -- in a body never uses its index there), once per user of a materialize.
+    LET $row = (SELECT VALUE id FROM _00_user_feature WHERE user = $user AND key = $key LIMIT 1)[0];
+    IF $row != NONE {
+        UPDATE $row
+            SET evaluated_at = IF variant = $variant AND payload = $payload AND evaluated_at != NONE
+                    { evaluated_at } ELSE { time::now() },
+                user = $user, key = $key, variant = $variant, payload = $payload;
+    } ELSE {
+        CREATE _00_user_feature
+            SET evaluated_at = time::now(), user = $user, key = $key, variant = $variant, payload = $payload;
+    };
     RETURN $variant;
 }
 PERMISSIONS WHERE $auth.id != NONE
@@ -563,7 +578,7 @@ DEFINE FUNCTION OVERWRITE fn::feature::materialize($key: string) -> object {
     -- Unknown/deleted flag: drop the orphaned assignments, mirroring the
     -- load_flag-failed branch of `flag.rs::materialize`.
     IF $flag = NONE {
-        DELETE _00_user_feature WHERE key = $key;
+        DELETE (SELECT VALUE id FROM _00_user_feature WHERE key = $key);
         RETURN { key: $key, found: false, users: 0 };
     };
 
@@ -658,7 +673,7 @@ DEFINE FUNCTION OVERWRITE fn::feature::allow($key: string, $variant: string, $us
         array::append($rules, { kind: 'allowlist', variant: $variant, users: [$uid], priority: 10 })
     };
 
-    UPDATE _00_feature_flag SET rules = $next WHERE key = $key;
+    UPDATE $flag.id SET rules = $next;
     RETURN fn::feature::reassign($key, $user);
 }
 PERMISSIONS WHERE $auth.id != NONE
@@ -683,7 +698,7 @@ DEFINE FUNCTION OVERWRITE fn::feature::disallow($key: string, $user: record) -> 
         } ELSE { $r };
     });
 
-    UPDATE _00_feature_flag SET rules = $next WHERE key = $key;
+    UPDATE $flag.id SET rules = $next;
     RETURN fn::feature::reassign($key, $user);
 }
 PERMISSIONS WHERE $auth.id != NONE

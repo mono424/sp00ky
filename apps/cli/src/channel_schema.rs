@@ -53,8 +53,12 @@ pub fn server_ddl(source: &str) -> Option<String> {
          DEFINE INDEX OVERWRITE {SIGNAL_TABLE}_sender ON TABLE {SIGNAL_TABLE} FIELDS sender, at;\n\
          -- A signal is only useful for the seconds a connection takes to set up.\n\
          -- Each new one sweeps its sender's stale rows, so the table stays tiny.\n\
+         -- Values bound first and the rows selected by id: SurrealDB 4.0.1 scans\n\
+         -- a `DELETE <table> WHERE ...` in an event body.\n\
          DEFINE EVENT OVERWRITE {SIGNAL_TABLE}_sweep ON TABLE {SIGNAL_TABLE} WHEN $event = \"CREATE\" THEN {{\n\
-         \x20 DELETE {SIGNAL_TABLE} WHERE sender = $after.sender AND at < time::now() - 2m;\n\
+         \x20 LET $sender = $after.sender;\n\
+         \x20 LET $stale = time::now() - 2m;\n\
+         \x20 DELETE (SELECT VALUE id FROM {SIGNAL_TABLE} WHERE sender = $sender AND at < $stale);\n\
          }};\n"
     ))
 }

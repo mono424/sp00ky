@@ -23,7 +23,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, SecondsFormat, Timelike, Utc};
 use serde_json::{json, Map, Value};
 
-use crate::db::{count_value, first_row, rows, ScheduleDb, ScheduleDbError};
+use crate::db::{count_value, first_row, last_rows, rows, ScheduleDb, ScheduleDbError};
 use crate::kill::JobKill;
 use crate::spec::{Concurrency, ScheduleKind, ScheduleSpec, HISTORY_FAILURES_ONLY};
 use crate::{ids, sql};
@@ -1550,7 +1550,7 @@ impl ScheduleEngine {
             let binds = [("before", before.clone()), ("batch", json!(DURABLE_PRUNE_BATCH)), ("status", json!(status))];
             match self.db.query(sql::PRUNE_DURABLE_INSTANCES, &binds).await {
                 Ok(results) => {
-                    let n = rows(results).len();
+                    let n = last_rows(results).len();
                     report.pruned += n;
                     if n < DURABLE_PRUNE_BATCH {
                         return;
@@ -1605,7 +1605,7 @@ impl ScheduleEngine {
             binds.extend(extra.iter().cloned());
             match self.db.query(stmt, &binds).await {
                 Ok(results) => {
-                    let doomed = rows(results);
+                    let doomed = last_rows(results);
                     let n = doomed.len();
                     report.pruned += n;
                     // Fold BEFORE deciding to stop: the rows are already deleted, so a

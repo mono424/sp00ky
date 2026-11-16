@@ -485,12 +485,16 @@ pub const DELETE_SCHEDULE_RUN: &str = "DELETE type::record($tb, $key)";
 /// runs: `advance_workflow` computes `all_terminal` with `Iterator::all`, which is
 /// `true` for an EMPTY step list, so a `running` run whose steps vanished gets
 /// flipped straight to `success` by the next pass.
+///
+/// One transaction of top-level statements, not a `RETURN { ... }` block: inside
+/// a block SurrealDB 4.0.1 runs `DELETE _00_step_run WHERE workflow_run = $run`
+/// as a scan of every step row (see [`PRUNE_SCHEDULE_RUNS`]).
 pub const DELETE_WORKFLOW_RUN_CASCADE: &str = "\
-RETURN { \
+BEGIN; \
 LET $run = type::record($tb, $key); \
 DELETE _00_step_run WHERE workflow_run = $run; \
 DELETE $run; \
-}";
+COMMIT;";
 
 /// Drop specific records by id.
 ///
@@ -600,9 +604,15 @@ pub const WORKFLOW_RUN_PRUNABLE: [&str; 3] = ["success", "failed", "killed"];
 ///   haul every payload back. Projecting `id, finished_at` and returning
 ///   `count($doomed)` gives the caller the batch size at a fraction of the bytes.
 ///
-/// Wrapped in `RETURN { ... }` so the whole thing is ONE statement with one
-/// result: [`crate::db::count_value`] reads only the first result entry, and a
-/// bare `LET` would shift the indices.
+/// Top-level statements in one transaction, the deleted batch returned last
+/// (read with [`crate::db::last_rows`]). Not a `RETURN { ... }` block:
+/// SurrealDB 4.0.1 plans statements inside a block expression from the
+/// block's own variables, and there a `DELETE ... WHERE x INSIDE $ids`, a
+/// `FOR` over `$ids` and a LET-bound equality all scan the table (the
+/// workflow prune took 1.2 s with nothing to prune on 300k steps, 2-5 s on
+/// WhitePawn; 151 s for the `FOR` form). The same statements at the top level
+/// use their indexes on 3.3.5 and 4.0.1 alike. See
+/// `docs/surrealdb-bugs/v4-block-param-index-scan.md`.
 /// `$except` holds the schedule names that carry their own `history:` window and
 /// are pruned separately by [`PRUNE_SCHEDULE_RUNS_FOR`]. Usually empty, in which
 /// case the predicate is trivially true and costs nothing.
@@ -611,28 +621,28 @@ pub const WORKFLOW_RUN_PRUNABLE: [&str; 3] = ["success", "failed", "killed"];
 /// but has no negated form of it, and the parse error surfaces only as a warning
 /// from the prune pass — i.e. retention silently stops working.
 pub const PRUNE_SCHEDULE_RUNS: &str = "\
-RETURN { \
+BEGIN; \
 LET $doomed = (SELECT id, schedule_name, finished_at, \
 time::floor(finished_at, 1h) AS bucket FROM _00_schedule_run \
 WHERE status = $status AND finished_at != NONE AND finished_at < <datetime>$before \
 AND schedule_name NOT IN $except \
 ORDER BY finished_at ASC LIMIT $batch); \
 DELETE $doomed.id; \
-RETURN $doomed; \
-}";
+COMMIT; \
+RETURN $doomed;";
 
 /// One schedule's history, on that schedule's own window. `schedule_name` is an
 /// extra equality on top of the same status/ordering plan.
 pub const PRUNE_SCHEDULE_RUNS_FOR: &str = "\
-RETURN { \
+BEGIN; \
 LET $doomed = (SELECT id, schedule_name, finished_at, \
 time::floor(finished_at, 1h) AS bucket FROM _00_schedule_run \
 WHERE status = $status AND schedule_name = $name \
 AND finished_at != NONE AND finished_at < <datetime>$before \
 ORDER BY finished_at ASC LIMIT $batch); \
 DELETE $doomed.id; \
-RETURN $doomed; \
-}";
+COMMIT; \
+RETURN $doomed;";
 
 /// Prune workflow runs together with their steps, oldest batch first.
 ///
@@ -646,7 +656,7 @@ RETURN $doomed; \
 /// BEFORE runs anyway (a run finalizes after its steps, so `run.finished_at >=
 /// step.finished_at`), so no database can be carrying orphans.
 pub const PRUNE_WORKFLOW_RUNS: &str = "\
-RETURN { \
+BEGIN; \
 LET $doomed = (SELECT id, schedule_name, finished_at, \
 time::floor(finished_at, 1h) AS bucket FROM _00_workflow_run \
 WHERE status = $status AND finished_at != NONE AND finished_at < <datetime>$before \
@@ -654,8 +664,8 @@ ORDER BY finished_at ASC LIMIT $batch); \
 LET $ids = $doomed.id; \
 DELETE _00_step_run WHERE workflow_run INSIDE $ids; \
 DELETE $ids; \
-RETURN $doomed; \
-}";
+COMMIT; \
+RETURN $doomed;";
 
 
 
@@ -663,7 +673,7 @@ RETURN $doomed; \
 /// window, with their steps and events. An instance can hold hundreds of
 /// steps, so the engine runs this with a smaller batch than the run prunes.
 pub const PRUNE_DURABLE_INSTANCES: &str = "\
-RETURN { \
+BEGIN; \
 LET $doomed = (SELECT id, finished_at FROM _00_wf_instance \
 WHERE status = $status AND finished_at != NONE AND finished_at < <datetime>$before \
 ORDER BY finished_at ASC LIMIT $batch); \
@@ -671,8 +681,8 @@ LET $ids = $doomed.id; \
 DELETE _00_wf_step WHERE instance INSIDE $ids; \
 DELETE _00_wf_event WHERE instance INSIDE $ids; \
 DELETE $ids; \
-RETURN $doomed; \
-}";
+COMMIT; \
+RETURN $doomed;";
 
 /// The durable instance statuses the prune takes, each with whether it keeps
 /// the failure window (true) or the success one.
@@ -707,14 +717,14 @@ WHERE history_success_secs != NONE OR history_failed_secs != NONE";
 /// status at a time, and the status list it iterates contains neither.
 pub fn prune_job_table(table: &str) -> String {
     format!(
-        "RETURN {{ \
+        "BEGIN; \
          LET $doomed = (SELECT id, updated_at, time::floor(updated_at, 1h) AS bucket \
          FROM {table} \
          WHERE status = $status AND updated_at < <datetime>$before \
          ORDER BY updated_at ASC LIMIT $batch); \
          DELETE $doomed.id; \
-         RETURN $doomed; \
-         }}"
+         COMMIT; \
+         RETURN $doomed;"
     )
 }
 
@@ -1100,13 +1110,23 @@ mod tests {
         }
     }
 
-    /// Every prune is one statement (so `count_value` reads its count) and is
-    /// bounded by a batch limit (so a backlog drains without one giant transaction
-    /// full of per-row ingest events).
+    /// Every prune is one transaction of top-level statements answering with the
+    /// deleted batch last (read by `last_rows`), never a `RETURN { ... }` block
+    /// (SurrealDB 4.0.1 scans inside blocks), and is bounded by a batch limit (so
+    /// a backlog drains without one giant transaction full of per-row ingest
+    /// events).
     #[test]
     fn prunes_are_single_batched_statements() {
-        for sql in [PRUNE_SCHEDULE_RUNS, PRUNE_WORKFLOW_RUNS] {
-            assert!(sql.starts_with("RETURN {"), "prune must be one block: {sql}");
+        for sql in [
+            PRUNE_SCHEDULE_RUNS,
+            PRUNE_SCHEDULE_RUNS_FOR,
+            PRUNE_WORKFLOW_RUNS,
+            PRUNE_DURABLE_INSTANCES,
+            &prune_job_table("job"),
+        ] {
+            assert!(sql.starts_with("BEGIN; "), "prune must be one transaction: {sql}");
+            assert!(sql.ends_with("COMMIT; RETURN $doomed;"), "prune must answer with the batch last: {sql}");
+            assert!(!sql.contains('{'), "prune must not use a block expression: {sql}");
             assert!(sql.contains("LIMIT $batch"), "prune must be batched: {sql}");
             assert!(!sql.contains("RETURN BEFORE"), "prune must not haul rows back: {sql}");
         }
@@ -1333,7 +1353,8 @@ mod tests {
     #[test]
     fn the_workflow_cascade_deletes_steps_before_the_run() {
         let sql = DELETE_WORKFLOW_RUN_CASCADE;
-        assert!(sql.starts_with("RETURN {"), "must be one statement: {sql}");
+        assert!(sql.starts_with("BEGIN; ") && sql.ends_with("COMMIT;"), "must be one transaction: {sql}");
+        assert!(!sql.contains('{'), "must not use a block expression: {sql}");
         let steps = sql.find("DELETE _00_step_run").expect("deletes steps");
         let run = sql.rfind("DELETE $run").expect("deletes the run");
         assert!(steps < run, "steps must go first: {sql}");

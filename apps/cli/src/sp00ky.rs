@@ -167,6 +167,54 @@ fn relation_endpoints(table: &TableSchema, row: &str) -> String {
         .collect()
 }
 
+/// The ledger half of a `_00_<table>_mutation` event: bump the record's row
+/// in `_00_version` and leave the new version in `$sp00ky_ver`.
+///
+/// The row is keyed by the record (`_00_version:[game:a]`), so the bump is a
+/// key read and a key write. It used to be `UPDATE _00_version ... WHERE
+/// record_id = $after.id`, an index lookup that SurrealDB 4.0.1 plans as a
+/// scan of the whole ledger inside an event body: one write cost 14 s on a
+/// 3M row ledger (WhitePawn, 2026-11-16). See `docs/version-ledger.md` and
+/// `ssp_protocol::version_ledger`.
+///
+/// A record whose row still has a random id (written before keyed rows) has
+/// no keyed row yet: its first UPDATE carries the old version over, deleting
+/// the old row first so the UNIQUE index on `record_id` never holds two rows
+/// for it. That lookup binds the id with `LET` first, the form both SurrealDB
+/// lines plan as an index read, and stops being hit once the scheduler's
+/// migration has moved every row. A CREATE never looks: a new record has no
+/// old row (an orphan one fails the UNIQUE index exactly as it did before).
+fn version_bump() -> String {
+    let keyed = ssp_protocol::version_ledger::keyed_row("$sp00ky_rid");
+    format!(
+        "    LET $sp00ky_rid = $after.id;\n\
+         \x20   LET $sp00ky_vk = {keyed};\n\
+         \x20   LET $sp00ky_ver = IF $event = \"CREATE\" OR record::exists($sp00ky_vk) {{\n\
+         \x20       (UPSERT ONLY $sp00ky_vk SET record_id = $sp00ky_rid, version += 1 RETURN VALUE version)\n\
+         \x20   }} ELSE {{\n\
+         \x20       LET $sp00ky_old = (SELECT id, version FROM _00_version WHERE record_id = $sp00ky_rid);\n\
+         \x20       DELETE $sp00ky_old.id;\n\
+         \x20       (CREATE ONLY $sp00ky_vk SET record_id = $sp00ky_rid, version = ($sp00ky_old[0].version ?? 0) + 1 RETURN VALUE version)\n\
+         \x20   }};\n"
+    )
+}
+
+/// The ledger half of a `_00_<table>_delete` event: drop the record's row,
+/// by key, or (a row from before keyed rows) by its `record_id`. See
+/// [`version_bump`].
+fn version_drop() -> String {
+    let keyed = ssp_protocol::version_ledger::keyed_row("$sp00ky_rid");
+    format!(
+        "    LET $sp00ky_rid = $before.id;\n\
+         \x20   LET $sp00ky_vk = {keyed};\n\
+         \x20   IF record::exists($sp00ky_vk) {{\n\
+         \x20       DELETE $sp00ky_vk;\n\
+         \x20   }} ELSE {{\n\
+         \x20       DELETE (SELECT VALUE id FROM _00_version WHERE record_id = $sp00ky_rid);\n\
+         \x20   }};\n"
+    )
+}
+
 pub fn generate_sp00ky_events(
     tables: &BTreeMap<String, TableSchema>,
     _raw_content: &str,
@@ -280,14 +328,8 @@ pub fn generate_sp00ky_events(
         events.push_str("WHEN $before != $after AND $event != \"DELETE\"\nTHEN {\n");
 
         // --- Versioning Logic ---
-        events.push_str("    LET $sp00ky_ver_rec = IF $event = \"CREATE\" {\n");
-        events.push_str(
-            "        (CREATE _00_version SET record_id = $after.id, version = 1 RETURN AFTER)\n",
-        );
-        events.push_str("    } ELSE IF $event = \"UPDATE\" {\n");
-        events.push_str("        (UPDATE _00_version SET version += 1 WHERE record_id = $after.id RETURN AFTER)\n");
-        events.push_str("    };\n");
-        events.push_str("    LET $sp00ky_ver = $sp00ky_ver_rec[0].version;\n\n");
+        events.push_str(&version_bump());
+        events.push('\n');
 
         // --- Ingestion Logic ---
         events.push_str("    LET $plain_after = {\n");
@@ -332,7 +374,7 @@ pub fn generate_sp00ky_events(
                 }
             }
         }
-        events.push_str("        _00_rv: (SELECT VALUE version FROM ONLY _00_version WHERE record_id = $after.id)\n");
+        events.push_str("        _00_rv: $sp00ky_ver\n");
         events.push_str("    };\n");
 
         if post_ingest {
@@ -366,7 +408,8 @@ pub fn generate_sp00ky_events(
         events.push_str("WHEN $event = \"DELETE\"\nTHEN {\n");
 
         // --- Versioning Logic ---
-        events.push_str("    DELETE _00_version WHERE record_id = $before.id;\n\n");
+        events.push_str(&version_drop());
+        events.push('\n');
         // `@crdt` documents are cleaned up by their own `_00_crdt_cleanup`
         // event (see crdt_schema.rs), log and presence rows by the SSP sweep.
 
@@ -433,15 +476,7 @@ pub fn generate_sp00ky_events(
     events.push_str("-- Table: _00_user_feature Mutation (server-written; ingest-notify)\n");
     events.push_str("DEFINE EVENT OVERWRITE _00_user_feature_mutation ON TABLE _00_user_feature\n");
     events.push_str("WHEN $before != $after AND $event != \"DELETE\"\nTHEN {\n");
-    events.push_str("    LET $sp00ky_ver_rec = IF $event = \"CREATE\" {\n");
-    events.push_str(
-        "        (CREATE _00_version SET record_id = $after.id, version = 1 RETURN AFTER)\n",
-    );
-    events.push_str("    } ELSE {\n");
-    events.push_str(
-        "        (UPDATE _00_version SET version += 1 WHERE record_id = $after.id RETURN AFTER)\n",
-    );
-    events.push_str("    };\n");
+    events.push_str(&version_bump());
     events.push_str("    LET $plain_after = {\n");
     events.push_str("        id: <string>($after.id OR \"\"),\n");
     events.push_str("        user: <string>($after.user OR \"\"),\n");
@@ -449,7 +484,7 @@ pub fn generate_sp00ky_events(
     events.push_str("        variant: $after.variant,\n");
     events.push_str("        payload: $after.payload,\n");
     events.push_str("        evaluated_at: <string>($after.evaluated_at OR \"\"),\n");
-    events.push_str("        _00_rv: (SELECT VALUE version FROM ONLY _00_version WHERE record_id = $after.id)\n");
+    events.push_str("        _00_rv: $sp00ky_ver\n");
     events.push_str("    };\n");
     if post_ingest {
         events.push_str("    LET $payload = {\n");
@@ -469,7 +504,7 @@ pub fn generate_sp00ky_events(
     events.push_str("-- Table: _00_user_feature Deletion (ingest-notify)\n");
     events.push_str("DEFINE EVENT OVERWRITE _00_user_feature_delete ON TABLE _00_user_feature\n");
     events.push_str("WHEN $event = \"DELETE\"\nTHEN {\n");
-    events.push_str("    DELETE _00_version WHERE record_id = $before.id;\n");
+    events.push_str(&version_drop());
     events.push_str("    LET $plain_before = {\n");
     events.push_str("        id: <string>($before.id OR \"\"),\n");
     events.push_str("        user: <string>($before.user OR \"\"),\n");
@@ -503,15 +538,7 @@ pub fn generate_sp00ky_events(
     events.push_str("-- Table: _00_app_release Mutation (server-written; ingest-notify)\n");
     events.push_str("DEFINE EVENT OVERWRITE _00_app_release_mutation ON TABLE _00_app_release\n");
     events.push_str("WHEN $before != $after AND $event != \"DELETE\"\nTHEN {\n");
-    events.push_str("    LET $sp00ky_ver_rec = IF $event = \"CREATE\" {\n");
-    events.push_str(
-        "        (CREATE _00_version SET record_id = $after.id, version = 1 RETURN AFTER)\n",
-    );
-    events.push_str("    } ELSE {\n");
-    events.push_str(
-        "        (UPDATE _00_version SET version += 1 WHERE record_id = $after.id RETURN AFTER)\n",
-    );
-    events.push_str("    };\n");
+    events.push_str(&version_bump());
     events.push_str("    LET $plain_after = {\n");
     events.push_str("        id: <string>($after.id OR \"\"),\n");
     events.push_str("        app: $after.app,\n");
@@ -519,7 +546,7 @@ pub fn generate_sp00ky_events(
     events.push_str("        cache_bust: $after.cache_bust,\n");
     events.push_str("        mandatory: $after.mandatory,\n");
     events.push_str("        released_at: <string>($after.released_at OR \"\"),\n");
-    events.push_str("        _00_rv: (SELECT VALUE version FROM ONLY _00_version WHERE record_id = $after.id)\n");
+    events.push_str("        _00_rv: $sp00ky_ver\n");
     events.push_str("    };\n");
     if post_ingest {
         events.push_str("    LET $payload = {\n");
@@ -575,7 +602,7 @@ pub fn generate_sp00ky_events(
     events.push_str("-- Table: _00_app_release Deletion (ingest-notify)\n");
     events.push_str("DEFINE EVENT OVERWRITE _00_app_release_delete ON TABLE _00_app_release\n");
     events.push_str("WHEN $event = \"DELETE\"\nTHEN {\n");
-    events.push_str("    DELETE _00_version WHERE record_id = $before.id;\n");
+    events.push_str(&version_drop());
     events.push_str("    LET $plain_before = {\n");
     events.push_str("        id: <string>($before.id OR \"\"),\n");
     events.push_str("        app: $before.app,\n");
@@ -668,8 +695,8 @@ DEFINE FIELD body ON TABLE doc TYPE string;
         );
         assert!(out.contains("DEFINE EVENT OVERWRITE _00_doc_mutation"));
         assert!(out.contains("DEFINE EVENT OVERWRITE _00_doc_delete"));
-        assert!(out.contains("CREATE _00_version SET record_id = $after.id"), "version rows still written");
-        assert!(out.contains("DELETE _00_version WHERE record_id = $before.id"));
+        assert!(out.contains("UPSERT ONLY $sp00ky_vk SET record_id = $sp00ky_rid, version += 1"), "version rows still written");
+        assert!(out.contains("DELETE $sp00ky_vk;"));
         assert!(!out.contains("http::post"), "no network call inside the transaction");
         assert!(!out.contains("mod::dbsp::ingest"), "not the surrealism path either");
         // The http transport on the same schema still posts.
@@ -955,7 +982,7 @@ DEFINE FIELD body ON TABLE doc TYPE string;
         // A CRDT field is the folded plain text: it syncs.
         assert!(out.contains("body: $after.body"), "got:\n{out}");
         assert!(
-            out.contains("_00_rv: (SELECT VALUE version FROM ONLY _00_version"),
+            out.contains("_00_rv: $sp00ky_ver\n"),
             "the record version must still be stamped:\n{out}"
         );
     }
@@ -1027,6 +1054,52 @@ DEFINE FIELD body ON TABLE doc TYPE string;
             let sql = format!("DEFINE TABLE _00_push_message SCHEMALESS;\n{}", push_message_events(post));
             if let Err(e) = surrealdb_core::syn::parse_with_capabilities(&sql, &Capabilities::all()) {
                 panic!("push message event (post={post}) does not parse:\n{sql}\n-> {e}");
+            }
+        }
+    }
+
+    /// Every ledger access of the generated events is a key access on
+    /// `_00_version:[<record>]`. The only `record_id` lookups are the
+    /// fallbacks for a row from before keyed rows, behind `record::exists`,
+    /// with the id bound by `LET` first (SurrealDB 4.0.1 scans the ledger for
+    /// `WHERE record_id = $after.id` inside an event, and for every
+    /// `UPDATE`/`DELETE ... WHERE record_id = ...` there). See
+    /// `version_ledger_tests` for what that cost.
+    #[test]
+    fn ledger_accesses_are_keyed_with_a_legacy_fallback_only() {
+        use crate::parser::SchemaParser;
+        let schema = "DEFINE TABLE doc SCHEMAFULL;\nDEFINE FIELD body ON TABLE doc TYPE string;\n";
+        let mut parser = SchemaParser::new();
+        parser.parse_file(schema).unwrap();
+        for transport in [SyncTransport::Http, SyncTransport::Changefeed] {
+            let out = generate_sp00ky_events(&parser.tables, schema, false, &DeployMode::Cluster, None, None, transport);
+            for event in ["_00_doc_mutation", "_00_user_feature_mutation", "_00_app_release_mutation"] {
+                let start = out.find(&format!("DEFINE EVENT OVERWRITE {event} ")).unwrap_or_else(|| panic!("{event}"));
+                let body = &out[start..start + out[start..].find("\n};\n").unwrap()];
+                assert!(body.contains("LET $sp00ky_rid = $after.id;\n    LET $sp00ky_vk = type::record('_00_version', [$sp00ky_rid]);"), "{body}");
+                assert!(body.contains("IF $event = \"CREATE\" OR record::exists($sp00ky_vk) {"), "{body}");
+                assert!(body.contains("_00_rv: $sp00ky_ver\n"), "{body}");
+            }
+            for event in ["_00_doc_delete", "_00_user_feature_delete", "_00_app_release_delete"] {
+                let start = out.find(&format!("DEFINE EVENT OVERWRITE {event} ")).unwrap_or_else(|| panic!("{event}"));
+                let body = &out[start..start + out[start..].find("\n};\n").unwrap()];
+                assert!(body.contains("LET $sp00ky_rid = $before.id;\n    LET $sp00ky_vk = type::record('_00_version', [$sp00ky_rid]);"), "{body}");
+                assert!(body.contains("IF record::exists($sp00ky_vk) {\n        DELETE $sp00ky_vk;"), "{body}");
+            }
+            // No index lookup on a parameter path, and no UPDATE/DELETE by
+            // `record_id` at all.
+            for bad in [
+                "record_id = $after.id",
+                "record_id = $before.id",
+                "UPDATE _00_version",
+                "DELETE _00_version WHERE",
+                "FROM ONLY _00_version",
+            ] {
+                assert!(!out.contains(bad), "`{bad}` is back in the generated events:\n{out}");
+            }
+            assert_eq!(out.matches("WHERE record_id = $sp00ky_rid").count(), 6, "one fallback per mutation and delete event");
+            if let Err(e) = surrealdb_core::syn::parse_with_capabilities(&out, &surrealdb_core::dbs::Capabilities::all()) {
+                panic!("generated events do not parse: {e}\n{out}");
             }
         }
     }

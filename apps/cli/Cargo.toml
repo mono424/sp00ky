@@ -52,5 +52,5 @@ ureq = { version = "2.9", features = ["json"] }
 # Push SQL tests (`push_db_tests.rs`): the CLI itself only speaks HTTP, and the
 # CLI's own `surrealdb-core` is the 2.x parser.
 surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 

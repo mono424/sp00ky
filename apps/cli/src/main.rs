@@ -28,6 +28,8 @@ mod port_check;
 mod push_cmd;
 #[cfg(test)]
 mod push_db_tests;
+#[cfg(test)]
+mod version_ledger_tests;
 mod push_sync;
 mod query;
 mod scaffold;

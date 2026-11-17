@@ -68,6 +68,10 @@ The upgrade needs room on the database's disk (a little over the size of the dat
 Projects with a scheduler (the VM plans) are offered the 4.x step once their scheduler and SSP run sp00ky 1.0.0-beta.3 or newer, whose SurrealDB SDK talks to both 3.x and 4.x: run `spky deploy --upgrade` first. Until then they stop at the newest 3.x, and `spky db upgrade status` says which build holds them back. Pay-as-you-go projects can take both steps. The free plan's shared database and a database of your own (`surrealdb.endpoint`) are not upgraded from here.
 </Note>
 
+<Warning>
+Deploy with a sp00ky release newer than 1.0.0-beta.3 before you move to 4.x. Up to beta.3, the events sp00ky generates look up each record's version through an index that SurrealDB 4 does not use inside an event, so on 4.x every synced write scans the whole version table: seconds per write once an app holds millions of records. Newer releases key that table by record (see [row versions](/docs/reference/architecture#row-versions)). A project already on 4.x gets the fix from `spky deploy --upgrade` with a newer CLI: writes are fast again as soon as the deploy applies the new events, and the scheduler moves the old version rows in the background.
+</Warning>
+
 <CardGrid>
   <LinkCard title="Backups" href="/docs/cloud/backups" description="What the upgrade takes first, and how to restore one." />
   <LinkCard title="Console" href="/docs/cloud/console" description="The same upgrade, with its progress on screen." />

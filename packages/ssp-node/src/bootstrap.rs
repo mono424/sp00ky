@@ -59,16 +59,33 @@ pub struct LoadedSchema {
     pub version_lookup: ssp_protocol::VersionLookup,
 }
 
-/// The ledger lookup the server plans as an index read, from its `/version`.
-/// The SurrealDB 3 form when the version cannot be read.
+/// How a scan starting now reads row versions from the `_00_version` ledger:
+/// by key alone once no legacy (random id) row remains, else by key with the
+/// legacy lookup as a fallback, in the form this server plans as an index
+/// read. Resolved per scan, never kept: the ledger migration finishing and a
+/// server upgrade both change the answer under a running node, and a form
+/// picked for one SurrealDB major scans the ledger for every row on the
+/// other. A probe that fails keeps the fallback, which is always correct.
 pub(crate) async fn version_lookup(db: &dyn Db) -> ssp_protocol::VersionLookup {
-    match db.version().await {
-        Ok(v) => ssp_protocol::VersionLookup::for_server(&v),
+    use ssp_protocol::version_ledger;
+    let legacy = match db.query(version_ledger::HEAD_QUERY, &[]).await {
+        Ok(answers) => answers.first().is_some_and(version_ledger::head_is_legacy),
         Err(e) => {
-            warn!(error = %e, "server version unavailable; reading row versions the SurrealDB 3 way");
-            ssp_protocol::VersionLookup::default()
+            warn!(error = %e, "could not probe the version ledger; reading legacy rows too");
+            true
         }
+    };
+    if !legacy {
+        return ssp_protocol::VersionLookup::Keyed;
     }
+    let server = match db.version().await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(error = %e, "server version unavailable; reading legacy row versions the SurrealDB 3 way");
+            None
+        }
+    };
+    ssp_protocol::VersionLookup::for_ledger(server.as_deref(), true)
 }
 
 /// Read upstream's schema probe ([`INFO_FOR_DB`] plus the CLI's

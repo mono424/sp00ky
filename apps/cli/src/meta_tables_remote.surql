@@ -287,7 +287,11 @@ DEFINE EVENT OVERWRITE _00_dbsp_cleanup ON TABLE _00_query WHEN $event = "DELETE
 
 -- ==================================================
 -- SPOOKY VERSION
--- Tracks the version of every record for sync.
+-- Tracks the version of every record for sync. Each row is keyed by the
+-- record it versions (_00_version:[game:a]), so the generated events and the
+-- SSP/scheduler scans read it by key: SurrealDB 4.0.1 scans the table for a
+-- `WHERE record_id = $after.id` inside an event. Rows with random ids are
+-- from before that; the scheduler moves them. See docs/version-ledger.md.
 -- Permission inherits from the linked record: dereferencing record_id under
 -- the caller's permission context returns NONE when the user can't read the
 -- target row, which makes the version row invisible too.

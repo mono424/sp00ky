@@ -786,7 +786,19 @@ fn make_defines_overwrite(sql: &str) -> String {
 ///
 /// A changed definition, a missing index, or an unreadable `INFO FOR TABLE`
 /// keeps the statement: a rebuild is then the right thing, or the safe one.
-fn prune_unchanged_index_defines(client: &dyn MigrationDB, sql: &str) -> (String, usize) {
+/// With `concurrently` (a server engine) a kept statement builds
+/// `CONCURRENTLY`: SurrealDB 4.0.1 makes a blocking build wait for every write
+/// transaction older than it, up to 60 s each (`WRITE_BARRIER_WAIT`), so on a
+/// busy database every new or changed index held the apply request a minute
+/// and two of them ran past the CLI's 120 s HTTP timeout (measured with this
+/// release's schema on a WhitePawn-sized 4.0.1 database). A concurrent build
+/// runs on the server whatever happens to the request, so a timeout cannot cut
+/// it off part way either.
+fn prune_unchanged_index_defines(
+    client: &dyn MigrationDB,
+    sql: &str,
+    concurrently: bool,
+) -> (String, usize) {
     use std::collections::HashMap;
     // table -> its live indexes (name -> definition); None when INFO failed.
     let mut live: HashMap<String, Option<HashMap<String, String>>> = HashMap::new();
@@ -820,6 +832,10 @@ fn prune_unchanged_index_defines(client: &dyn MigrationDB, sql: &str) -> (String
         if unchanged {
             pruned += 1;
             out.push_str(&format!("-- index {name} on {table} unchanged; not rebuilt"));
+        } else if concurrently && !stmt.to_ascii_uppercase().contains(" CONCURRENTLY") {
+            // a trailing clause, before the `;`
+            let body = stmt.trim_end().trim_end_matches(';').trim_end();
+            out.push_str(&format!("{body} CONCURRENTLY;"));
         } else {
             out.push_str(stmt);
         }
@@ -865,7 +881,7 @@ fn normalize_index_define(stmt: &str) -> String {
         let t = raw[i];
         let is = |s: &str| t.eq_ignore_ascii_case(s);
         let after_on = toks.last().map(|p| p.eq_ignore_ascii_case("ON")).unwrap_or(false);
-        if is("OVERWRITE") {
+        if is("OVERWRITE") || is("CONCURRENTLY") {
         } else if is("IF")
             && raw.get(i + 1).map(|x| x.eq_ignore_ascii_case("NOT")).unwrap_or(false)
             && raw.get(i + 2).map(|x| x.eq_ignore_ascii_case("EXISTS")).unwrap_or(false)
@@ -1233,7 +1249,9 @@ pub fn apply_internal_schema(
     // 5. Never rebuild an index that has not changed. The hash above covers the
     // assembled SQL; what runs is that SQL minus the index statements whose
     // live definition already matches (see prune_unchanged_index_defines).
-    let (internal_sql, unchanged_indexes) = prune_unchanged_index_defines(client, &internal_sql);
+    let concurrently = matches!(mode, DeployMode::Singlenode | DeployMode::Cluster);
+    let (internal_sql, unchanged_indexes) =
+        prune_unchanged_index_defines(client, &internal_sql, concurrently);
     if unchanged_indexes > 0 {
         ui::detail(format!(
             "{} unchanged index(es) kept as-is (no rebuild)",
@@ -2428,7 +2446,7 @@ mod tests {
                    DEFINE INDEX OVERWRITE idx_new ON TABLE _00_feature_flag COLUMNS key UNIQUE;\n\
                    DEFINE EVENT OVERWRITE e ON TABLE _00_version WHEN true THEN { RETURN 1; };";
 
-        let (out, pruned) = prune_unchanged_index_defines(&db, sql);
+        let (out, pruned) = prune_unchanged_index_defines(&db, sql, false);
         assert_eq!(pruned, 1);
         assert!(
             !out.contains("DEFINE INDEX OVERWRITE idx_record_id"),
@@ -2456,10 +2474,51 @@ mod tests {
         assert_eq!(infos, 1);
 
         // Nothing readable about the live schema: every statement stays.
-        let (out2, pruned2) = prune_unchanged_index_defines(&MockDB::new(), sql);
+        let (out2, pruned2) = prune_unchanged_index_defines(&MockDB::new(), sql, false);
         assert_eq!(pruned2, 0);
         assert!(out2.contains(
             "DEFINE INDEX OVERWRITE idx_record_id ON TABLE _00_version COLUMNS record_id UNIQUE;"
         ));
+    }
+
+    /// On a server engine the indexes that do get (re)defined build
+    /// `CONCURRENTLY`: a blocking build on SurrealDB 4.0.1 waits up to 60 s for
+    /// the write transactions older than it, which held a deploy past the
+    /// CLI's HTTP timeout. An unchanged one still compares equal to its live
+    /// definition with the clause on our side.
+    #[test]
+    fn redefined_indexes_build_concurrently_on_servers() {
+        let db = MockDB::new();
+        db.set_live_indexes(
+            "_00_version",
+            &[(
+                "idx_record_id",
+                "DEFINE INDEX idx_record_id ON _00_version FIELDS record_id UNIQUE",
+            )],
+        );
+        let sql = "DEFINE INDEX OVERWRITE idx_record_id ON TABLE _00_version COLUMNS record_id UNIQUE CONCURRENTLY;\n\
+                   DEFINE INDEX OVERWRITE idx_new ON TABLE _00_user_feature COLUMNS user;\n\
+                   DEFINE INDEX IF NOT EXISTS idx_job ON job COLUMNS status, created_at CONCURRENTLY;";
+        let (out, pruned) = prune_unchanged_index_defines(&db, sql, true);
+        assert_eq!(pruned, 1, "{out}");
+        assert!(
+            out.contains(
+                "DEFINE INDEX OVERWRITE idx_new ON TABLE _00_user_feature COLUMNS user CONCURRENTLY;"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "DEFINE INDEX IF NOT EXISTS idx_job ON job COLUMNS status, created_at CONCURRENTLY;"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("CONCURRENTLY CONCURRENTLY"), "{out}");
+        if let Err(e) = surrealdb_core::syn::parse_with_capabilities(
+            &out,
+            &surrealdb_core::dbs::Capabilities::all(),
+        ) {
+            panic!("does not parse: {e}\n{out}");
+        }
     }
 }

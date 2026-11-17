@@ -104,7 +104,7 @@ LET $sp00ky_vk = type::record('_00_version', [$sp00ky_rid]);
 LET $sp00ky_ver = IF $event = "CREATE" OR record::exists($sp00ky_vk) {
     (UPSERT ONLY $sp00ky_vk SET record_id = $sp00ky_rid, version += 1 RETURN VALUE version)
 } ELSE {
-    LET $sp00ky_old = (SELECT id, version FROM _00_version WHERE record_id = $sp00ky_rid);
+    LET $sp00ky_old = (SELECT VALUE (SELECT id, version FROM _00_version WHERE record_id = $parent.r) FROM ONLY { r: $sp00ky_rid });
     DELETE $sp00ky_old.id;
     (CREATE ONLY $sp00ky_vk SET record_id = $sp00ky_rid, version = ($sp00ky_old[0].version ?? 0) + 1 RETURN VALUE version)
 };
@@ -116,16 +116,25 @@ LET $sp00ky_vk = type::record('_00_version', [$sp00ky_rid]);
 IF record::exists($sp00ky_vk) {
     DELETE $sp00ky_vk;
 } ELSE {
-    DELETE (SELECT VALUE id FROM _00_version WHERE record_id = $sp00ky_rid);
+    DELETE (SELECT VALUE (SELECT VALUE id FROM _00_version WHERE record_id = $parent.r) FROM ONLY { r: $sp00ky_rid });
 };
 ```
+
+The `ELSE` branches look a legacy row up with a correlated subquery over a
+one-field object. A `LET`-bound `WHERE record_id = $sp00ky_rid` is an index
+read when root writes, but SurrealDB 4.0.1 plans it as a scan of the whole
+ledger when a record user's write fires the event: 3.9 s per write on a 3M
+row ledger locally, a steady 19 s per client write on WhitePawn
+(2026-11-17), 18 ms for the same write as root. The correlated form is an
+index read for root and record users on both lines; see
+`docs/surrealdb-bugs/v4-record-user-event-scan.md`.
 
 The `ELSE` branches are the transition: a record whose ledger row still has a
 random id moves it to the keyed id on its first write, deleting the old row
 first so the UNIQUE index never holds two rows for one record. They bind the id
-with `LET` at the top of the body, the one shape both lines plan as an index
-read (measured 4 to 6 ms on 4.0.1 with 3M legacy rows), and they stop being hit
-once the migration below has run. A `CREATE` never takes the fallback: a new
+with `LET` at the top of the body and look the row up in the correlated form
+above (4 to 70 ms on 4.0.1 and 3.3.5 with 3M legacy rows, root or record
+user), and they stop being hit once the migration below has run. A `CREATE` never takes the fallback: a new
 record has no old row. An orphaned legacy row for a re-created record fails the
 UNIQUE index, exactly as the old `CREATE _00_version` did, until the migration
 has moved it; after that the keyed row simply continues its version.

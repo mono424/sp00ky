@@ -69,10 +69,10 @@ impl fmt::Display for Finding {
 }
 
 /// Parameters an event or function body receives from SurrealDB rather than
-/// from a `LET` of its own.
-const EVENT_VALUES: &[&str] = &[
-    "$after", "$before", "$value", "$input", "$this", "$parent", "$event",
-];
+/// from a `LET` of its own. (`$parent` and `$this` are left out: inside a
+/// subquery they are the outer document, the correlated form that keeps an
+/// index, see `sp00ky::LEDGER_LOOKUP_ROWS`.)
+const EVENT_VALUES: &[&str] = &["$after", "$before", "$value", "$input", "$event"];
 
 /// Every finding in a schema source.
 pub fn lint(source: &str) -> Vec<Finding> {

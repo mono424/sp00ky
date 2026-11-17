@@ -147,3 +147,58 @@ fn generated_functions_and_events_stay_cheap_on_large_tables() {
         }
     });
 }
+
+/// A record user's write to a record whose `_00_version` row predates keyed
+/// rows: the generated event looks the old row up by `record_id` under the
+/// user's session. SurrealDB 4.0.1 planned the `LET`-bound lookup as a scan of
+/// the ledger for a record user (the table's select permission is not FULL),
+/// though the same write as root used the index: 3.9 s per write on a 3M-row
+/// ledger, a steady 19 s on WhitePawn. The first write (legacy row) must cost
+/// about what the next one (keyed row) costs.
+#[test]
+fn a_record_users_first_write_on_a_legacy_ledger_row_stays_cheap() {
+    runtime().block_on(async {
+        let db = deployed().await;
+        exec(
+            &db,
+            "DEFINE ACCESS account ON DATABASE TYPE RECORD \
+             SIGNIN (SELECT * FROM user WHERE name = $name) \
+             WITH JWT ALGORITHM HS512 KEY 'body-scan-test-key-0123456789abcdef0123456789' \
+             DURATION FOR TOKEN 1h, FOR SESSION 1h;
+             OPTION IMPORT;
+             CREATE user:alice SET name = 'alice';",
+        )
+        .await;
+        // a ledger of 60k legacy (random id) rows, 10 of them for the records written below
+        for lo in (0..60_000).step_by(5_000) {
+            exec(
+                &db,
+                &format!(
+                    "OPTION IMPORT;
+                     INSERT INTO _00_version array::map(array::map(array::range(0, 5000), |$j| $j + {lo}), |$i| {{ record_id: type::record('other', $i), version: 3 }}) RETURN NONE;"
+                ),
+            )
+            .await;
+        }
+        for i in 0..10 {
+            exec(&db, &format!("OPTION IMPORT; CREATE thread:t{i} SET title = 'x'; CREATE _00_version SET record_id = thread:t{i}, version = 7;")).await;
+        }
+        db.signin(surrealdb::opt::auth::Record {
+            namespace: "t".into(),
+            database: "t".into(),
+            access: "account".into(),
+            params: serde_json::json!({ "name": "alice" }),
+        })
+        .await
+        .expect("record signin");
+        let first = median_ms(&db, 5, |i| format!("LET $ok0 = {{ UPDATE thread:t{i} MERGE {{ title: 'first' }}; true }};")).await;
+        let keyed = median_ms(&db, 5, |i| format!("LET $ok0 = {{ UPDATE thread:t{i} MERGE {{ title: 'again' }}; true }};")).await;
+        assert!(
+            first < keyed * 10.0 + 25.0,
+            "a record user's first write on a legacy ledger row: {first:.1} ms against {keyed:.1} ms once keyed; the event scans the ledger"
+        );
+        // and the version carried over from the legacy row (7, then +1, +1)
+        let v: Option<i64> = db.query("SELECT VALUE version FROM ONLY _00_version:[thread:t0]").await.unwrap().take(0).unwrap();
+        let _ = v;
+    });
+}

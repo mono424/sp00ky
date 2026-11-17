@@ -545,11 +545,18 @@ DEFINE FUNCTION OVERWRITE fn::feature::put($user: record, $key: string, $variant
     -- 5,000-user flag took 25-42 s), 4.0.1 cannot use the (user, key) index
     -- in a body; through `user` it is one row per flag the user has, on both.
     LET $row = IF $access = NONE {
-        (SELECT VALUE id FROM _00_user_feature WITH INDEX idx_user_feature_user
+        (SELECT id, variant, payload, evaluated_at FROM _00_user_feature WITH INDEX idx_user_feature_user
             WHERE user = $user AND key = $key LIMIT 1)[0]
     } ELSE { NONE };
+    -- An assignment that did not move is not written at all: rewriting it
+    -- byte for byte stored the same row (the ingest event skipped it) but
+    -- still paid a write, about 3 ms each on SurrealDB 4.0.1 with WhitePawn's
+    -- changefeeds and events, 16 s for a 5,000-user flag.
+    IF $row != NONE AND $row.variant = $variant AND $row.payload = $payload AND $row.evaluated_at != NONE {
+        RETURN $variant;
+    };
     IF $row != NONE {
-        UPDATE $row
+        UPDATE $row.id
             SET evaluated_at = IF variant = $variant AND payload = $payload AND evaluated_at != NONE
                     { evaluated_at } ELSE { time::now() },
                 user = $user, key = $key, variant = $variant, payload = $payload;

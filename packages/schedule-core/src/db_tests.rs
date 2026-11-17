@@ -3933,10 +3933,11 @@ async fn prunes_with_nothing_due_stay_cheap_on_a_large_history() {
         );
     }
     // a due batch costs about the same per row on either history, and its
-    // steps go with it
+    // steps (and an instance's steps and events) go with it
     let due = json!(stamp(Utc::now() + Duration::days(1)));
     for (name, select, status, delete, batch) in [
         ("workflow runs", crate::sql::PRUNE_WORKFLOW_RUNS, "success", crate::sql::delete_workflow_runs as fn(usize) -> String, 500),
+        ("durable instances", crate::sql::PRUNE_DURABLE_INSTANCES, "complete", crate::sql::delete_durable_instances, 100),
     ] {
         let mut per_row = Vec::new();
         for h in [&small, &large] {
@@ -3958,6 +3959,8 @@ async fn prunes_with_nothing_due_stay_cheap_on_a_large_history() {
         async move { raw.query(sql).await.unwrap().take::<Option<i64>>(0).unwrap().unwrap_or(0) }
     };
     assert_eq!(count("SELECT VALUE count() FROM _00_step_run GROUP ALL").await, (40_000 - 500) * 3, "the runs' steps go with them");
+    assert_eq!(count("SELECT VALUE count() FROM _00_wf_step GROUP ALL").await, 40_000 - 100, "the instances' steps go with them");
+    assert_eq!(count("SELECT VALUE count() FROM _00_wf_event GROUP ALL").await, 40_000 - 100, "the instances' events go with them");
 }
 
 /// The workflow prune selects a batch in one request and deletes it in

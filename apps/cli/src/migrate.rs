@@ -794,16 +794,23 @@ fn make_defines_overwrite(sql: &str) -> String {
 /// release's schema on a WhitePawn-sized 4.0.1 database). A concurrent build
 /// runs on the server whatever happens to the request, so a timeout cannot cut
 /// it off part way either.
+///
+/// A live index whose definition matches but whose build ended in an error
+/// (a `CONCURRENTLY` build of a UNIQUE index over duplicates) counts as
+/// changed: `INFO FOR TABLE` still lists its definition, but the planner never
+/// uses it, so it is defined again. One whose build is still running is left
+/// to finish and listed with the builds to wait for.
 fn prune_unchanged_index_defines(
     client: &dyn MigrationDB,
     sql: &str,
     concurrently: bool,
-) -> (String, usize) {
+) -> PrunedIndexes {
     use std::collections::HashMap;
     // table -> its live indexes (name -> definition); None when INFO failed.
     let mut live: HashMap<String, Option<HashMap<String, String>>> = HashMap::new();
     let mut out = String::with_capacity(sql.len());
     let mut pruned = 0;
+    let mut building = Vec::new();
     let mut cursor = 0;
     while let Some(rel) = sql[cursor..].find("DEFINE INDEX ") {
         let start = cursor + rel;
@@ -824,24 +831,131 @@ fn prune_unchanged_index_defines(
         let indexes = live
             .entry(table.clone())
             .or_insert_with(|| read_live_indexes(client, &table));
-        let unchanged = indexes
+        let same_definition = indexes
             .as_ref()
             .and_then(|m| m.get(&name))
             .map(|def| normalize_index_define(def) == normalize_index_define(stmt))
             .unwrap_or(false);
+        let state = if same_definition {
+            index_build_state(client, &name, &table)
+        } else {
+            None
+        };
+        let unchanged = same_definition && !matches!(state, Some(BuildState::Failed(_)));
         if unchanged {
             pruned += 1;
             out.push_str(&format!("-- index {name} on {table} unchanged; not rebuilt"));
-        } else if concurrently && !stmt.to_ascii_uppercase().contains(" CONCURRENTLY") {
-            // a trailing clause, before the `;`
-            let body = stmt.trim_end().trim_end_matches(';').trim_end();
-            out.push_str(&format!("{body} CONCURRENTLY;"));
+            if matches!(state, Some(BuildState::Building(_))) {
+                building.push((name, table));
+            }
+        } else if concurrently {
+            if stmt.to_ascii_uppercase().contains(" CONCURRENTLY") {
+                out.push_str(stmt);
+            } else {
+                // a trailing clause, before the `;`
+                let body = stmt.trim_end().trim_end_matches(';').trim_end();
+                out.push_str(&format!("{body} CONCURRENTLY;"));
+            }
+            building.push((name, table));
         } else {
             out.push_str(stmt);
         }
     }
     out.push_str(&sql[cursor..]);
-    (out, pruned)
+    PrunedIndexes { sql: out, unchanged: pruned, building }
+}
+
+/// What [`prune_unchanged_index_defines`] leaves to run.
+struct PrunedIndexes {
+    sql: String,
+    /// Index statements dropped because the live index already matches.
+    unchanged: usize,
+    /// `(index, table)` of every build the SQL starts `CONCURRENTLY`, and of
+    /// unchanged indexes whose earlier build has not finished: the apply
+    /// waits for these before it records the schema hash.
+    building: Vec<(String, String)>,
+}
+
+/// Where an index's build stands, per `INFO FOR INDEX` (`building.status`:
+/// `started` and other in-progress phases, `ready`, `error` with an `error`
+/// message; the same keys on 3.3.5 and 4.0.1).
+#[derive(Debug, Clone, PartialEq)]
+enum BuildState {
+    Ready,
+    Building(String),
+    Failed(String),
+}
+
+/// `None` when the index does not exist or `INFO FOR INDEX` failed.
+fn index_build_state(client: &dyn MigrationDB, name: &str, table: &str) -> Option<BuildState> {
+    let responses = client
+        .execute(&format!("INFO FOR INDEX {name} ON {table};"))
+        .ok()?;
+    let ok = responses.into_iter().find(|r| r.status == "OK")?;
+    let info = ok.result?;
+    let Some(building) = info.get("building") else {
+        return Some(BuildState::Ready);
+    };
+    let status = building
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("ready")
+        .to_string();
+    Some(match status.as_str() {
+        "ready" => BuildState::Ready,
+        s if s == "error" || s.contains("abort") => BuildState::Failed(
+            building
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+                .unwrap_or(status),
+        ),
+        _ => BuildState::Building(status),
+    })
+}
+
+/// How long an apply waits for its `CONCURRENTLY` index builds
+/// (`SPKY_INDEX_BUILD_TIMEOUT_SECS`, default 600).
+fn index_build_timeout() -> std::time::Duration {
+    let secs = std::env::var("SPKY_INDEX_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(600);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Wait until every listed index is built. `Ok(true)`: all ready; `Ok(false)`:
+/// some still building when `timeout` ran out; `Err`: a build failed (or was
+/// aborted), with the index and SurrealDB's reason. An index that cannot be
+/// read is not waited for (the statement that defined it would have failed).
+fn wait_for_index_builds(
+    client: &dyn MigrationDB,
+    indexes: &[(String, String)],
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<bool> {
+    let started = std::time::Instant::now();
+    let mut pending: Vec<&(String, String)> = indexes.iter().collect();
+    loop {
+        let mut still = Vec::new();
+        for ix in pending {
+            match index_build_state(client, &ix.0, &ix.1) {
+                Some(BuildState::Building(_)) => still.push(ix),
+                Some(BuildState::Failed(reason)) => {
+                    anyhow::bail!("index {} on {} failed to build: {reason}", ix.0, ix.1)
+                }
+                Some(BuildState::Ready) | None => {}
+            }
+        }
+        if still.is_empty() {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        pending = still;
+        std::thread::sleep(poll);
+    }
 }
 
 /// `(index name, table)` of a `DEFINE INDEX [OVERWRITE|IF NOT EXISTS] <name> ON
@@ -1250,8 +1364,11 @@ pub fn apply_internal_schema(
     // assembled SQL; what runs is that SQL minus the index statements whose
     // live definition already matches (see prune_unchanged_index_defines).
     let concurrently = matches!(mode, DeployMode::Singlenode | DeployMode::Cluster);
-    let (internal_sql, unchanged_indexes) =
-        prune_unchanged_index_defines(client, &internal_sql, concurrently);
+    let PrunedIndexes {
+        sql: internal_sql,
+        unchanged: unchanged_indexes,
+        building,
+    } = prune_unchanged_index_defines(client, &internal_sql, concurrently);
     if unchanged_indexes > 0 {
         ui::detail(format!(
             "{} unchanged index(es) kept as-is (no rebuild)",
@@ -1270,10 +1387,46 @@ pub fn apply_internal_schema(
         return Err(e).context("Failed to apply internal Sp00ky schema");
     }
 
-    // Record the applied hash only after a successful execute. The
-    // _00_schema_state table is defined by the internal_sql we just ran, so it
-    // exists by now.
-    record_schema_hash(client, "internal", &hash);
+    // The `CONCURRENTLY` builds run on after the request returns. Wait for
+    // them: a build that fails (a UNIQUE index over duplicates) leaves an index
+    // the planner never uses but `INFO FOR TABLE` still lists, so it fails the
+    // apply; one still running at the timeout leaves the hash unrecorded, so
+    // the next apply looks at it again.
+    let mut built = true;
+    if !building.is_empty() {
+        step.set_message(format!("building {} index(es)", building.len()));
+        match wait_for_index_builds(
+            client,
+            &building,
+            index_build_timeout(),
+            std::time::Duration::from_millis(500),
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                built = false;
+                ui::warn(format!(
+                    "index builds still running after {}s: {}; the schema hash is not recorded, so the next apply checks them again",
+                    index_build_timeout().as_secs(),
+                    building
+                        .iter()
+                        .map(|(ix, tb)| format!("{ix} on {tb}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            Err(e) => {
+                step.fail("failed");
+                return Err(e).context("Failed to build the internal Sp00ky schema's indexes");
+            }
+        }
+    }
+
+    // Record the applied hash only after a successful execute and finished
+    // index builds. The _00_schema_state table is defined by the internal_sql
+    // we just ran, so it exists by now.
+    if built {
+        record_schema_hash(client, "internal", &hash);
+    }
 
     step.done(format!(
         "applied{}{} tables{}{} events",
@@ -1468,6 +1621,9 @@ mod tests {
         // `indexes` map. A table not listed here answers with an ERR (as a
         // missing table does).
         live_indexes: RefCell<std::collections::HashMap<String, Vec<(String, String)>>>,
+        // Build statuses answered to `INFO FOR INDEX <ix> ON <t>;`, in order
+        // (the last one repeats); an index not listed is `ready`.
+        index_statuses: RefCell<std::collections::HashMap<String, Vec<String>>>,
     }
 
     impl MockDB {
@@ -1479,7 +1635,15 @@ mod tests {
                 fail_execute: RefCell::new(false),
                 stored_hash: RefCell::new(None),
                 live_indexes: RefCell::new(Default::default()),
+                index_statuses: RefCell::new(Default::default()),
             }
+        }
+
+        fn set_index_statuses(&self, index: &str, table: &str, statuses: &[&str]) {
+            self.index_statuses.borrow_mut().insert(
+                format!("{index} ON {table}"),
+                statuses.iter().map(|s| s.to_string()).collect(),
+            );
         }
 
         fn set_live_indexes(&self, table: &str, indexes: &[(&str, &str)]) {
@@ -1544,6 +1708,26 @@ mod tests {
                 return Ok(vec![SurrealResponse {
                     status: "OK".to_string(),
                     result: Some(result),
+                }]);
+            }
+            if let Some(key) = query
+                .strip_prefix("INFO FOR INDEX ")
+                .and_then(|q| q.strip_suffix(';'))
+            {
+                let mut statuses = self.index_statuses.borrow_mut();
+                let status = match statuses.get_mut(key) {
+                    Some(list) if list.len() > 1 => list.remove(0),
+                    Some(list) => list.first().cloned().unwrap_or_else(|| "ready".into()),
+                    None => "ready".into(),
+                };
+                let building = if status == "error" {
+                    serde_json::json!({ "status": "error", "error": "Database index `x` already contains 1" })
+                } else {
+                    serde_json::json!({ "status": status })
+                };
+                return Ok(vec![SurrealResponse {
+                    status: "OK".to_string(),
+                    result: Some(serde_json::json!({ "building": building })),
                 }]);
             }
             if let Some(table) = query
@@ -2446,7 +2630,8 @@ mod tests {
                    DEFINE INDEX OVERWRITE idx_new ON TABLE _00_feature_flag COLUMNS key UNIQUE;\n\
                    DEFINE EVENT OVERWRITE e ON TABLE _00_version WHEN true THEN { RETURN 1; };";
 
-        let (out, pruned) = prune_unchanged_index_defines(&db, sql, false);
+        let PrunedIndexes { sql: out, unchanged: pruned, .. } =
+            prune_unchanged_index_defines(&db, sql, false);
         assert_eq!(pruned, 1);
         assert!(
             !out.contains("DEFINE INDEX OVERWRITE idx_record_id"),
@@ -2474,11 +2659,86 @@ mod tests {
         assert_eq!(infos, 1);
 
         // Nothing readable about the live schema: every statement stays.
-        let (out2, pruned2) = prune_unchanged_index_defines(&MockDB::new(), sql, false);
+        let PrunedIndexes { sql: out2, unchanged: pruned2, .. } =
+            prune_unchanged_index_defines(&MockDB::new(), sql, false);
         assert_eq!(pruned2, 0);
         assert!(out2.contains(
             "DEFINE INDEX OVERWRITE idx_record_id ON TABLE _00_version COLUMNS record_id UNIQUE;"
         ));
+    }
+
+    /// A live index whose build failed is defined again (the planner never
+    /// uses it, though `INFO FOR TABLE` lists it); one still building is left
+    /// alone and waited for.
+    #[test]
+    fn a_failed_build_is_redefined_and_a_running_one_waited_for() {
+        let db = MockDB::new();
+        db.set_live_indexes(
+            "t",
+            &[("a", "DEFINE INDEX a ON t FIELDS x"), ("b", "DEFINE INDEX b ON t FIELDS y")],
+        );
+        db.set_index_statuses("a", "t", &["error"]);
+        db.set_index_statuses("b", "t", &["started"]);
+        let sql = "DEFINE INDEX OVERWRITE a ON TABLE t COLUMNS x;\n\
+                   DEFINE INDEX OVERWRITE b ON TABLE t COLUMNS y;";
+        let p = prune_unchanged_index_defines(&db, sql, true);
+        assert_eq!(p.unchanged, 1, "{}", p.sql);
+        assert!(p.sql.contains("DEFINE INDEX OVERWRITE a ON TABLE t COLUMNS x CONCURRENTLY;"), "{}", p.sql);
+        assert!(p.sql.contains("-- index b on t unchanged; not rebuilt"), "{}", p.sql);
+        assert_eq!(
+            p.building,
+            vec![("a".to_string(), "t".to_string()), ("b".to_string(), "t".to_string())]
+        );
+    }
+
+    #[test]
+    fn index_builds_are_waited_for_until_ready_failed_or_timed_out() {
+        use std::time::Duration;
+        let ix = |n: &str| vec![(n.to_string(), "t".to_string())];
+        let db = MockDB::new();
+        db.set_index_statuses("a", "t", &["started", "started", "ready"]);
+        assert!(wait_for_index_builds(&db, &ix("a"), Duration::from_secs(5), Duration::from_millis(1)).unwrap());
+        db.set_index_statuses("b", "t", &["started"]);
+        assert!(!wait_for_index_builds(&db, &ix("b"), Duration::ZERO, Duration::from_millis(1)).unwrap());
+        db.set_index_statuses("c", "t", &["started", "error"]);
+        let err = wait_for_index_builds(&db, &ix("c"), Duration::from_secs(5), Duration::from_millis(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("index c on t failed to build"), "{err}");
+    }
+
+    /// A concurrent build that fails (a UNIQUE index over duplicates) fails
+    /// the apply and leaves the schema hash unrecorded, so the next apply
+    /// defines the index again instead of skipping an unusable one.
+    #[test]
+    fn a_failed_index_build_fails_the_apply_and_records_no_hash() {
+        let dir = TempDir::new().unwrap();
+        let schema = dir.path().join("schema.surql");
+        fs::write(&schema, "DEFINE TABLE message SCHEMAFULL;\nDEFINE FIELD body ON TABLE message TYPE string;\n")
+            .unwrap();
+        let recorded = |m: &MockDB| {
+            m.executed_queries
+                .borrow()
+                .iter()
+                .any(|s| s.contains("UPSERT _00_schema_state:internal"))
+        };
+        let mock = MockDB::new();
+        mock.set_index_statuses("idx_record_id", "_00_version", &["started", "error"]);
+        let err = apply_internal_schema(&mock, &schema, None, &DeployMode::Cluster, None, None, &mut Vec::new)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("idx_record_id on _00_version failed to build"), "{err:#}");
+        assert!(!recorded(&mock));
+        let ddl = mock
+            .executed_queries
+            .borrow()
+            .iter()
+            .find(|s| s.contains("DEFINE INDEX OVERWRITE idx_record_id"))
+            .cloned()
+            .unwrap();
+        assert!(ddl.contains("ON TABLE _00_version COLUMNS record_id UNIQUE CONCURRENTLY;"));
+
+        let mock = MockDB::new();
+        apply_internal_schema(&mock, &schema, None, &DeployMode::Cluster, None, None, &mut Vec::new).unwrap();
+        assert!(recorded(&mock), "every build ready: the hash is recorded");
     }
 
     /// On a server engine the indexes that do get (re)defined build
@@ -2499,7 +2759,15 @@ mod tests {
         let sql = "DEFINE INDEX OVERWRITE idx_record_id ON TABLE _00_version COLUMNS record_id UNIQUE CONCURRENTLY;\n\
                    DEFINE INDEX OVERWRITE idx_new ON TABLE _00_user_feature COLUMNS user;\n\
                    DEFINE INDEX IF NOT EXISTS idx_job ON job COLUMNS status, created_at CONCURRENTLY;";
-        let (out, pruned) = prune_unchanged_index_defines(&db, sql, true);
+        let PrunedIndexes { sql: out, unchanged: pruned, building } =
+            prune_unchanged_index_defines(&db, sql, true);
+        assert_eq!(
+            building,
+            vec![
+                ("idx_new".to_string(), "_00_user_feature".to_string()),
+                ("idx_job".to_string(), "job".to_string())
+            ]
+        );
         assert_eq!(pruned, 1, "{out}");
         assert!(
             out.contains(

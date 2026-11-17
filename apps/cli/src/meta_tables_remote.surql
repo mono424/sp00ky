@@ -544,6 +544,8 @@ DEFINE FUNCTION OVERWRITE fn::feature::put($user: record, $key: string, $variant
     -- the `key` index and filters every row of the flag (materializing a
     -- 5,000-user flag took 25-42 s), 4.0.1 cannot use the (user, key) index
     -- in a body; through `user` it is one row per flag the user has, on both.
+    -- (`spky migrate apply` waits for the index to build before it records the
+    -- schema as applied, and fails the apply if the build fails.)
     LET $row = IF $access = NONE {
         (SELECT id, variant, payload, evaluated_at FROM _00_user_feature WITH INDEX idx_user_feature_user
             WHERE user = $user AND key = $key LIMIT 1)[0]

@@ -17,7 +17,7 @@ Your backends can be written in anything that speaks HTTP, because we ship Docke
 More traffic showed up? <code>spky scale ssp 3</code>. That is the ritual.
     The sync layer grows horizontally, the rest stays put. Set a default in
 <code>sp00ky.yml</code> and you will not have to think about it again.
-</p> <h2>Logs you actually want to read</h2> <p> <code>spky logs</code> tails everything live. Filter by service, stack two
+</p> <h2>Logs you actually want to read</h2> <p> <code>spky logs</code> tails everything live, SurrealDB's own log included. Filter by service, stack two
     services in a split view, grep with a real regex on the server, or open an
     interactive TUI with scroll, search, and a follow toggle. It feels like the logging
     tool you always meant to build.

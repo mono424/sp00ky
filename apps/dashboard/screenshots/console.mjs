@@ -21,6 +21,11 @@
  * Settings > Machines is the same, with `?host=` : `pending` (project host on cx23
  * with an upgrade waiting, the default), `waiting` (cx33 not available yet),
  * `upgrading`, `failed`, `current` (nothing to upgrade) or `none` (no VMs of its own).
+ *
+ * Logs > surrealdb streams a made-up SurrealDB log from `/v1/projects/:id/logs`:
+ * two hours of history, then a line every few seconds. `staging-lab`'s
+ * dashboard does not answer, so it opens on the cloud's pages alone, where the
+ * database's log is the one source.
  */
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -466,6 +471,48 @@ function linkRoute(method, id, body) {
   return [200, at];
 }
 
+/* SurrealDB's log, the way the cloud's `/logs` stream sends it. */
+
+const SLOW = [
+  'SELECT VALUE source_id FROM game WHERE database = $coll AND source = $source',
+  'DELETE email_notice WHERE sent_at = NONE AND claimed_at < time::now() - 1h',
+  'SELECT count() AS total FROM game GROUP ALL',
+  'CREATE type::record($tb, $key) CONTENT $content',
+];
+
+/** The cloud's frames for one SurrealDB line at `t`, split where the message has newlines. */
+function dbFrames(t, level, target, message) {
+  const at = new Date(t).toISOString();
+  const stamp = at.replace('Z', '123Z');
+  const lines = `${stamp}  ${level} ${target}: ${message}`.split('\n');
+  return lines.map((m) => `data: ${JSON.stringify({ timestamp: at.replace('Z', '456789Z'), service: 'surrealdb', stream: 'stderr', message: m })}\n\n`).join('');
+}
+
+function dbLine(t, i) {
+  if (i % 41 === 7) return dbFrames(t, 'ERROR', 'surrealdb::net', 'Error processing RPC request: The query was not executed due to a cancelled transaction');
+  if (i % 23 === 3) return dbFrames(t, 'WARN', 'surrealdb_server::rpc::websocket', 'Closing a WebSocket whose client stopped reading its notifications');
+  if (i % 37 === 11) return dbFrames(t, 'WARN', 'surrealdb_core::kvs::slowlog', `Slow query detected - time: ${(2 + (i % 9)).toFixed(3)}s - query: SELECT id, sort_index\n  FROM game\n  WHERE insights_computed_at = NONE\n  ORDER BY sort_index LIMIT 4 - params: [  ]`);
+  if (i % 3 === 0) return dbFrames(t, 'WARN', 'surrealdb_core::kvs::slowlog', `Slow query detected - time: ${(1 + (i % 7) * 0.31).toFixed(6)}s - query: ${SLOW[i % SLOW.length]} - params: [  ]`);
+  return dbFrames(t, 'INFO', 'surrealdb::net', `Started web server on 0.0.0.0:8000 (session ${(i * 2654435761 % 0xffffff).toString(16)})`);
+}
+
+function dbLogStream(req, res, url) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+  res.write(': connected\n\n');
+  const since = Date.parse(url.searchParams.get('since') ?? '') || Date.now() - 2 * H;
+  const from = Math.max(since, Date.now() - 2 * H);
+  let i = 0;
+  let history = '';
+  for (let t = from; t < Date.now(); t += 9_000 + ((i * 7919) % 30_000)) history += dbLine(t, i++);
+  // The store takes a moment to answer, as the real one does.
+  const opening = setTimeout(() => res.write(history), 300);
+  const tick = setInterval(() => res.write(dbLine(Date.now(), i++)), 3_000);
+  req.on('close', () => {
+    clearTimeout(opening);
+    clearInterval(tick);
+  });
+}
+
 function cloudRoute(method, path, url, body) {
   FRESH.projects = ONBOARDING.project ? [NEW_PROJECT(ONBOARDING.project)] : [];
   if (path === '/console/me') {
@@ -486,6 +533,8 @@ function cloudRoute(method, path, url, body) {
   if ((m = path.match(/^\/console\/projects\/([^/]+)\/grant$/)) && method === 'POST') {
     const p = WORKSPACES.flatMap((w) => w.projects).find((x) => x.id === m[1]);
     if (p?.platform === 'cloudflare') return [200, { grant: 'fx', admin_url: `${ORIGIN}/cf`, admin: 'ssp', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
+    // A dashboard that does not answer (its database is down, say).
+    if (p?.slug === 'staging-lab') return [200, { grant: 'fx', admin_url: `${ORIGIN}/down`, admin: 'scheduler', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
     return [200, { grant: 'fixture-grant', admin_url: `${ORIGIN}/fx`, admin: 'scheduler', scope: 'full', expires_at: Math.floor(now / 1000) + 60 }];
   }
   if ((m = path.match(/^\/projects\/([^/]+)\/database\/upgrade(?:\/(cutover|cancel|finish|rollback))?$/))) return upgradeRoute(method, m[1], m[2], body);
@@ -567,6 +616,7 @@ createServer(async (req, res) => {
   if (url.searchParams.has('host')) hostScenario = url.searchParams.get('host') || null;
   if (url.pathname.startsWith('/v1/')) {
     if (signedOut) return json(401, { error: 'missing authorization header', code: 'unauthorized' });
+    if (/^\/v1\/projects\/[^/]+\/logs$/.test(url.pathname)) return dbLogStream(req, res, url);
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const sent = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined;

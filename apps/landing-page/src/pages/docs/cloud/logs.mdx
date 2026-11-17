@@ -78,7 +78,11 @@ logLevel: info,ssp=debug,scheduler=trace`;
 
 ## Viewing Logs
 
-Tail logs from your cloud deployment in real time:
+Tail logs from your cloud deployment in real time. The stream covers every
+service, SurrealDB included: the database's own log sits next to the
+scheduler, SSP, backend and frontend lines, so a database error or restart
+shows up in the same place as the sync trouble it causes. Use
+`--filter surrealdb` to read it on its own.
 
 <CodeBlock
   code={code3}
@@ -103,6 +107,10 @@ same scheduler and SSP sources, with the SSP picked per instance: a histogram of
 live tail. It is the quicker route when
 you are already looking at a cluster's health, and it works against a self-hosted scheduler,
 where `spky logs` has no cloud deployment to talk to.
+
+In the [console](/docs/cloud/console), the Logs page also has a `surrealdb` source with the
+database's log from this same stream. It stays reachable when the project's dashboard cannot
+open, which a stopped database is a common reason for.
 
 ## Setting Log Level
 

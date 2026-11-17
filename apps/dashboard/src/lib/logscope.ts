@@ -167,6 +167,36 @@ export function appendNew(buf: Line[], incoming: readonly Line[]): number {
 }
 
 /**
+ * Every line of `incoming` that `buf` lacks, put in its place, in place;
+ * returns how many. For a source whose order is loose: the cloud's log store
+ * can deliver a line from before the last one held (a database host ships its
+ * log in batches), and that line belongs in the buffer, not dropped as
+ * `appendNew` would. A line resent across a reconnect is not doubled, and two
+ * real lines alike in one millisecond both stay.
+ */
+export function mergeLines(buf: Line[], incoming: readonly Line[]): number {
+  // What `buf` held at each instant before this call, so lines this call adds
+  // are never mistaken for ones it already had.
+  const held = new Map<number, Map<string, number>>();
+  const heldFor = (ts: number) => {
+    let h = held.get(ts);
+    if (!h) {
+      h = new Map();
+      for (let i = lowerBound(buf, ts); i < buf.length && buf[i].ts === ts; i++) h.set(ident(buf[i]), (h.get(ident(buf[i])) ?? 0) + 1);
+      held.set(ts, h);
+    }
+    return h;
+  };
+  let added = 0;
+  for (const l of incoming) {
+    if (take(heldFor(l.ts), l)) continue;
+    insert(buf, l);
+    added++;
+  }
+  return added;
+}
+
+/**
  * `older` in front of `buf`: the history fetched once, behind what the socket
  * has already delivered. Only what lies before `buf`'s first instant is new
  * (plus lines at that instant `buf` lacks); the rest `buf` already holds.
@@ -184,6 +214,56 @@ export function prependOlder(buf: readonly Line[], older: readonly Line[]): Line
     if (l.ts < first || (l.ts === first && !take(held, l))) insert(head, l);
   }
   return head.length ? head.concat(buf) : (buf as Line[]);
+}
+
+/* ------------------------------------------------------------------ */
+/* SurrealDB's log, as Sp00ky Cloud stores it                          */
+/* ------------------------------------------------------------------ */
+
+/** One row of the cloud's log stream: a container's output line, stamped when it was collected. */
+export interface CloudLogEntry {
+  timestamp?: string;
+  service?: string;
+  stream?: string;
+  message?: string;
+}
+
+/** `2026-11-17T08:50:11.978211Z  WARN surrealdb_core::kvs::slowlog: Slow query detected …` */
+const SURREAL_LINE = /^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+([A-Za-z_][\w:]*):\s?([\s\S]*)$/;
+const ANSI = /\x1b\[[0-9;]*m/g;
+
+/**
+ * Epoch ms of an RFC 3339 stamp with any number of fraction digits. The store
+ * writes nine, SurrealDB six, and not every engine's `Date.parse` takes more
+ * than three.
+ */
+export function stampMs(stamp: string | undefined): number {
+  if (!stamp) return NaN;
+  return Date.parse(stamp.replace(/(\.\d{3})\d+/, '$1'));
+}
+
+/**
+ * A row of SurrealDB's own log, read: a new `line` (level and target off
+ * SurrealDB's text format, time as the store stamped it, so lines sort the way
+ * the stream sends them), or `more` of `prev`.
+ *
+ * The cloud splits a multi-line message (a slow query written over several
+ * lines, a panic's backtrace) into rows with one stamp. Kept as rows of their
+ * own they would read upside down in a table that puts the newest first, so a
+ * row without SurrealDB's prefix that shares `prev`'s stamp is the rest of
+ * that message. One that does not is a line of its own, INFO from `surrealdb`
+ * (the startup banner, say).
+ */
+export function readSurreal(entry: CloudLogEntry, prev?: Line | null): { line: Line } | { more: string } | null {
+  const text = (entry.message ?? '').replace(ANSI, '').trimEnd();
+  if (!text.trim()) return null;
+  const m = SURREAL_LINE.exec(text);
+  let ts = stampMs(entry.timestamp);
+  if (!Number.isFinite(ts)) ts = m ? stampMs(m[1]) : NaN;
+  if (!Number.isFinite(ts)) return null;
+  if (m) return { line: { ts, level: m[2], target: m[3], message: m[4] } };
+  if (prev && prev.ts === ts) return { more: text };
+  return { line: { ts, level: 'INFO', target: 'surrealdb', message: text } };
 }
 
 /* ------------------------------------------------------------------ */

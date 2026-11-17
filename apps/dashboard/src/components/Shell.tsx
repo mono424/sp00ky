@@ -71,7 +71,7 @@ function NavIcon(props: { href: string; icon?: string }) {
  * adds Deployments and the project's Settings pages; `limited` is a project
  * whose own dashboard cannot open there, so only Sp00ky Cloud's pages remain.
  */
-export function projectNav(console: boolean, overview?: Overview, limited = false): NavLink[] {
+export function projectNav(console: boolean, overview?: Overview, limited = false, dbLogs = false): NavLink[] {
   const o = overview;
   const settings: NavLink[] = console
     ? [
@@ -84,7 +84,15 @@ export function projectNav(console: boolean, overview?: Overview, limited = fals
         { href: '/settings/danger', label: 'Danger zone', group: 'Settings' },
       ]
     : [];
-  if (limited) return [{ href: '/', label: 'Overview' }, { href: '/deployments', label: 'Deployments' }, { href: '/audience', label: 'Audience' }, ...settings];
+  if (limited)
+    return [
+      { href: '/', label: 'Overview' },
+      { href: '/deployments', label: 'Deployments' },
+      { href: '/audience', label: 'Audience' },
+      // The database's log comes from the cloud, so it is there when the dashboard is not.
+      ...(dbLogs ? [{ href: '/logs', label: 'Logs' }] : []),
+      ...settings,
+    ];
   return [
     // Where an operator starts: the cluster, what shipped, what went wrong, what it said.
     { href: '/', label: 'Overview' },
@@ -319,7 +327,12 @@ export function Shell(props: {
   const clusterOnly = new Set(['/views', '/backups', '/incidents', '/logs']);
   const links = (): NavLink[] => {
     if (props.nav) return props.nav.links;
-    return projectNav(!!cx, props.overview, !!cx?.limited()).filter((l) => !servedByNode() || !clusterOnly.has(l.href));
+    const limited = !!cx?.limited();
+    const p = cx?.project();
+    // Without a dashboard there is no admin API to be served by an SSP, only the cloud.
+    return projectNav(!!cx, props.overview, limited, !!p && p.platform !== 'cloudflare').filter(
+      (l) => limited || !servedByNode() || !clusterOnly.has(l.href),
+    );
   };
 
   const sections = () => sectionsOf(links());

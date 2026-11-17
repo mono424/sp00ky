@@ -436,33 +436,7 @@ export function openStream(
         throw new ApiError(res.status, message);
       }
       handlers.onOpen?.();
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (!closed) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        // Frames are separated by a blank line. Anything after the last one is
-        // a partial frame and stays in the buffer for the next read.
-        let split: number;
-        while ((split = buffer.indexOf('\n\n')) !== -1) {
-          const frame = buffer.slice(0, split);
-          buffer = buffer.slice(split + 2);
-
-          let eventName = 'message';
-          const dataLines: string[] = [];
-          for (const line of frame.split('\n')) {
-            if (line.startsWith(':')) continue; // keep-alive
-            if (line.startsWith('event:')) eventName = line.slice(6).trim();
-            else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
-          }
-          if (dataLines.length) handlers.onEvent(eventName, dataLines.join('\n'));
-        }
-      }
+      await readEvents(res.body, handlers.onEvent, () => closed);
       if (!closed) handlers.onDone?.();
     } catch (err) {
       // An abort is us closing the stream, not a failure.
@@ -476,4 +450,42 @@ export function openStream(
     closed = true;
     controller.abort();
   };
+}
+
+/**
+ * The frames of an event stream, handed over as they arrive, until the body
+ * ends or `stopped` says to quit. Shared with the console's streams from Sp00ky
+ * Cloud, which are the same format.
+ */
+export async function readEvents(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: string, data: string) => void,
+  stopped: () => boolean,
+): Promise<void> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (!stopped()) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // Frames are separated by a blank line. Anything after the last one is
+    // a partial frame and stays in the buffer for the next read.
+    let split: number;
+    while ((split = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+
+      let eventName = 'message';
+      const dataLines: string[] = [];
+      for (const line of frame.split('\n')) {
+        if (line.startsWith(':')) continue; // keep-alive
+        if (line.startsWith('event:')) eventName = line.slice(6).trim();
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+      }
+      if (dataLines.length) onEvent(eventName, dataLines.join('\n'));
+    }
+  }
 }

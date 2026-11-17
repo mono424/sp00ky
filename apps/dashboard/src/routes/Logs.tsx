@@ -6,6 +6,8 @@ import { FilterMenu, Sq, type FilterValue } from '../components/Frame';
 import { formatCount, formatRelativeTime } from '../lib/format';
 import { liveLogsView, useLiveView } from '../api/liveStack';
 import type { Overview } from '../api/types';
+import { useConsoleChrome } from '../console/chrome';
+import { cloudStream } from '../console/cloud';
 import {
   appendNew,
   clock,
@@ -15,12 +17,15 @@ import {
   frameFor,
   lasting,
   lowerBound,
+  mergeLines,
   parseFields,
   prependOlder,
   rangeLabel,
+  readSurreal,
   shape,
   span,
   tick,
+  type CloudLogEntry,
   type Columns,
   type Frame,
   type Line,
@@ -29,6 +34,11 @@ import {
 
 /** Lines the tab keeps, and asks for when it opens: the whole of the server's ring. */
 const MAX_LINES = 10_000;
+
+/** How far back the database's log opens: the cloud keeps about a week, and sends its newest 5,000 lines of it. */
+const DB_HISTORY_MS = 7 * 86_400_000;
+/** The cloud answers with its history after a query, not at once: this long with nothing means none. */
+const DB_QUIET_MS = 4_000;
 
 const LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE'];
 
@@ -52,7 +62,7 @@ const sameFrame = (a: Frame | null, b: Frame | null) =>
   a === b || (!!a && !!b && a.t0 === b.t0 && a.step === b.step && a.cols === b.cols);
 /** Local time's offset from UTC, so minute, hour and day columns start where a clock says they do. */
 const localOffset = (t: number) => -new Date(t).getTimezoneOffset() * 60_000;
-const shortTarget = (t: string) => t.replace(/^(scheduler|ssp)::/, '');
+const shortTarget = (t: string) => t.replace(/^(scheduler|ssp|surrealdb(?:_\w+)?)::/, '');
 const levelTone = (l: string) => (l === 'ERROR' ? 'bad' : l === 'WARN' ? 'warn' : l === 'INFO' ? '' : 'idle');
 
 const parse = (data: string): Line | null => {
@@ -64,7 +74,7 @@ const parse = (data: string): Line | null => {
 };
 
 /**
- * Log explorer for the scheduler or any SSP.
+ * Log explorer for the scheduler, any SSP, and in the console the database.
  *
  * Top to bottom: the volume of lines over time as a histogram you drag across
  * to pick a window (the pill above it reads the window out and zooms into
@@ -81,21 +91,40 @@ const parse = (data: string): Line | null => {
  * one, else over the same stream that delivered the history. Lines both carry
  * are merged, not doubled.
  *
+ * SurrealDB's log is not the scheduler's to give: its container's output goes
+ * to Sp00ky Cloud's log store, the one `spky logs` reads, so the console reads
+ * it from there. Outside the console there is no such source, and with
+ * `cloudOnly` (the project's own dashboard cannot open, which a stopped
+ * database is a common reason for) it is the only one.
+ *
  * Backends are deliberately absent from the sources: the scheduler reaches
  * them with HTTP health checks and has no pipe to their output, so offering
  * them here would be offering something that cannot work.
  */
-export function Logs(props: { overview: Overview | undefined }) {
+export function Logs(props: { overview: Overview | undefined; cloudOnly?: boolean }) {
   const [params, setParams] = useSearchParams<{ source?: string }>();
-  const source = () => params.source || 'scheduler';
+  const cx = useConsoleChrome();
+  /** The project whose database log the cloud keeps. Not a Cloudflare one: no database container of its own runs there. */
+  const dbProject = () => {
+    const p = cx?.project();
+    return p && p.platform !== 'cloudflare' ? p : undefined;
+  };
+  const home = () => (props.cloudOnly ? 'surrealdb' : 'scheduler');
+  // Without the dashboard, a source in the address (an old link) cannot open.
+  const source = () => (props.cloudOnly ? home() : params.source || home());
 
   const sources = () => [
-    { value: 'scheduler', label: 'scheduler', tone: props.overview?.scheduler?.status === 'ready' || !props.overview?.scheduler ? '' : 'warn' },
-    ...(props.overview?.ssps ?? []).map((s) => ({
-      value: `ssp:${s.id}`,
-      label: s.id,
-      tone: s.status === 'ready' ? '' : 'warn',
-    })),
+    ...(props.cloudOnly
+      ? []
+      : [
+          { value: 'scheduler', label: 'scheduler', tone: props.overview?.scheduler?.status === 'ready' || !props.overview?.scheduler ? '' : 'warn' },
+          ...(props.overview?.ssps ?? []).map((s) => ({
+            value: `ssp:${s.id}`,
+            label: s.id,
+            tone: s.status === 'ready' ? '' : 'warn',
+          })),
+        ]),
+    ...(dbProject() ? [{ value: 'surrealdb', label: 'surrealdb', tone: '' }] : []),
   ];
 
   /* ---- the buffer: sorted by time, mutated in place, `ver` says when ---- */
@@ -114,9 +143,11 @@ export function Logs(props: { overview: Overview | undefined }) {
     if (buf.length > MAX_LINES) buf.splice(0, buf.length - MAX_LINES);
     setVer((v) => v + 1);
   };
+  // The scheduler's sources arrive in order; the cloud's may not, so its lines are merged in place.
+  let merge = appendNew;
   const ingest = (lines: readonly Line[]) => {
     const was = buf.length;
-    if (!appendNew(buf, lines)) return;
+    if (!merge(buf, lines)) return;
     batch(() => {
       changed();
       setSettled(true);
@@ -140,6 +171,80 @@ export function Logs(props: { overview: Overview | undefined }) {
   };
   onCleanup(() => clearTimeout(flushing));
 
+  /**
+   * SurrealDB's log from Sp00ky Cloud: the newest lines of the last week, then
+   * the live tail. The cloud ends a tail after an hour, and a dropped
+   * connection ends it sooner; either way it opens again from the newest line
+   * held, and `mergeLines` takes what it sends twice only once. A message the
+   * cloud split over several rows is put back together into one line. Returns
+   * the way to stop.
+   */
+  const followDatabase = (projectId: string, tenant: string | undefined): (() => void) => {
+    let stopped = false;
+    let close = () => {};
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let quiet: ReturnType<typeof setTimeout> | undefined;
+    let prev: Line | null = null;
+    let fails = 0;
+    const open = () => {
+      const newest = Math.max(buf.length ? buf[buf.length - 1].ts : 0, pending.length ? pending[pending.length - 1].ts : 0);
+      const since = new Date(newest || Date.now() - DB_HISTORY_MS).toISOString();
+      close = cloudStream(
+        `/projects/${encodeURIComponent(projectId)}/logs?service=surrealdb&since=${encodeURIComponent(since)}`,
+        { tenant },
+        {
+          onOpen: () => {
+            fails = 0;
+            batch(() => {
+              setConnected(true);
+              setError(null);
+            });
+            quiet = setTimeout(() => setSettled(true), DB_QUIET_MS);
+          },
+          onEvent: (event, data) => {
+            if (event !== 'message') return;
+            let entry: CloudLogEntry;
+            try {
+              entry = JSON.parse(data) as CloudLogEntry;
+            } catch {
+              return; // skip a malformed line rather than dropping the stream
+            }
+            const read = readSurreal(entry, prev);
+            if (!read) return;
+            if ('line' in read) {
+              prev = read.line;
+              queue(read.line);
+            } else if (prev) {
+              // The rest of a message the cloud split. Not flushed yet, it is the last line
+              // waiting; flushed, the buffer holds it and has to be redrawn.
+              prev.message += `\n${read.more}`;
+              if (pending[pending.length - 1] !== prev) changed();
+            }
+          },
+          onError: (err, final) => {
+            clearTimeout(quiet);
+            if (stopped) return;
+            batch(() => {
+              setConnected(false);
+              setSettled(true);
+              // A refusal will not change by asking again; a dropped stream may.
+              if (final) setError(err.message);
+              else if (++fails >= 3) setError(`${err.message}. Trying again.`);
+            });
+            if (!final) retry = setTimeout(open, Math.min(30_000, 1_000 * 2 ** Math.min(fails, 5)));
+          },
+        },
+      );
+    };
+    open();
+    return () => {
+      stopped = true;
+      clearTimeout(retry);
+      clearTimeout(quiet);
+      close();
+    };
+  };
+
   /* ---- where the lines come from ---- */
 
   const live = useLiveView(liveLogsView);
@@ -151,6 +256,7 @@ export function Logs(props: { overview: Overview | undefined }) {
       shown = src;
       buf = [];
       pending = [];
+      merge = src === 'surrealdb' ? mergeLines : appendNew;
       batch(() => {
         setVer((v) => v + 1);
         setDropped(0);
@@ -196,6 +302,22 @@ export function Logs(props: { overview: Overview | undefined }) {
           if (!lines.length) setSettled(true);
         });
       });
+      return;
+    }
+
+    if (src === 'surrealdb') {
+      const p = untrack(dbProject);
+      if (p) onCleanup(followDatabase(p.id, untrack(() => cx?.workspace()?.id)));
+      else
+        batch(() => {
+          setConnected(false);
+          setSettled(true);
+          setError(
+            cx
+              ? "This project's database is not one Sp00ky Cloud keeps a log of."
+              : "The database's log is read from Sp00ky Cloud, so only the console shows it.",
+          );
+        });
       return;
     }
 
@@ -405,11 +527,17 @@ export function Logs(props: { overview: Overview | undefined }) {
           <div class="fx-cell lx-chart-cell">
             <div class="lx-chart-top">
               <div class="fx-range lx-sources" role="group" aria-label="Source"
-                title="Scheduler and SSPs only: backends are health-checked over HTTP, their output never reaches the scheduler.">
+                title={
+                  props.cloudOnly
+                    ? "The database's log, from Sp00ky Cloud. The scheduler's and the SSPs' come from the project's dashboard, which is not open."
+                    : dbProject()
+                      ? "The scheduler, the SSPs, and the database's log from Sp00ky Cloud. Backends are health-checked over HTTP, so their output is not here."
+                      : 'Scheduler and SSPs only: backends are health-checked over HTTP, their output never reaches the scheduler.'
+                }>
                 <For each={sources()}>
                   {(s) => (
                     <button classList={{ on: source() === s.value }} aria-pressed={source() === s.value}
-                      onClick={() => setParams({ source: s.value === 'scheduler' ? undefined : s.value })}>
+                      onClick={() => setParams({ source: s.value === home() ? undefined : s.value })}>
                       <Sq tone={s.tone} />
                       {s.label}
                     </button>

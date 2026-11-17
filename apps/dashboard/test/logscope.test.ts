@@ -10,11 +10,13 @@ import {
   frameFor,
   lasting,
   lowerBound,
+  mergeLines,
   parseFields,
   prependOlder,
   rangeLabel,
   shape,
   span,
+  readSurreal,
   type Line,
 } from '../src/lib/logscope.ts';
 
@@ -111,4 +113,53 @@ test('labels read in the unit the window calls for', () => {
   assert.equal(lasting(850), '850ms');
   assert.equal(lasting(19 * 60_000 + 55_000), '19m 55s');
   assert.equal(lasting(2 * 3_600_000 + 5 * 60_000), '2h 05m');
+});
+
+test('readSurreal reads level and target off SurrealDB lines', () => {
+  const at = '2026-11-17T08:50:11.978442365Z';
+  const read = readSurreal({
+    timestamp: at,
+    service: 'surrealdb',
+    stream: 'stderr',
+    message: '2026-11-17T08:50:11.978211Z  WARN surrealdb_core::kvs::slowlog: Slow query detected - time: 1.8s - query: SELECT 1',
+  });
+  assert.deepEqual(read, {
+    line: {
+      ts: Date.UTC(2026, 10, 17, 8, 50, 11, 978),
+      level: 'WARN',
+      target: 'surrealdb_core::kvs::slowlog',
+      message: 'Slow query detected - time: 1.8s - query: SELECT 1',
+    },
+  });
+  // Colour codes from a terminal-minded build do not get in the way.
+  const coloured = readSurreal({ timestamp: at, message: '\x1b[2m2026-11-17T08:50:11.978211Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2msurrealdb::net\x1b[0m: boom' });
+  assert.ok(coloured && 'line' in coloured && coloured.line.level === 'ERROR');
+});
+
+test('readSurreal takes a split message as more of the line it continues', () => {
+  const at = '2026-11-17T08:50:11.978442365Z';
+  const first = readSurreal({ timestamp: at, message: '2026-11-17T08:50:11.978211Z  WARN surrealdb_core::kvs::slowlog: query: SELECT *' });
+  assert.ok(first && 'line' in first);
+  assert.deepEqual(readSurreal({ timestamp: at, message: '  FROM game WHERE x = 1' }, first.line), { more: '  FROM game WHERE x = 1' });
+  // A bare line at another instant is a line of its own: the startup banner, say.
+  const lone = readSurreal({ timestamp: '2026-11-17T09:00:00Z', message: '.d8888b.   888' }, first.line);
+  assert.deepEqual(lone, { line: { ts: Date.UTC(2026, 10, 17, 9), level: 'INFO', target: 'surrealdb', message: '.d8888b.   888' } });
+  // Without the store's stamp, SurrealDB's own; without either, nothing.
+  const own = readSurreal({ message: '2026-11-17T08:50:11.5Z  INFO surrealdb::net: up' });
+  assert.ok(own && 'line' in own && own.line.ts === Date.UTC(2026, 10, 17, 8, 50, 11, 500));
+  assert.equal(readSurreal({ message: 'no stamp at all' }), null);
+  assert.equal(readSurreal({ timestamp: at, message: '   ' }), null);
+});
+
+test('mergeLines keeps a late line and does not double a resent one', () => {
+  const buf = [L(1), L(3), L(5)];
+  // Late (2), resent (3, 5), new (6), and a second real line alike at 6.
+  assert.equal(mergeLines(buf, [L(2), L(3), L(5), L(6), L(6)]), 3);
+  assert.deepEqual(buf.map((l) => l.ts), [1, 2, 3, 5, 6, 6]);
+  // A reconnect from the last stamp resends both lines at 6: nothing new.
+  assert.equal(mergeLines(buf, [L(6), L(6)]), 0);
+  // Into an empty buffer, out of order, sorted on the way in.
+  const empty: Line[] = [];
+  assert.equal(mergeLines(empty, [L(4), L(2), L(3)]), 3);
+  assert.deepEqual(empty.map((l) => l.ts), [2, 3, 4]);
 });

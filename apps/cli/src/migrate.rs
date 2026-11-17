@@ -775,8 +775,10 @@ fn make_defines_overwrite(sql: &str) -> String {
 /// request, one entry per row. On `_00_version` that is one entry per synced
 /// row (737k on whitepawn staging): long enough to hit the CLI's HTTP timeout,
 /// and an interrupted rebuild leaves the unique index partially populated.
-/// `_00_version.record_id` is the lookup every `_00_<table>_mutation` event
-/// does to stamp `_00_rv`; a missing entry stamps NONE, the row is published
+/// `_00_version.record_id` was the lookup every `_00_<table>_mutation` event
+/// did to stamp `_00_rv` before ledger rows were keyed by their record (see
+/// docs/version-ledger.md; it still backs the fallback for rows from before
+/// that, and the UNIQUE guard); a missing entry stamped NONE, the row was published
 /// at version 1, and every peer holding it at >= 1 keeps its stale copy for
 /// good (measured: 35% of rows, two chat clients each rendering their own
 /// last write). See

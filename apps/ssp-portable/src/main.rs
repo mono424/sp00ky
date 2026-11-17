@@ -8,8 +8,18 @@ use surrealdb::Surreal;
 
 use ssp_portable::PortableHost;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // An embedded SurrealDB 4 recurses on the calling thread (planner,
+    // lowering, drop) and running out of stack aborts the process; tokio's
+    // default of 2 MiB is not enough for it.
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber_init();
 
     let secret = std::env::var("SPKY_SSP_SECRET").unwrap_or_else(|_| "portable-dev".to_string());

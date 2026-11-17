@@ -306,6 +306,13 @@ move through the lines, `Escape` closes the line, then clears the window, then
 zooms out. If a viewer falls behind the stream, the count of skipped lines is
 shown rather than hidden.
 
+In the [Sp00ky Cloud console](/docs/cloud/console) the sources also include
+`surrealdb`: the database's own log, which the scheduler has no pipe to, read
+from the cloud's log store (the one [`spky logs`](/docs/cloud/logs) reads). It
+opens on the newest lines of the last week, then follows the tail. Because it
+does not go through the scheduler, it is there even when the project's
+dashboard cannot open. Cloudflare projects have no database log to show.
+
 <Screenshot
   src="/docs/admin/logs.png"
   caption="A time window brushed across the log volume, read out in the pill and filtering the lines below."

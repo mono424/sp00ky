@@ -1,6 +1,6 @@
 [package]
 name = "sp00ky-cli"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.4"
 edition = "2021"
 
 [[bin]]
@@ -51,6 +51,6 @@ ureq = { version = "2.9", features = ["json"] }
 # In-process SurrealDB v3 (the engine and parser the server runs) for the Web
 # Push SQL tests (`push_db_tests.rs`): the CLI itself only speaks HTTP, and the
 # CLI's own `surrealdb-core` is the 2.x parser.
-surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 

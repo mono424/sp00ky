@@ -843,12 +843,16 @@ pub fn host_of(base: &str) -> String {
     }
 }
 
-/// Whether an error from opening the replica is the RocksDB lock another
-/// process (or a predecessor still closing) holds.
+/// Whether an error from opening the replica is the lock another process (or a
+/// predecessor still closing) holds: SurrealKV's ("Database at .../LOCK is
+/// already locked by another process"), RocksDB's, which a SurrealDB 3
+/// predecessor holds, as the conversion meets it ("the RocksDB database at ...
+/// is in use by another process") or `Replica::new` does (see there).
 pub fn is_lock_error(e: &anyhow::Error) -> bool {
     let text = format!("{e:#}");
     text.contains("/LOCK") || text.contains("lock hold") || text.contains("No locks available")
-        || text.contains("Resource temporarily unavailable")
+        || text.contains("Resource temporarily unavailable") || text.contains("already locked")
+        || text.contains("in use by another process")
 }
 
 #[cfg(test)]
@@ -867,6 +871,10 @@ mod tests {
     #[test]
     fn lock_errors_are_recognised() {
         let e = anyhow::anyhow!("IO error: lock hold by current process: /data/replica/LOCK: No locks available");
+        assert!(is_lock_error(&e));
+        let e = anyhow::anyhow!("Database at /data/replica/LOCK is already locked by another process");
+        assert!(is_lock_error(&e));
+        let e = anyhow::anyhow!("Migration failed: the RocksDB database at /data/replica is in use by another process; stop it");
         assert!(is_lock_error(&e));
         assert!(!is_lock_error(&anyhow::anyhow!("permission denied")));
     }

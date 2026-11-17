@@ -1,4 +1,9 @@
-import { applyPatch, type Operation } from 'fast-json-patch';
+// Default import, not `{ applyPatch }`: fast-json-patch 3.x is CommonJS for
+// Node (its ESM build is reachable only through the `module` field bundlers
+// read) and fills `module.exports` via Object.assign, which Node's CJS export
+// lexer cannot see. A named import makes `dist/index.js` throw a SyntaxError on
+// load in Node ESM (SSR, Vitest). Same pattern as `pino` in services/logger.
+import jsonPatch, { type Operation } from 'fast-json-patch';
 import { DEFAULT_LOCAL_OP_TIMEOUT_MS, LocalOpTimeoutError } from './errors';
 import { withTimeout } from '../../utils/index';
 import type { QueryPlan, RelationPlan, WhereNode } from '@spooky-sync/query-builder';
@@ -998,7 +1003,7 @@ export class SqliteCacheEngine implements LocalStore {
     // RFC6902 (fast-json-patch) applied read-modify-write — SQLite's json_patch
     // is RFC7396 merge-patch and would misinterpret op arrays.
     const existing = (await this.getById(table, id)) ?? { id: stableKey(id) };
-    const next = applyPatch(existing, patches as Operation[]).newDocument as Row;
+    const next = jsonPatch.applyPatch(existing, patches as Operation[]).newDocument as Row;
     await this.upsert(table, id, next, 'replace');
   }
 

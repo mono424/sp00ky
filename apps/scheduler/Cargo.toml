@@ -1,9 +1,10 @@
 [package]
 name = "scheduler"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.4"
 edition = "2021"
 
 [dependencies]
+libc = "0.2"
 schedule-core = { path = "../../packages/schedule-core" }
 push-core = { path = "../../packages/push-core", features = ["reqwest"] }
 # Machine pools: the engine, its agent wire types, the docker provider (Docker
@@ -15,7 +16,7 @@ bollard = "0.18"
 hmac = "0.12"
 hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
-surrealdb = { version = "3.1.2", default-features = false, features = ["kv-rocksdb", "protocol-http", "rustls"] }
+surrealdb = { version = "4.0.1", default-features = false, features = ["kv-surrealkv", "protocol-http", "rustls"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,6 +1,6 @@
 [package]
 name = "ssp-node"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.4"
 edition = "2021"
 description = "Portable SSP node core: platform ports (traits) + shared types for the VM (tokio/axum) and Cloudflare (workers-rs) shells"
 
@@ -45,6 +45,6 @@ anyhow = "1"
 # Native-only (tests don't run on the wasm target; the portability gate is a
 # plain `cargo check`, which ignores dev-deps).
 reqwest = { version = "0.12", features = ["json"] }
-surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
+surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem"] }
 tokio = { version = "1", features = ["full"] }
 wiremock = "0.6"

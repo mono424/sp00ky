@@ -99,6 +99,16 @@ scheduler reports each step when it ends, so the page starts filling once the
 project runs a release with activity reporting. Gaps mean nothing was
 measured, not that nobody was there. Cloudflare projects are not measured yet.
 
+## Logs
+
+The Logs page reads the scheduler's and each SSP's log, and SurrealDB's.
+The database's log does not come from the project: it is the database
+container's output, which Sp00ky Cloud collects (the same lines
+[`spky logs --filter surrealdb`](/docs/cloud/logs) shows). So when the
+project's dashboard cannot open, Logs is still in the sidebar with the
+database as its one source, often the quickest way to see why. Cloudflare
+projects have no database log here.
+
 ## Database
 
 Your project's tables, in the shape of a table editor. Pick a table on the left
@@ -213,7 +223,7 @@ has the details.
 
 <Note>
 A project's live dashboard needs a scheduler from canary.370 or later. An
-older one still shows Deployments and Settings, with a note to upgrade it
+older one still shows Deployments, Settings and the database's Logs, with a note to upgrade it
 (`spky restart --upgrade`). Cloudflare projects show Deployments and
 Settings until their SSP learns console sign-in. Database, Users and Storage
 appear once a project's scheduler or SSP is on canary.371 or later, Feature

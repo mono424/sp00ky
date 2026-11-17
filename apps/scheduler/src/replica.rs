@@ -4,26 +4,152 @@ use ssp_protocol::range_hash::{self, RangeHashes, TableRanges};
 use ssp_protocol::snapshot_hash;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use surrealdb::engine::local::RocksDb;
+use surrealdb::engine::local::SurrealKv;
 use surrealdb::opt::capabilities::{Capabilities, ExperimentalFeature};
 use surrealdb::opt::Config;
 use surrealdb::Surreal;
 use tracing::{debug, info, trace, warn};
 
-/// Config for the embedded replica DB: enable `Files` + `Surrealism`
-/// experimental capabilities so dumps that reference `DEFINE BUCKET ...` (a
-/// Files feature) or surrealism modules import cleanly. The main SurrealDB
-/// runs with these enabled (via `SURREAL_CAPS_ALLOW_EXPERIMENTAL=surrealism,files`),
-/// so if the replica isn't configured to match, every post-v3 restore that
-/// touches buckets dies with "expected the experimental files feature to be
-/// enabled" when the replica tries to import the dump.
+/// Config for the embedded replica DB: the `Surrealism` experimental
+/// capability so dumps that reference surrealism modules import cleanly, as
+/// the main SurrealDB runs with it. Buckets (`DEFINE BUCKET`) are no longer
+/// experimental in SurrealDB 4.
+///
+/// The engine is SurrealKV, which SurrealDB 4 sizes from the cgroup limit by
+/// keeping half of it minus 1 GiB as block cache: on a scheduler container of
+/// a GiB or two that is its 16 MiB floor, and every read past it goes to disk.
+/// An eighth of the memory for the cache and a sixteenth per memtable leaves
+/// the rest to the scheduler itself.
+///
+/// It always opts in to SurrealDB 4 converting a replica a SurrealDB 3
+/// scheduler wrote (embedded RocksDB) in place, see [`Replica::new`]: the
+/// refusal guards a database someone may still want to open with 3.x, and this
+/// one is a private cache of upstream. Asking only when a `CURRENT` file is
+/// there would strand a conversion killed after it moved that file but before
+/// SurrealDB stamped the store as 4.x: every later start would be refused.
 fn replica_config() -> Config {
-    Config::new().capabilities(
-        Capabilities::default().with_experimental_features_allowed(&[
-            ExperimentalFeature::Files,
-            ExperimentalFeature::Surrealism,
-        ]),
-    )
+    let mut config = Config::new().capabilities(
+        Capabilities::default().with_experimental_features_allowed(&[ExperimentalFeature::Surrealism]),
+    );
+    if let Some(mem) = cgroup_memory_limit() {
+        let (cache, memtable) = replica_memory(mem);
+        config = config
+            .datastore_option("surrealkv_block_cache_capacity", cache)
+            .datastore_option("surrealkv_max_memtable_size", memtable);
+    }
+    config.datastore_option("experimental_upgrade_from_3x", true)
+}
+
+/// The SurrealKV block cache and memtable size for a container of `mem` bytes.
+fn replica_memory(mem: u64) -> (u64, u64) {
+    const MIB: u64 = 1024 * 1024;
+    ((mem / 8).clamp(64 * MIB, 1024 * MIB), (mem / 16).clamp(32 * MIB, 256 * MIB))
+}
+
+/// Whether `dir` holds the embedded RocksDB a SurrealDB 3 scheduler wrote
+/// (RocksDB keeps a `CURRENT` file naming its manifest, SurrealKV has none),
+/// or a conversion of one to SurrealKV that did not finish (its marker, or its
+/// staging directory).
+fn holds_rocksdb_replica(dir: &std::path::Path) -> bool {
+    dir.join("CURRENT").is_file() || dir.join("MIGRATING_ROCKSDB").exists() || dir.join("_rocksdb_migration").exists()
+}
+
+/// Whether a failed open says the replica's RocksDB data cannot be converted at
+/// all, as opposed to failing for now (I/O, a full disk, a lock), which a
+/// restart retries.
+fn unconvertible(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("corrupt RocksDB data")
+        || text.contains("unsupported RocksDB feature")
+        || text.contains("it is not a RocksDB database to migrate")
+}
+
+/// Bytes of the files under `dir`.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// Bytes free on the filesystem of `dir`, `None` when that cannot be read.
+fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a zeroed statvfs is valid output space, and the path is a
+    // NUL-terminated string that outlives the call.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+/// Whether another process holds the RocksDB lock of `dir`. RocksDB locks
+/// `LOCK` with `fcntl`, SurrealKV with `flock`, and on Linux the two do not
+/// see each other: without this check a SurrealDB 4 scheduler would start
+/// converting a replica its SurrealDB 3 predecessor still has open.
+fn rocksdb_lock_held(dir: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // Read-only: asking about a lock (F_GETLK) needs no write access.
+    let file = match std::fs::File::open(dir.join("LOCK")) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: a zeroed flock is a valid "whole file" range; F_GETLK only reads
+    // it back, filling in the holder if there is one.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    // F_GETLK asks without taking anything, so closing the file (which drops
+    // every fcntl lock this process holds on it) gives nothing away.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(lock.l_type != libc::F_UNLCK as libc::c_short)
+}
+
+/// Hold a POSIX record lock on `dir/LOCK` for as long as the returned file is
+/// open. SurrealKV's own lock is an `flock`, which a SurrealDB 3 scheduler's
+/// RocksDB (an `fcntl` lock on the same file) never sees: without this one an
+/// older scheduler restarting on the volume, or a rollback to one, would open
+/// a fresh RocksDB beside the live SurrealKV files and serve as a second
+/// scheduler. It is an open-file-description lock, which closing some other
+/// descriptor of the file in this process does not drop.
+///
+/// Linux only: that is where the two kinds of lock are independent (verified:
+/// one process holds both an flock and an OFD lock on `LOCK`, and another
+/// process's fcntl lock is refused). On macOS they interfere, so SurrealKV's
+/// flock keeps RocksDB out by itself, and taking this one too would collide
+/// with it.
+#[cfg(target_os = "linux")]
+fn hold_replica_lock(dir: &std::path::Path) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let path = dir.join("LOCK");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    // SAFETY: a zeroed flock with the type and origin set is a valid request
+    // for the whole file (an OFD request must have l_pid 0, which it does).
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as libc::c_short;
+    lock.l_whence = libc::SEEK_SET as libc::c_short;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &lock) } != 0 {
+        let e = std::io::Error::last_os_error();
+        // Worded like the lock error the open loop waits on (`handover::is_lock_error`).
+        anyhow::bail!("{}: lock hold by another scheduler ({e})", path.display());
+    }
+    Ok(Some(file))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hold_replica_lock(_dir: &std::path::Path) -> Result<Option<std::fs::File>> {
+    Ok(None)
 }
 
 /// The container's memory ceiling, if we are running under one. Read from
@@ -331,6 +457,9 @@ pub struct SpoolManifest {
 /// Persistent replica backed by embedded SurrealDB with RocksDB
 pub struct Replica {
     db: Surreal<surrealdb::engine::local::Db>,
+    /// The POSIX lock on `db_path/LOCK` that keeps a SurrealDB 3 scheduler out
+    /// for as long as this replica is open (see `hold_replica_lock`).
+    dir_lock: Option<std::fs::File>,
     db_path: PathBuf,
     /// Sequence number of the last event applied to this snapshot
     snapshot_seq: u64,
@@ -404,9 +533,43 @@ pub struct Replica {
     range_build: std::sync::Mutex<Option<RangeBuild>>,
 }
 
+/// How a scan of upstream starting now reads row versions from the
+/// `_00_version` ledger: by key alone once no legacy (random id) row remains,
+/// else by key with the legacy lookup as a fallback in the form this server
+/// plans as an index read (see [`ssp_protocol::VersionLookup`]). Resolved per
+/// scan: the ledger migration finishing and a server upgrade both change it
+/// under a running scheduler. A probe that fails keeps the fallback, which is
+/// always correct.
+pub(crate) async fn upstream_version_lookup<C: surrealdb::Connection>(
+    db: &surrealdb::Surreal<C>,
+) -> ssp_protocol::VersionLookup {
+    use ssp_protocol::version_ledger;
+    let head = async {
+        let mut response = db.query(version_ledger::HEAD_QUERY).await?;
+        response.take::<surrealdb::types::Value>(0)
+    };
+    let legacy = match head.await {
+        Ok(head) => version_ledger::head_is_legacy(&head.into_json_value()),
+        Err(e) => {
+            warn!(error = %e, "Could not probe the upstream version ledger; reading legacy rows too");
+            true
+        }
+    };
+    if !legacy {
+        return ssp_protocol::VersionLookup::Keyed;
+    }
+    let server = match db.version().await {
+        Ok(v) => Some(v.to_string()),
+        Err(e) => {
+            warn!(error = %e, "Could not read the upstream SurrealDB version; using the 3.x legacy lookup");
+            None
+        }
+    };
+    ssp_protocol::VersionLookup::for_ledger(server.as_deref(), true)
+}
+
 impl Replica {
-    /// Create a new replica with persistent SurrealDB/RocksDB storage
-    /// Release the embedded RocksDB, and with it the directory lock, without
+    /// Release the embedded store, and with it the directory lock, without
     /// ending the process: the scheduler handing over to a successor on the
     /// same volume (see `crate::handover`) must keep relaying requests after
     /// its successor has opened this directory. Dropping the last connected
@@ -416,6 +579,7 @@ impl Replica {
     pub fn close(&mut self) {
         let closed = Surreal::<surrealdb::engine::local::Db>::init();
         drop(std::mem::replace(&mut self.db, closed));
+        self.dir_lock = None;
         info!(path = ?self.db_path, "Closed replica for the handover");
     }
 
@@ -426,38 +590,89 @@ impl Replica {
                 .with_context(|| format!("Failed to create directory: {:?}", parent))?;
         }
 
-        // `?sync=never` — the ONE knob the embedded SDK actually forwards to
-        // the storage engine (query params become `datastore_*` ConfigMap keys;
-        // `rocksdb_*` keys are reachable only from the server binary, which
-        // reads `SURREAL_*` env we do not run through).
-        //
-        // Durability is not the property this store needs. The replica is a
-        // rebuildable cache of upstream: a crash mid-clone leaves
+        // `?sync=never`: durability is not the property this store needs. The
+        // replica is a rebuildable cache of upstream: a crash mid-clone leaves
         // `snapshot_seq == 0`, and the next start clones again from the source
-        // of truth. What it *does* need is to survive a bulk clone, and the
-        // default (`sync=every`) makes every commit wait on a grouped WAL
-        // fsync — which is what let memtables outrun flushes until RocksDB's
-        // WriteBufferManager stalled writes and never recovered: all threads
-        // parked, 0% CPU, bootstrap frozen forever with the scheduler stuck in
+        // of truth. What it *does* need is to survive a bulk clone, and making
+        // every commit wait on a WAL fsync is what once let RocksDB's memtables
+        // outrun its flushes until it stalled writes for good: all threads
+        // parked, 0% CPU, bootstrap frozen with the scheduler stuck in
         // `cloning` and every SSP registration answering 503 (whitepawn,
         // 2026-08-22, 57h of dead sync).
-        let path = db_path.to_str().unwrap_or("./data/replica");
-        let db = Surreal::new::<RocksDb>((format!("{path}?sync=never"), replica_config()))
-            .await
-            .with_context(|| format!("Failed to open RocksDB at {:?}", db_path))?;
+        //
+        // A replica a SurrealDB 3 scheduler wrote is embedded RocksDB, which
+        // SurrealDB 4 no longer has. SurrealKV converts it in place on this
+        // open (measured: 339 MB in about a second) and keeps the originals in
+        // `_rocksdb_backup/`, which go once the converted snapshot reads back:
+        // the replica keeps its snapshot, its hashes and its changefeed
+        // cursor, so neither this scheduler nor its SSPs start cold. A replica
+        // whose data cannot be converted, or that has no room for the copy the
+        // conversion writes beside it, is dropped and clones from upstream
+        // like a first start. Anything else fails the open, and the restart
+        // tries again.
+        let path = db_path.to_str().unwrap_or("./data/replica").to_string();
+        let mut legacy = holds_rocksdb_replica(&db_path);
+        if legacy {
+            match rocksdb_lock_held(&db_path) {
+                // Worded like the lock error the open loop waits on
+                // (`handover::is_lock_error`).
+                Ok(true) => anyhow::bail!(
+                    "{}/LOCK: lock hold by a SurrealDB 3 scheduler; the replica converts once it lets go",
+                    db_path.display()
+                ),
+                Ok(false) => {}
+                Err(e) => anyhow::bail!(
+                    "Could not check whether a SurrealDB 3 scheduler holds the replica at {} ({e}); not converting it",
+                    db_path.display()
+                ),
+            }
+            let need = dir_bytes(&db_path) + 256 * 1024 * 1024;
+            match free_bytes(&db_path) {
+                Some(free) if free < need => {
+                    warn!(free, need, path = ?db_path,
+                        "No room to convert the replica in place; dropping it to clone from upstream");
+                    std::fs::remove_dir_all(&db_path)
+                        .with_context(|| format!("Failed to remove the replica at {:?}", db_path))?;
+                    legacy = false;
+                }
+                _ => info!(path = ?db_path, "Converting the replica from RocksDB (SurrealDB 3) to SurrealKV in place"),
+            }
+        }
+        let started = std::time::Instant::now();
+        let db = match Surreal::new::<SurrealKv>((format!("{path}?sync=never"), replica_config())).await {
+            Ok(db) => db,
+            Err(e) => {
+                let err = anyhow::Error::from(e).context(format!("Failed to open SurrealKV at {:?}", db_path));
+                if !legacy || !unconvertible(&err) {
+                    return Err(err);
+                }
+                warn!(error = %format!("{err:#}"), "The replica cannot be converted; dropping it to clone from upstream");
+                std::fs::remove_dir_all(&db_path)
+                    .with_context(|| format!("Failed to remove the replica at {:?}", db_path))?;
+                Surreal::new::<SurrealKv>((format!("{path}?sync=never"), replica_config()))
+                    .await
+                    .with_context(|| format!("Failed to open SurrealKV at {:?}", db_path))?
+            }
+        };
+        if legacy {
+            info!(elapsed_ms = started.elapsed().as_millis() as u64, "Replica converted to SurrealKV");
+        }
+        // Taken once the store is open: the conversion takes RocksDB's lock on
+        // the same file itself.
+        let dir_lock = hold_replica_lock(&db_path)?;
 
         db.use_ns("sp00ky").use_db("snapshot").await
             .context("Failed to select namespace/database on replica")?;
 
-        // The engine sizes its RocksDB memory budget from the CGROUP limit, so
-        // the container's cap silently sets the stall threshold. Log what we
-        // are running under: it is the first number worth knowing when a clone
-        // wedges, and it is invisible from the outside.
+        // The engine's memory is sized from the container's cap (see
+        // `replica_config`). Log what we are running under: it is the first
+        // number worth knowing when a clone wedges, and it is invisible from
+        // the outside.
         info!(
             memory_limit = %cgroup_memory_limit()
                 .map(|b| format!("{}MB", b / (1024 * 1024)))
                 .unwrap_or_else(|| "unknown".to_string()),
-            "Opened replica SurrealDB at {:?} (sync=never)", db_path,
+            "Opened replica SurrealDB (SurrealKV) at {:?} (sync=never)", db_path,
         );
 
         let SnapshotState {
@@ -466,7 +681,22 @@ impl Replica {
             tables: known_tables,
             applying: interrupted_apply,
             changefeed_vs,
-        } = Self::read_snapshot_state_from_db(&db).await.unwrap_or_default();
+        } = match Self::read_snapshot_state_from_db(&db).await {
+            Ok(state) => {
+                // The converted snapshot reads back: the RocksDB originals
+                // can go. Every start looks, so one cut short goes next time.
+                let backup = db_path.join("_rocksdb_backup");
+                if backup.is_dir() {
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = std::fs::remove_dir_all(&backup) {
+                            warn!(error = %e, "Could not remove the replica's RocksDB originals");
+                        }
+                    });
+                }
+                state
+            }
+            Err(_) => SnapshotState::default(),
+        };
         if snapshot_seq > 0 {
             info!(
                 snapshot_seq,
@@ -479,6 +709,7 @@ impl Replica {
 
         let mut replica = Self {
             db,
+            dir_lock,
             db_path,
             snapshot_seq,
             snapshot_hashes,
@@ -1857,6 +2088,7 @@ impl Replica {
         let info: surrealdb::types::Value = info.take(0)?;
         let has_versions = info.into_json_value().get("tables")
             .and_then(|v| v.get("_00_version")).is_some();
+        let lookup = if has_versions { upstream_version_lookup(remote_db).await } else { Default::default() };
         let started = std::time::Instant::now();
         let mut cursor = Self::table_cursor(remote_db, table_name, window_rows(page_size)).await;
         let mut total: usize = 0;
@@ -1864,7 +2096,7 @@ impl Replica {
         loop {
             let query = cursor.query(table_name, page_size, omit);
             let query = if has_versions {
-                ssp_protocol::with_durable_row_versions(&query)
+                ssp_protocol::with_durable_row_versions_using(&query, lookup)
             } else { query };
             trace!(table = %table_name, paged_by = cursor.paged_by(), page_size, "remote page query: {}", query);
             let resp = remote_db.query(&query).await;
@@ -1962,7 +2194,7 @@ impl Replica {
             ssp_protocol::omit_clause(omit)
         );
         let query = if has_versions {
-            ssp_protocol::with_durable_row_versions(&query)
+            ssp_protocol::with_durable_row_versions_using(&query, upstream_version_lookup(remote_db).await)
         } else {
             query
         };
@@ -2017,9 +2249,13 @@ impl Replica {
                 .bind(("ids", chunk.to_vec()))
                 .await
                 .with_context(|| format!("SELECT {} row versions from replica {}", chunk.len(), table))?;
-            let rows: surrealdb::types::Value = response
-                .take(0)
-                .with_context(|| format!("take(0) for row versions of {}", table))?;
+            // A table the replica has never held: SurrealDB 4 answers its
+            // records with an error, not with nothing.
+            let rows: surrealdb::types::Value = match response.take(0) {
+                Ok(rows) => rows,
+                Err(e) if is_missing_error(&e) => return Ok(out),
+                Err(e) => return Err(anyhow::Error::from(e).context(format!("take(0) for row versions of {}", table))),
+            };
             for row in rows.into_json_value().as_array().into_iter().flatten() {
                 if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
                     out.insert(id.to_string(), row.get("_00_rv").and_then(|v| v.as_i64()));
@@ -2708,6 +2944,184 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replica_memory_scales_with_the_container_within_bounds() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(replica_memory(2048 * MIB), (256 * MIB, 128 * MIB));
+        // A small container keeps the floors, a large one the caps.
+        assert_eq!(replica_memory(256 * MIB), (64 * MIB, 32 * MIB));
+        assert_eq!(replica_memory(64 * 1024 * MIB), (1024 * MIB, 256 * MIB));
+    }
+
+    #[test]
+    fn legacy_markers_and_unconvertible_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!holds_rocksdb_replica(dir.path()), "an empty directory");
+        for marker in ["CURRENT", "MIGRATING_ROCKSDB"] {
+            std::fs::write(dir.path().join(marker), b"").unwrap();
+            assert!(holds_rocksdb_replica(dir.path()), "{marker}");
+            std::fs::remove_file(dir.path().join(marker)).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("_rocksdb_migration")).unwrap();
+        assert!(holds_rocksdb_replica(dir.path()), "a conversion's staging directory");
+        std::fs::remove_dir(dir.path().join("_rocksdb_migration")).unwrap();
+        std::fs::create_dir(dir.path().join("_rocksdb_backup")).unwrap();
+        assert!(!holds_rocksdb_replica(dir.path()), "a finished conversion's originals are no 3.x store");
+
+        assert!(unconvertible(&anyhow::anyhow!("Migration failed: corrupt RocksDB data: 000012.sst is shorter than a table footer")));
+        assert!(unconvertible(&anyhow::anyhow!("Migration failed: unsupported RocksDB feature: 000007.log holds a merge operand")));
+        assert!(unconvertible(&anyhow::anyhow!("/data/replica holds a SurrealKV manifest and RocksDB files; it is not a RocksDB database to migrate")));
+        assert!(!unconvertible(&anyhow::anyhow!("Migration failed: I/O error: No space left on device (os error 28)")));
+        assert!(!unconvertible(&anyhow::anyhow!("Migration failed: the RocksDB database at /data/replica is in use by another process")));
+    }
+
+    /// While a replica is open, the fcntl lock a SurrealDB 3 scheduler's
+    /// RocksDB takes on `LOCK` is refused; after `close` it is free.
+    #[tokio::test]
+    async fn an_open_replica_keeps_an_fcntl_locker_out_until_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replica");
+        let mut replica = Replica::new(path.clone()).await.unwrap();
+        let try_lock = |lock: &std::path::Path| std::process::Command::new("python3")
+            .args(["-c", "import fcntl,sys\ntry:\n f=open(sys.argv[1],'r+'); fcntl.lockf(f, fcntl.LOCK_EX|fcntl.LOCK_NB); print('got')\nexcept OSError: print('busy')"])
+            .arg(lock).output();
+        let Ok(out) = try_lock(&path.join("LOCK")) else {
+            eprintln!("python3 not available; skipping");
+            return;
+        };
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "busy", "the replica's lock must keep RocksDB out");
+        replica.close();
+        // On Linux the record lock goes with `close`; SurrealKV's flock (which
+        // on macOS is what keeps the fcntl locker out) goes when the engine has
+        // closed, in the background.
+        let mut got = String::new();
+        for _ in 0..100 {
+            got = String::from_utf8_lossy(&try_lock(&path.join("LOCK")).unwrap().stdout).trim().to_string();
+            if got == "got" { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(got, "got", "close lets go of it");
+        // And a second open in this process waits for the first, as a
+        // handover's successor does.
+        let again = Replica::new(path).await;
+        assert!(again.is_ok() || again.as_ref().is_err_and(|e| crate::handover::is_lock_error(e)));
+    }
+
+    /// RocksDB locks `LOCK` with fcntl, which a SurrealKV flock never sees, so
+    /// the conversion asks for it by itself. Held by another process here (a
+    /// lock of this process never conflicts with itself).
+    #[test]
+    fn rocksdb_lock_held_sees_another_process_fcntl_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!rocksdb_lock_held(dir.path()).unwrap(), "no LOCK file is no lock");
+        let lock = dir.path().join("LOCK");
+        std::fs::write(&lock, b"").unwrap();
+        assert!(!rocksdb_lock_held(dir.path()).unwrap(), "an unlocked LOCK file");
+        let holder = std::process::Command::new("python3")
+            .args(["-c", "import fcntl,sys,time; f=open(sys.argv[1],'r+'); fcntl.lockf(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(30)"])
+            .arg(&lock)
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut holder) = holder else {
+            eprintln!("python3 not available; skipping");
+            return;
+        };
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(holder.stdout.take().unwrap()), &mut line).unwrap();
+        assert_eq!(line.trim(), "held");
+        let held = rocksdb_lock_held(dir.path());
+        holder.kill().ok();
+        holder.wait().ok();
+        assert!(held.unwrap(), "another process's fcntl lock must be seen");
+    }
+
+    /// A replica a SurrealDB 3 scheduler wrote (embedded RocksDB) converts in
+    /// place on open and keeps its snapshot: rows, `_00_metadata:snapshot`
+    /// (seq, hashes, tables, changefeed cursor), with the RocksDB originals
+    /// removed. The 3.x replica is written by the 3.1.5 server image, the
+    /// same engine the SurrealDB 3 SDK embeds.
+    #[tokio::test]
+    #[ignore = "requires Docker"]
+    async fn a_surrealdb_3_replica_converts_in_place_and_keeps_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_dir = dir.path().canonicalize().unwrap();
+        let name = format!("spky-replica-convert-{}", std::process::id());
+        let docker = |args: &[&str]| std::process::Command::new("docker").args(args).output().unwrap();
+        let _ = docker(&["rm", "-f", &name]);
+        let mount = format!("{}:/data", host_dir.display());
+        let run = docker(&["run", "-d", "--name", &name, "-u", "root", "-v", &mount, "-p", "127.0.0.1::8000",
+            "surrealdb/surrealdb:v3.1.5", "start", "--user", "root", "--pass", "root", "--allow-all", "rocksdb:/data/replica"]);
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        let port = String::from_utf8(docker(&["port", &name, "8000"]).stdout).unwrap().trim().to_string();
+        let url = format!("http://{port}");
+        let http = reqwest::Client::new();
+        for _ in 0..120 {
+            if http.get(format!("{url}/health")).send().await.is_ok_and(|r| r.status().is_success()) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        let sql = "DEFINE NAMESPACE IF NOT EXISTS sp00ky; USE NS sp00ky; DEFINE DATABASE IF NOT EXISTS snapshot; USE DB snapshot; \
+            FOR $i IN 0..2000 { CREATE type::record('thread', $i) SET title = 'thread ' + <string>$i, _00_rv = 3; }; \
+            UPSERT _00_metadata:snapshot CONTENT { seq: 4242, hashes: { thread: 'abc' }, tables: ['thread'], applying: false, changefeed_vs: 777 };";
+        let res = http.post(format!("{url}/sql")).basic_auth("root", Some("root"))
+            .header("Accept", "application/json").body(sql).send().await.unwrap();
+        assert!(res.status().is_success(), "{}", res.text().await.unwrap_or_default());
+        let stop = docker(&["stop", "-t", "30", &name]);
+        let _ = docker(&["rm", "-f", &name]);
+        assert!(stop.status.success());
+
+        assert_converts(host_dir.join("replica")).await;
+    }
+
+    /// [`a_surrealdb_3_replica_converts_in_place_and_keeps_its_snapshot`] on a
+    /// replica made beforehand (`SPKY_TEST_SURREALDB3_REPLICA`, the directory a
+    /// 3.1.5 server wrote with the same rows), so the checks also run where
+    /// this test cannot start containers, such as inside a Linux one: that is
+    /// where SurrealKV's flock and the replica's fcntl lock are independent.
+    #[tokio::test]
+    #[ignore = "needs SPKY_TEST_SURREALDB3_REPLICA"]
+    async fn a_prepared_surrealdb_3_replica_converts() {
+        let Ok(path) = std::env::var("SPKY_TEST_SURREALDB3_REPLICA") else { return };
+        assert_converts(std::path::PathBuf::from(path)).await;
+    }
+
+    async fn assert_converts(path: std::path::PathBuf) {
+        assert!(holds_rocksdb_replica(&path), "the 3.1.5 replica is RocksDB");
+        let replica = Replica::new(path.clone()).await.expect("open and convert");
+        assert_eq!(replica.snapshot_seq(), 4242);
+        assert_eq!(replica.changefeed_vs, 777);
+        assert!(replica.known_tables().contains("thread"));
+        let mut res = replica.db.query("RETURN count(SELECT id FROM thread)").await.unwrap();
+        let n: Option<i64> = res.take(0).unwrap();
+        assert_eq!(n, Some(2000));
+        assert!(!holds_rocksdb_replica(&path), "converted to SurrealKV");
+        // A SurrealDB 3 scheduler (RocksDB's fcntl lock) is kept out while it is open.
+        if let Ok(out) = std::process::Command::new("python3")
+            .args(["-c", "import fcntl,sys\ntry:\n f=open(sys.argv[1],'r+'); fcntl.lockf(f, fcntl.LOCK_EX|fcntl.LOCK_NB); print('got')\nexcept OSError: print('busy')"])
+            .arg(path.join("LOCK")).output()
+        {
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "busy");
+        }
+        for _ in 0..100 {
+            if !path.join("_rocksdb_backup").exists() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!path.join("_rocksdb_backup").exists(), "the RocksDB originals are removed");
+        let mut replica = replica;
+        replica.close();
+        // And it opens again as SurrealKV, with nothing left to convert, once
+        // the engine has let go of its lock (it closes in the background, as
+        // a handover's successor waits for too).
+        let mut again = None;
+        for _ in 0..100 {
+            match Replica::new(path.clone()).await {
+                Ok(r) => { again = Some(r); break; }
+                Err(e) if crate::handover::is_lock_error(&e) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                Err(e) => panic!("reopen: {e:#}"),
+            }
+        }
+        assert_eq!(again.expect("reopen within 5 s").snapshot_seq(), 4242);
+    }
+
+    #[test]
     fn cgroup_limit_parses_both_versions_and_unlimited() {
         // v2 container with a cap.
         assert_eq!(parse_cgroup_limit("3221225472\n"), Some(3 * 1024 * 1024 * 1024));
@@ -3206,7 +3620,7 @@ mod tests {
     /// An upstream stand-in: an embedded database with `ns`/`db` selected.
     async fn source_db() -> Result<(tempfile::TempDir, Surreal<surrealdb::engine::local::Db>)> {
         let tmp = tempfile::tempdir()?;
-        let db = Surreal::new::<RocksDb>(tmp.path().join("source").to_str().unwrap()).await?;
+        let db = Surreal::new::<SurrealKv>(tmp.path().join("source").to_str().unwrap()).await?;
         db.use_ns("test").use_db("test").await?;
         Ok((tmp, db))
     }
@@ -3244,6 +3658,50 @@ mod tests {
         assert_eq!(read.len(), ids.len(), "a row was read twice");
         let want: BTreeSet<String> = want.into_iter().collect();
         assert_eq!(read.into_iter().cloned().collect::<BTreeSet<_>>(), want);
+    }
+
+    /// Row versions come from the keyed ledger row (`_00_version:[game:a]`),
+    /// from a legacy (random id) one while any remain, and from the row's own
+    /// `_00_rv` without either; once no legacy row is left the scan reads by
+    /// key alone, whatever the server.
+    #[tokio::test]
+    async fn row_versions_come_from_keyed_and_legacy_ledger_rows() -> Result<()> {
+        let (_tmp, db) = source_db().await?;
+        db.query(
+            "CREATE game:k SET n = 1; CREATE game:l SET n = 2; CREATE game:n SET n = 3, _00_rv = 4; \
+             CREATE _00_version:[game:k] SET record_id = game:k, version = 7; \
+             CREATE _00_version:abc SET record_id = game:l, version = 3;",
+        )
+        .await?
+        .check()?;
+        let versions = |rows: Vec<Value>| -> BTreeMap<String, i64> {
+            rows.into_iter()
+                .map(|r| (r["id"].as_str().unwrap().to_string(), r["_00_rv"].as_i64().unwrap()))
+                .collect()
+        };
+        let want: BTreeMap<String, i64> =
+            [("game:k".to_string(), 7), ("game:l".to_string(), 3), ("game:n".to_string(), 4)].into();
+
+        assert_ne!(upstream_version_lookup(&db).await, ssp_protocol::VersionLookup::Keyed, "a legacy row remains");
+        let rows = std::sync::Mutex::new(Vec::new());
+        Replica::page_table_by(&db, "game", &BTreeSet::new(), 100, |page| {
+            rows.lock().unwrap().extend(page);
+            std::future::ready(Ok(()))
+        })
+        .await?;
+        assert_eq!(versions(rows.into_inner().unwrap()), want);
+        let ids: Vec<String> = want.keys().cloned().collect();
+        let by_id = Replica::fetch_rows_by_id(&db, "game", &ids, &BTreeSet::new()).await?;
+        assert_eq!(versions(by_id.into_values().collect()), want);
+
+        // The migration moved the legacy row.
+        db.query("DELETE _00_version:abc; CREATE _00_version:[game:l] SET record_id = game:l, version = 3;")
+            .await?
+            .check()?;
+        assert_eq!(upstream_version_lookup(&db).await, ssp_protocol::VersionLookup::Keyed);
+        let by_id = Replica::fetch_rows_by_id(&db, "game", &ids, &BTreeSet::new()).await?;
+        assert_eq!(versions(by_id.into_values().collect()), want);
+        Ok(())
     }
 
     #[tokio::test]

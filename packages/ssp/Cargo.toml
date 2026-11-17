@@ -1,6 +1,6 @@
 [package]
 name = "ssp"
-version = "1.0.0-beta.2"
+version = "1.0.0-beta.4"
 edition = "2021"
 
 [lib]

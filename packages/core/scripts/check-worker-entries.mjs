@@ -7,7 +7,8 @@
 //     has none of them; an access at module top level would throw on import);
 //   - `/sw` does not even pull in the `surrealdb` SDK.
 // Each entry is then really imported in this Node process (no DOM globals)
-// to catch top-level side effects the static scan cannot see. Prints the
+// to catch top-level side effects the static scan cannot see, and so is
+// dist/index.js, which must load in Node ESM too. Prints the
 // gzipped size of each entry (own code, and fully bundled with its npm
 // dependencies when rolldown is reachable). Run after `tsdown` in the build.
 import { readFileSync, existsSync } from 'node:fs';
@@ -133,6 +134,18 @@ for (const entry of ENTRIES) {
   }
 }
 
+// The main entry carries the wasm engines, so none of the scans above apply,
+// but it must still load in Node ESM: the client bindings import it during
+// SSR and consumers import it from Vitest. Node resolves a CommonJS
+// dependency through its `main`, where a named import the CJS export lexer
+// cannot see fails at link time (`import { applyPatch } from 'fast-json-patch'`
+// did, with "does not provide an export named 'applyPatch'").
+try {
+  await import(pathToFileURL(join(dist, 'index.js')).href);
+} catch (error) {
+  problems.push(`index.js fails to import in Node: ${error?.message ?? error}`);
+}
+
 // Fully bundled size (entry + npm deps, minified), when rolldown is reachable
 // through tsdown. Informational only.
 async function bundledGzip(entry) {
@@ -166,7 +179,7 @@ for (const s of sizes) {
 if (problems.length > 0) {
   for (const p of problems) console.error(`check-worker-entries: ${p}`);
   console.error(
-    'The /pure, /live and /sw entries must stay free of wasm, the logger and DOM globals.'
+    'The /pure, /live and /sw entries must stay free of wasm, the logger and DOM globals, and every entry must import in Node.'
   );
   process.exit(1);
 }

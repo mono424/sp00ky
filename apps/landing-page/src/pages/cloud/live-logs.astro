@@ -36,6 +36,11 @@ import FeaturePage from '../../layouts/FeaturePage.astro';
     the two you almost always want together.
   </p>
   <p>
+    The database is in there too. SurrealDB's own log streams next to everything else,
+    so when a query fails or the database restarts, you read it right beside the sync
+    lines it broke. <code>--filter surrealdb</code> shows just the database.
+  </p>
+  <p>
     Need to watch two streams side by side? Pass <code>--split v</code> and you get a
     vertical split, or <code>--split h</code> for stacked. Looking for a specific error?
     <code>--grep</code> runs a real regex on the server, so your terminal is not doing

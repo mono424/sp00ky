@@ -37,6 +37,7 @@ import { pageSkeleton } from '../skeletons';
 import { ProjectApp } from '../ProjectApp';
 import { Database, SqlEditor } from '../routes/Database';
 import { Flags } from '../routes/Flags';
+import { Logs } from '../routes/Logs';
 import { Storage } from '../routes/Storage';
 import { Users } from '../routes/Users';
 import { SignInFrame } from '../routes/Login';
@@ -367,7 +368,14 @@ function ProjectView(props: { workspace: Workspace; project: WorkspaceProject; s
         )}
       </Match>
       <Match when={state().kind === 'limited' && state()}>
-        {(s) => <CloudOnly base={base} reason={(s() as { reason: string }).reason} routes={cloudRoutes()} />}
+        {(s) => (
+          <CloudOnly
+            base={base}
+            reason={(s() as { reason: string }).reason}
+            dbLogs={props.project.platform !== 'cloudflare'}
+            routes={cloudRoutes()}
+          />
+        )}
       </Match>
     </Switch>
   );
@@ -381,7 +389,7 @@ function Opening() {
 }
 
 /** The cloud's own pages for a project whose dashboard cannot open. */
-function CloudOnly(props: { base: string; reason: string; routes: JSX.Element }) {
+function CloudOnly(props: { base: string; reason: string; dbLogs: boolean; routes: JSX.Element }) {
   const Notice = () => (
     <>
       <PageHead title="Overview" />
@@ -392,6 +400,9 @@ function CloudOnly(props: { base: string; reason: string; routes: JSX.Element })
             <p class="cx-reason">{props.reason}</p>
             <div class="cx-actions">
               <A class="btn btn-sm" href="/deployments">Deployments</A>
+              <Show when={props.dbLogs}>
+                <A class="btn btn-sm" href="/logs">Database logs</A>
+              </Show>
               <A class="btn btn-sm" href="/settings">Settings</A>
             </div>
           </div>
@@ -403,6 +414,8 @@ function CloudOnly(props: { base: string; reason: string; routes: JSX.Element })
     <Router base={props.base} root={(r) => <Shell session={CLOUD_SESSION} overview={undefined} onSignOut={() => undefined}>{r.children}</Shell>}>
       <Route path="/" component={Notice} />
       {props.routes}
+      {/* The database's log comes from the cloud, so it is here when the dashboard is not. */}
+      <Route path="/logs" component={() => (props.dbLogs ? <Logs overview={undefined} cloudOnly /> : <Notice />)} />
       <Route path="*" component={Notice} />
     </Router>
   );

@@ -897,6 +897,11 @@ impl Scheduler {
         // Publish it for the admin plane, which came up with the HTTP servers
         // (before this point) and answers 503 until this lands.
         *self.db_slot.write().await = Some(admin_db);
+        // Move legacy `_00_version` rows to keyed ids in the background, on a
+        // session of its own (see `maintenance::version_ledger`). Until it is
+        // done the events move each row on its record's first write, and the
+        // row scans keep a fallback for the rest.
+        maintenance::version_ledger::spawn_migration(self.config.db.clone());
         // Web Push rides the shared handle: its reads are small and keyed.
         // Built before the tail starts so the first changes it reads can push.
         if let Some(engine) = crate::push::start(Arc::clone(&shared_db)) {

@@ -11,6 +11,7 @@ pub mod impersonation;
 pub mod range_hash;
 pub mod schema;
 pub mod snapshot_hash;
+pub mod version_ledger;
 
 /// Storage mode for the SSP's per-query reference tables (`_00_query`,
 /// `_00_list_ref`). Shared by the CLI (reads from `sp00ky.yml`), the SSP
@@ -745,59 +746,85 @@ mod tests {
     }
 
     #[test]
-    fn version_lookup_follows_the_server_major() {
+    fn version_lookup_is_keyed_once_no_legacy_row_remains() {
+        for v in [Some("surrealdb-4.0.1"), Some("3.3.5"), None] {
+            assert_eq!(VersionLookup::for_ledger(v, false), VersionLookup::Keyed, "{v:?}");
+        }
         for (v, want) in [
-            ("surrealdb-4.0.0-beta.1", VersionLookup::ParentId),
-            ("4.0.0", VersionLookup::ParentId),
-            ("v4.1.2", VersionLookup::ParentId),
-            ("surrealdb-3.3.5", VersionLookup::BoundId),
-            ("3.1.5", VersionLookup::BoundId),
-            ("portable-mem", VersionLookup::BoundId),
-            ("", VersionLookup::BoundId),
+            (Some("surrealdb-4.0.0-beta.1"), VersionLookup::KeyedThenParentId),
+            (Some("4.0.1"), VersionLookup::KeyedThenParentId),
+            (Some("v4.1.2"), VersionLookup::KeyedThenParentId),
+            (Some("surrealdb-3.3.5"), VersionLookup::KeyedThenBoundId),
+            (Some("3.1.5"), VersionLookup::KeyedThenBoundId),
+            (Some("portable-mem"), VersionLookup::KeyedThenBoundId),
+            (Some(""), VersionLookup::KeyedThenBoundId),
+            (None, VersionLookup::KeyedThenBoundId),
         ] {
-            assert_eq!(VersionLookup::for_server(v), want, "{v}");
+            assert_eq!(VersionLookup::for_ledger(v, true), want, "{v:?}");
         }
     }
 
     #[test]
-    fn durable_versions_project_the_lookup_the_server_indexes() {
+    fn durable_versions_read_the_keyed_row_first() {
         let page = "SELECT * OMIT blob FROM game WHERE id > game:a ORDER BY id LIMIT 10";
-        let v3 = with_durable_row_versions(page);
-        assert_eq!(v3, with_durable_row_versions_using(page, VersionLookup::BoundId));
+        let keyed = with_durable_row_versions(page);
+        assert_eq!(keyed, with_durable_row_versions_using(page, VersionLookup::Keyed));
+        assert!(keyed.starts_with("SELECT *, type::record('_00_version', [id]).version ?? _00_rv ?? 1 AS _00_rv OMIT blob FROM game"), "{keyed}");
+        assert!(!keyed.contains("record_id"), "no index lookup at all: {keyed}");
+        let v3 = with_durable_row_versions_using(page, VersionLookup::KeyedThenBoundId);
+        assert!(v3.starts_with("SELECT *, type::record('_00_version', [id]).version ?? { LET $spky_row_id = id;"), "{v3}");
         assert!(v3.contains("record_id = $spky_row_id"), "{v3}");
-        let v4 = with_durable_row_versions_using(page, VersionLookup::ParentId);
-        assert!(v4.starts_with("SELECT *, (SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1 AS _00_rv OMIT blob FROM game"), "{v4}");
+        let v4 = with_durable_row_versions_using(page, VersionLookup::KeyedThenParentId);
+        assert!(v4.starts_with("SELECT *, type::record('_00_version', [id]).version ?? (SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1 AS _00_rv OMIT blob FROM game"), "{v4}");
         assert!(!v4.contains("$spky_row_id"), "{v4}");
     }
 }
 
-/// How a scan reads each row's version from the `_00_version` ledger: a
-/// correlated subquery per row, which the two SurrealDB lines plan in
-/// opposite ways. Measured 2026-11-06 on pages over a 46k-row ledger: 3.3.5
-/// uses the index for an id bound in a block first (5 rows: 5 ms) and scans
-/// the ledger for every row on `$parent.id` (28 s); 4.0.0-beta.1 is the
-/// reverse (46 rows: 35 s bound, 0.2 s on `$parent.id`), and a cold SSP
-/// bootstrap of a 46k-row table took over an hour.
+/// How a scan reads each row's version from the `_00_version` ledger (see
+/// [`version_ledger`]).
+///
+/// A keyed ledger row is one key read per scanned row on every server:
+/// measured 2026-11-16, a 1000-row page over a 200k-row ledger took 13 ms on
+/// SurrealDB 4.0.1 and 25 ms on 3.3.5. While legacy rows remain, a row with no
+/// keyed entry falls back to the old correlated `record_id` subquery, which
+/// the two SurrealDB lines plan in opposite ways (3.3.5 seeks the index for
+/// an id bound in a block first and scans the ledger on `$parent.id`; 4.0.1
+/// the reverse; the wrong form took 84 s for 1000 rows on a 200k ledger). The
+/// fallback is behind `??`, which evaluates its right side only when the
+/// keyed read is NONE, so a migrated row never pays for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VersionLookup {
-    /// The outer id bound with `LET` before the lookup: SurrealDB 3.
+    /// Every ledger row is keyed: no fallback, the same on every server.
     #[default]
-    BoundId,
-    /// The lookup on `$parent.id`: SurrealDB 4.
-    ParentId,
+    Keyed,
+    /// Legacy rows remain: keyed, else the lookup with the outer id bound
+    /// first (`LET`), the form SurrealDB 3 plans as an index read.
+    KeyedThenBoundId,
+    /// Legacy rows remain: keyed, else the lookup on `$parent.id`, the form
+    /// SurrealDB 4 plans as an index read.
+    KeyedThenParentId,
 }
 
 impl VersionLookup {
-    /// The lookup for a server whose `/version` reads `version`
-    /// (`surrealdb-4.0.0-beta.1`, `4.0.0`): `ParentId` from 4 on, `BoundId`
-    /// for anything else, an unknown version included.
-    pub fn for_server(version: &str) -> Self {
-        let v = version.trim();
-        let v = v.strip_prefix("surrealdb-").unwrap_or(v);
-        let v = v.strip_prefix('v').unwrap_or(v);
-        match v.split('.').next().and_then(|major| major.parse::<u32>().ok()) {
-            Some(major) if major >= 4 => Self::ParentId,
-            _ => Self::BoundId,
+    /// The lookup for a ledger that still holds legacy rows (or not) on a
+    /// server whose `/version` reads `server_version` (`surrealdb-4.0.1`,
+    /// `3.3.5`; `None` when it could not be read). Without legacy rows the
+    /// server does not matter. Resolve it per scan (see
+    /// [`version_ledger::HEAD_QUERY`]): both inputs change under a running
+    /// process, when the migration finishes or the server is upgraded.
+    pub fn for_ledger(server_version: Option<&str>, legacy_rows_remain: bool) -> Self {
+        if !legacy_rows_remain {
+            return Self::Keyed;
+        }
+        let major = server_version.and_then(|v| {
+            let v = v.trim();
+            let v = v.strip_prefix("surrealdb-").unwrap_or(v);
+            let v = v.strip_prefix('v').unwrap_or(v);
+            v.split('.').next().and_then(|major| major.parse::<u32>().ok())
+        });
+        match major {
+            Some(major) if major >= 4 => Self::KeyedThenParentId,
+            _ => Self::KeyedThenBoundId,
         }
     }
 }
@@ -805,20 +832,22 @@ impl VersionLookup {
 /// Include durable row versions when scanning upstream application tables.
 /// Call only when INFO FOR DB contains `_00_version`; replicas already carry
 /// `_00_rv`, and bare integration databases may have no version table.
-/// The SurrealDB 3 form; see [`with_durable_row_versions_using`].
+/// The keyed form; see [`with_durable_row_versions_using`].
 pub fn with_durable_row_versions(page_query: &str) -> String {
-    with_durable_row_versions_using(page_query, VersionLookup::BoundId)
+    with_durable_row_versions_using(page_query, VersionLookup::Keyed)
 }
 
-/// [`with_durable_row_versions`] with the lookup the server plans as an
-/// index read ([`VersionLookup`]).
+/// [`with_durable_row_versions`] with the given [`VersionLookup`].
 pub fn with_durable_row_versions_using(page_query: &str, lookup: VersionLookup) -> String {
     let projection = match lookup {
+        VersionLookup::Keyed => {
+            "SELECT *, type::record('_00_version', [id]).version ?? _00_rv ?? 1 AS _00_rv"
+        }
         // Bind the outer id before planning the lookup. A correlated $parent.id
         // predicate makes SurrealDB 3 scan the entire ledger for every source row.
-        VersionLookup::BoundId => "SELECT *, { LET $spky_row_id = id; RETURN (SELECT VALUE version FROM _00_version WHERE record_id = $spky_row_id LIMIT 1)[0] ?? _00_rv ?? 1; } AS _00_rv",
+        VersionLookup::KeyedThenBoundId => "SELECT *, type::record('_00_version', [id]).version ?? { LET $spky_row_id = id; RETURN (SELECT VALUE version FROM _00_version WHERE record_id = $spky_row_id LIMIT 1)[0]; } ?? _00_rv ?? 1 AS _00_rv",
         // SurrealDB 4 scans the ledger for a bound id and seeks the index on this.
-        VersionLookup::ParentId => "SELECT *, (SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1 AS _00_rv",
+        VersionLookup::KeyedThenParentId => "SELECT *, type::record('_00_version', [id]).version ?? (SELECT VALUE version FROM _00_version WHERE record_id = $parent.id LIMIT 1)[0] ?? _00_rv ?? 1 AS _00_rv",
     };
     page_query.replacen("SELECT *", projection, 1)
 }

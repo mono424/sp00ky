@@ -11,6 +11,7 @@
 import type { ActivityReport } from './audienceStats';
 import type { BuildPoint, RunStep, StepStat } from './buildStats';
 import type { BranchList } from './linkPlan';
+import { readEvents } from '../api/client';
 
 export class CloudError extends Error {
   constructor(
@@ -105,6 +106,68 @@ export async function cloud<T>(path: string, opts: CallOptions = {}): Promise<T>
   if (res.status === 204) return undefined as T;
   const text = await res.text();
   return (text ? JSON.parse(text) : undefined) as T;
+}
+
+/**
+ * An event stream from the cloud, read off a `fetch` body: `EventSource`
+ * cannot send `X-Spky-Console`. Returns the way to close it.
+ *
+ * `onError` says whether trying again could help: a refusal (4xx), or an
+ * `error` frame (the API's way of failing once the stream has opened), is
+ * `final`; a dropped connection, a 5xx (the API mid-deploy), or a stream the
+ * server ended (a live tail closes after an hour), is not.
+ */
+export function cloudStream(
+  path: string,
+  opts: Pick<CallOptions, 'tenant'>,
+  handlers: {
+    onEvent: (event: string, data: string) => void;
+    onOpen?: () => void;
+    onError?: (err: Error, final: boolean) => void;
+  },
+): () => void {
+  const controller = new AbortController();
+  let closed = false;
+  void (async () => {
+    const headers: Record<string, string> = { 'X-Spky-Console': '1', Accept: 'text/event-stream' };
+    if (opts.tenant) headers['X-Tenant-ID'] = opts.tenant;
+    try {
+      const res = await fetch(`/v1${path}`, { credentials: 'same-origin', headers, signal: controller.signal });
+      if (res.status === 401) signIn();
+      if (!res.ok || !res.body) {
+        let message = `Stream failed (${res.status})`;
+        try {
+          const body = await res.json();
+          if (typeof body?.error === 'string') message = body.error;
+        } catch {
+          /* keep the default */
+        }
+        throw new CloudError(res.status, undefined, message);
+      }
+      handlers.onOpen?.();
+      // Written from the frame callback, so an object TypeScript does not narrow.
+      const end = { failed: null as string | null };
+      await readEvents(
+        res.body,
+        (event, data) => {
+          if (event === 'error') end.failed = data || 'The stream failed';
+          else handlers.onEvent(event, data);
+        },
+        () => closed || end.failed !== null,
+      );
+      if (closed) return;
+      handlers.onError?.(new Error(end.failed ?? 'Stream ended'), end.failed !== null);
+    } catch (err) {
+      // An abort is us closing the stream, not a failure.
+      if (!closed && (err as { name?: string })?.name !== 'AbortError') {
+        handlers.onError?.(err instanceof Error ? err : new Error(String(err)), err instanceof CloudError && err.status < 500);
+      }
+    }
+  })();
+  return () => {
+    closed = true;
+    controller.abort();
+  };
 }
 
 /* ------------------------------------------------------------------ */

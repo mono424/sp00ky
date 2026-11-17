@@ -20,5 +20,5 @@ tracing = "0.1"
 [dev-dependencies]
 # Embedded in-memory SurrealDB so the engine tests run the real SQL against the
 # real shipped DDL (same approach as schedule-core).
-surrealdb = { version = "3.1.2", default-features = false, features = ["kv-mem"] }
+surrealdb = { version = "4.0.1", default-features = false, features = ["kv-mem"] }
 tokio = { version = "1", features = ["full"] }

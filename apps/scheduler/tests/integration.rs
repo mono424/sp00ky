@@ -720,7 +720,7 @@ mod ingest_tests {
         // Owned while queued: cluster recovery must not take these as orphans.
         assert_eq!(
             h.ssp_pool.read().await.queued_jobs(),
-            ["job:1", "job:2"].into_iter().map(String::from).collect()
+            ["job:1", "job:2"].into_iter().map(String::from).collect::<std::collections::HashSet<String>>()
         );
 
         ingest::redeliver_to_lagging_ssp(h.ingest_state(), "ssp-0".to_string()).await;
@@ -5678,7 +5678,7 @@ mod admin_plane {
 #[tokio::test]
 async fn replica_clone_preserves_durable_row_versions() {
     let source_dir = tempfile::tempdir().unwrap();
-    let source = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+    let source = surrealdb::Surreal::new::<surrealdb::engine::local::SurrealKv>(
         source_dir.path().join("source").to_str().unwrap()).await.unwrap();
     source.use_ns("test").use_db("test").await.unwrap();
     source.query("DEFINE TABLE user SCHEMALESS PERMISSIONS FULL; \
@@ -5765,7 +5765,7 @@ async fn drift_repair_pushes_the_difference_through_ingest() {
     h.add_ready_ssp("ssp-0", &format!("http://{addr}")).await;
 
     let upstream_dir = tempfile::tempdir().unwrap();
-    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::SurrealKv>(
         upstream_dir.path().join("upstream").to_str().unwrap()).await.unwrap();
     upstream.use_ns("test").use_db("test").await.unwrap();
     upstream.query("DEFINE TABLE puzzle SCHEMALESS PERMISSIONS FULL; \
@@ -5843,7 +5843,7 @@ async fn a_new_table_is_backfilled_uncapped_across_pages() {
 
     let h = TestHarness::new().await;
     let upstream_dir = tempfile::tempdir().unwrap();
-    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::SurrealKv>(
         upstream_dir.path().join("upstream").to_str().unwrap()).await.unwrap();
     upstream.use_ns("test").use_db("test").await.unwrap();
     upstream.query("DEFINE TABLE puzzle SCHEMALESS PERMISSIONS FULL; CREATE puzzle:a SET t = 1;")
@@ -5913,7 +5913,7 @@ async fn drift_repair_corrects_a_row_deleted_while_it_ran() {
 
     let h = TestHarness::new().await;
     let upstream_dir = tempfile::tempdir().unwrap();
-    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::RocksDb>(
+    let upstream = surrealdb::Surreal::new::<surrealdb::engine::local::SurrealKv>(
         upstream_dir.path().join("upstream").to_str().unwrap()).await.unwrap();
     upstream.use_ns("test").use_db("test").await.unwrap();
     upstream.query("DEFINE TABLE puzzle SCHEMALESS PERMISSIONS FULL; \

@@ -578,9 +578,20 @@ PERMISSIONS WHERE $auth.id != NONE
     AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
 
 -- Drop every assignment of `$key` (a flag that no longer exists).
+-- Root and system users (the scheduler, the CLI) see every row: bind the ids
+-- and delete them, because `DELETE _00_user_feature WHERE` inside a function
+-- body is a scan of the table on SurrealDB 4.0.1. A record user (an admin in
+-- DevTools) can SELECT only their own assignment, so their lookup would find
+-- and drop that row alone: for them the DELETE matches every user's row
+-- through the delete permission, as `fn::feature::put`'s UPSERT does.
+-- spky-lint: allow write-where
 DEFINE FUNCTION OVERWRITE fn::feature::drop_assignments($key: string) {
-    LET $ids = (SELECT VALUE id FROM _00_user_feature WHERE key = $key);
-    DELETE $ids;
+    IF $access = NONE {
+        LET $ids = (SELECT VALUE id FROM _00_user_feature WHERE key = $key);
+        DELETE $ids;
+    } ELSE {
+        DELETE _00_user_feature WHERE key = $key;
+    };
 }
 PERMISSIONS WHERE $auth.id != NONE
     AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;

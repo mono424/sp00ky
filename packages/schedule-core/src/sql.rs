@@ -644,45 +644,64 @@ DELETE $doomed.id; \
 COMMIT; \
 RETURN $doomed;";
 
-/// Prune workflow runs together with their steps, oldest batch first.
+/// The next batch of workflow runs to prune, oldest first.
+/// [`delete_workflow_runs`] then deletes the batch together with its steps.
 ///
-/// The steps go first and are selected by `workflow_run INSIDE $ids`, which rides
-/// `idx_step_wf`. The previous form filtered steps on
-/// `workflow_run.status != 'running'` — a record dereference, i.e. a point read
-/// per candidate row, on top of a full table scan. Deleting a run's steps in the
-/// same statement as the run also makes an orphaned step structurally impossible
-/// going forward — which is why there is no separate step-run prune: a step is only
-/// ever reachable through its run, and the old independent statement pruned steps
-/// BEFORE runs anyway (a run finalizes after its steps, so `run.finished_at >=
-/// step.finished_at`), so no database can be carrying orphans.
+/// Two statements rather than one because the steps have to be found by run:
+/// `DELETE _00_step_run WHERE workflow_run INSIDE $ids` is a table scan on
+/// SurrealDB 4.0.1 even at the top level of a request (96 ms on 300k steps
+/// with `$ids` empty; 3.3.5 used `idx_step_wf`), and inside the old
+/// `RETURN { ... }` block every prune paid it (2 to 5 s on WhitePawn, every
+/// minute). One equality per run is an index read on both lines.
 pub const PRUNE_WORKFLOW_RUNS: &str = "\
-BEGIN; \
-LET $doomed = (SELECT id, schedule_name, finished_at, \
+SELECT id, schedule_name, finished_at, \
 time::floor(finished_at, 1h) AS bucket FROM _00_workflow_run \
 WHERE status = $status AND finished_at != NONE AND finished_at < <datetime>$before \
-ORDER BY finished_at ASC LIMIT $batch); \
-LET $ids = $doomed.id; \
-DELETE _00_step_run WHERE workflow_run INSIDE $ids; \
-DELETE $ids; \
-COMMIT; \
-RETURN $doomed;";
+ORDER BY finished_at ASC LIMIT $batch";
 
+/// Delete `n` workflow runs, bound as `$r0..$r{n-1}` (record id strings, as
+/// [`PRUNE_WORKFLOW_RUNS`] returned them), with their steps, steps FIRST, in
+/// one transaction of top-level statements. A step row is only reachable
+/// through its run, so a run deleted before its steps would leak them.
+pub fn delete_workflow_runs(n: usize) -> String {
+    let mut sql = String::from("BEGIN; ");
+    for i in 0..n {
+        sql.push_str(&format!("LET $w{i} = type::record($r{i}); DELETE _00_step_run WHERE workflow_run = $w{i}; "));
+    }
+    let runs: Vec<String> = (0..n).map(|i| format!("$w{i}")).collect();
+    if n > 0 {
+        sql.push_str(&format!("DELETE {}; ", runs.join(", ")));
+    }
+    sql.push_str("COMMIT;");
+    sql
+}
 
-
-/// Finished durable workflow instances (`@spooky-sync/backend`) past their
-/// window, with their steps and events. An instance can hold hundreds of
-/// steps, so the engine runs this with a smaller batch than the run prunes.
+/// The next batch of finished durable workflow instances (`@spooky-sync/backend`)
+/// past their window. An instance can hold hundreds of steps, so the engine
+/// runs this with a smaller batch than the run prunes;
+/// [`delete_durable_instances`] deletes them with their steps and events, for
+/// the reason [`PRUNE_WORKFLOW_RUNS`] gives.
 pub const PRUNE_DURABLE_INSTANCES: &str = "\
-BEGIN; \
-LET $doomed = (SELECT id, finished_at FROM _00_wf_instance \
+SELECT id, finished_at FROM _00_wf_instance \
 WHERE status = $status AND finished_at != NONE AND finished_at < <datetime>$before \
-ORDER BY finished_at ASC LIMIT $batch); \
-LET $ids = $doomed.id; \
-DELETE _00_wf_step WHERE instance INSIDE $ids; \
-DELETE _00_wf_event WHERE instance INSIDE $ids; \
-DELETE $ids; \
-COMMIT; \
-RETURN $doomed;";
+ORDER BY finished_at ASC LIMIT $batch";
+
+/// Delete `n` durable instances bound as `$r0..$r{n-1}`, steps and events
+/// first, in one transaction of top-level statements.
+pub fn delete_durable_instances(n: usize) -> String {
+    let mut sql = String::from("BEGIN; ");
+    for i in 0..n {
+        sql.push_str(&format!(
+            "LET $w{i} = type::record($r{i}); DELETE _00_wf_step WHERE instance = $w{i}; DELETE _00_wf_event WHERE instance = $w{i}; "
+        ));
+    }
+    let ids: Vec<String> = (0..n).map(|i| format!("$w{i}")).collect();
+    if n > 0 {
+        sql.push_str(&format!("DELETE {}; ", ids.join(", ")));
+    }
+    sql.push_str("COMMIT;");
+    sql
+}
 
 /// The durable instance statuses the prune takes, each with whether it keeps
 /// the failure window (true) or the success one.
@@ -938,7 +957,7 @@ mod tests {
             "idx_srun_retention",  // PRUNE_SCHEDULE_RUNS status + ordering
             "idx_srun_fire",       // `spky schedules` fire_at sorts
             "idx_wfrun_retention", // PRUNE_WORKFLOW_RUNS
-            "idx_step_wf",         // PRUNE_WORKFLOW_RUNS' step delete
+            "idx_step_wf",         // delete_workflow_runs' step delete
         ] {
             assert!(
                 SCHEDULE_TABLES.contains(index),
@@ -1117,19 +1136,24 @@ mod tests {
     /// events).
     #[test]
     fn prunes_are_single_batched_statements() {
-        for sql in [
-            PRUNE_SCHEDULE_RUNS,
-            PRUNE_SCHEDULE_RUNS_FOR,
-            PRUNE_WORKFLOW_RUNS,
-            PRUNE_DURABLE_INSTANCES,
-            &prune_job_table("job"),
-        ] {
+        for sql in [PRUNE_SCHEDULE_RUNS, PRUNE_SCHEDULE_RUNS_FOR, &prune_job_table("job")] {
             assert!(sql.starts_with("BEGIN; "), "prune must be one transaction: {sql}");
             assert!(sql.ends_with("COMMIT; RETURN $doomed;"), "prune must answer with the batch last: {sql}");
             assert!(!sql.contains('{'), "prune must not use a block expression: {sql}");
             assert!(sql.contains("LIMIT $batch"), "prune must be batched: {sql}");
             assert!(!sql.contains("RETURN BEFORE"), "prune must not haul rows back: {sql}");
         }
+        for sql in [PRUNE_WORKFLOW_RUNS, PRUNE_DURABLE_INSTANCES] {
+            assert!(sql.starts_with("SELECT ") && sql.contains("LIMIT $batch"), "selection must be batched: {sql}");
+        }
+        // the batch's own delete: per id, no list match, no block
+        for sql in [delete_workflow_runs(3), delete_durable_instances(3)] {
+            assert!(sql.starts_with("BEGIN; ") && sql.ends_with("COMMIT;"), "{sql}");
+            assert!(!sql.contains("INSIDE") && !sql.contains(" IN ") && !sql.contains('{'), "{sql}");
+        }
+        let wf = delete_workflow_runs(2);
+        assert!(wf.find("DELETE _00_step_run").unwrap() < wf.find("DELETE $w0, $w1").unwrap(), "steps first: {wf}");
+        assert_eq!(delete_workflow_runs(0), "BEGIN; COMMIT;");
     }
 
     /// No prune statement may use `NOT INSIDE`. SurrealDB parses `INSIDE` as a

@@ -1313,9 +1313,8 @@ impl ScheduleEngine {
         }
         for status in sql::WORKFLOW_RUN_PRUNABLE {
             let before = json!(stamp(now - policy.for_run_status(status)));
-            self.prune_batches(
-                sql::PRUNE_WORKFLOW_RUNS,
-                &[("status", json!(status))],
+            self.prune_workflow_runs(
+                status,
                 &before,
                 Fold { scope: SCOPE_SCHEDULE, status, name: RollupName::Field("schedule_name") },
                 report,
@@ -1548,9 +1547,25 @@ impl ScheduleEngine {
     async fn prune_durable(&self, status: &str, before: &Value, report: &mut TickReport) {
         for _ in 0..PRUNE_MAX_BATCHES {
             let binds = [("before", before.clone()), ("batch", json!(DURABLE_PRUNE_BATCH)), ("status", json!(status))];
-            match self.db.query(sql::PRUNE_DURABLE_INSTANCES, &binds).await {
-                Ok(results) => {
-                    let n = last_rows(results).len();
+            let found = match self.db.query(sql::PRUNE_DURABLE_INSTANCES, &binds).await {
+                Ok(results) => rows(results),
+                Err(e) => {
+                    // A project that predates the tables has none to prune.
+                    if !e.to_string().to_ascii_lowercase().contains("does not exist") {
+                        tracing::warn!(error = %e, status, "durable instance prune failed");
+                    }
+                    return;
+                }
+            };
+            let ids = row_ids(&found);
+            if ids.is_empty() {
+                return;
+            }
+            let binds: Vec<(String, Value)> = ids.iter().enumerate().map(|(i, id)| (format!("r{i}"), json!(id))).collect();
+            let refs: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            match self.db.query(&sql::delete_durable_instances(ids.len()), &refs).await {
+                Ok(_) => {
+                    let n = ids.len();
                     report.pruned += n;
                     if n < DURABLE_PRUNE_BATCH {
                         return;
@@ -1565,6 +1580,41 @@ impl ScheduleEngine {
                 }
             }
         }
+    }
+
+    /// [`Self::prune_batches`] for workflow runs: select the batch, then delete it
+    /// with its steps by id ([`sql::delete_workflow_runs`]).
+    async fn prune_workflow_runs(&self, status: &str, before: &Value, fold: Fold<'_>, report: &mut TickReport) {
+        for _ in 0..PRUNE_MAX_BATCHES {
+            let binds = [("before", before.clone()), ("batch", json!(PRUNE_BATCH)), ("status", json!(status))];
+            let doomed = match self.db.query(sql::PRUNE_WORKFLOW_RUNS, &binds).await {
+                Ok(results) => rows(results),
+                Err(e) => {
+                    tracing::warn!(error = %e, status = %fold.status, "history prune failed");
+                    return;
+                }
+            };
+            let ids = row_ids(&doomed);
+            if ids.is_empty() {
+                return;
+            }
+            let binds: Vec<(String, Value)> = ids.iter().enumerate().map(|(i, id)| (format!("r{i}"), json!(id))).collect();
+            let refs: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            if let Err(e) = self.db.query(&sql::delete_workflow_runs(ids.len()), &refs).await {
+                tracing::warn!(error = %e, status = %fold.status, "history prune failed");
+                return;
+            }
+            report.pruned += doomed.len();
+            self.fold_rollup(&doomed, fold).await;
+            if doomed.len() < PRUNE_BATCH {
+                return;
+            }
+        }
+        tracing::info!(
+            status = %fold.status,
+            batches = PRUNE_MAX_BATCHES,
+            "history prune hit its per-pass batch budget; continuing next pass"
+        );
     }
 
     async fn prune_batches(
@@ -1763,6 +1813,11 @@ pub(crate) fn bind_ref(prefix: &str, r: &ids::Ref) -> [(&'static str, Value); 2]
 
 /// RFC 3339 with millisecond precision — the form SurrealDB's flattened values
 /// hand back, so a stamp we write can be compared against one we read.
+/// The `id` of each row, as the string SurrealDB rendered it.
+fn row_ids(rows: &[Value]) -> Vec<String> {
+    rows.iter().filter_map(|r| r.get("id").and_then(Value::as_str).map(String::from)).collect()
+}
+
 pub(crate) fn stamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }

@@ -215,9 +215,19 @@ there. `--namespace` cannot reach outside it.
 | --- | --- |
 | `-y`, `--yes` | The [global flag](#running-unattended--y----yes): confirms applying to production. Without it, and without a terminal, the migration is refused rather than run unasked. |
 | `--force-schema` | Re-apply the internal schema and remote functions even when unchanged, bypassing the schema-hash skip. Also accepted by `spky migrate apply`. Use it for drift recovery. |
+| `--allow-schema-downgrade` | Push the internal schema even though a newer `spky` recorded the one on the database (a deliberate rollback). Also accepted by `spky migrate apply` and `spky deploy`. |
 | `--migrations-dir <dir>` | Override the migrations directory from `sp00ky.yml`. |
 | `--endpoint <url>`, `--secret <s>` | Override the SSP or scheduler endpoint and auth secret used for the internal schema. |
 | `--config <path>` | Point at a `sp00ky.yml` somewhere else. |
+
+Every push of the internal schema records the `spky` version that made it. Before writing
+anything, `migrate prod`, `migrate apply` and `deploy` read that version, and if a newer CLI
+pushed the schema they refuse: an older `spky` (one left on `PATH`, say) would replace the
+generated events, functions and indexes with older ones. The message names both versions;
+install the one it names (`npm i -g @spooky-sync/cli@<version>`) or run the repository's pinned
+CLI by its path, and check with `spky --version`. `--allow-schema-downgrade` (or
+`SPKY_ALLOW_SCHEMA_DOWNGRADE=1`) lets a deliberate rollback through. Against a database on this
+machine (`localhost`, and anything `spky dev` applies) it only warns.
 
 Raise `SPKY_DB_HTTP_TIMEOUT_SECS` when a large migration exceeds the 120 second per-request
 deadline. [Migrations](/docs/schema/migrations)

@@ -833,6 +833,9 @@ DEFINE FIELD OVERWRITE released_at ON TABLE _00_query_allowlist TYPE datetime DE
 DEFINE TABLE OVERWRITE _00_schema_state SCHEMAFULL PERMISSIONS NONE;
 DEFINE FIELD OVERWRITE hash ON TABLE _00_schema_state TYPE string;
 DEFINE FIELD OVERWRITE updated_at ON TABLE _00_schema_state TYPE datetime VALUE time::now();
+-- The CLI version that recorded the row (`spky migrate` refuses to push over a
+-- schema a newer CLI recorded). option<>: rows and CLIs from before it.
+DEFINE FIELD OVERWRITE cli_version ON TABLE _00_schema_state TYPE option<string>;
 
 -- ==================================================
 -- SPOOKY HEARTBEAT (e2e sync-pipeline probe)

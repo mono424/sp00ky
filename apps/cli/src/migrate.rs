@@ -1070,7 +1070,8 @@ fn read_stored_schema_hash(client: &dyn MigrationDB, id: &str) -> Option<String>
 /// when missing.
 const SCHEMA_STATE_DDL: &str = "DEFINE TABLE IF NOT EXISTS _00_schema_state SCHEMAFULL PERMISSIONS NONE; \
 DEFINE FIELD IF NOT EXISTS hash ON TABLE _00_schema_state TYPE string; \
-DEFINE FIELD IF NOT EXISTS updated_at ON TABLE _00_schema_state TYPE datetime VALUE time::now(); ";
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE _00_schema_state TYPE datetime VALUE time::now(); \
+DEFINE FIELD IF NOT EXISTS cli_version ON TABLE _00_schema_state TYPE option<string>; ";
 
 /// Record the applied schema hash for `id` in `_00_schema_state` (best-effort:
 /// a failure here only costs a redundant re-apply next time, so it warns rather
@@ -1085,12 +1086,165 @@ fn record_schema_hash(client: &dyn MigrationDB, id: &str, hash: &str) {
     // EXISTING ROWS. Every first `migrate apply` on a fresh 4.x database
     // failed there. IF NOT EXISTS leaves an existing definition alone.
     let q = format!(
-        "{SCHEMA_STATE_DDL}UPSERT _00_schema_state:{id} SET hash = '{hash}', updated_at = time::now();",
+        "{SCHEMA_STATE_DDL}UPSERT _00_schema_state:{id} SET hash = '{hash}', cli_version = '{CLI_VERSION}', updated_at = time::now();",
         id = id,
         hash = hash
     );
     if let Err(e) = client.execute(&q) {
         ui::warn(format!("failed to record schema hash for '{id}': {e:?}"));
+    }
+}
+
+/// This CLI's version. Recorded beside the schema hash it writes, so a later
+/// push can tell whether a newer CLI wrote the schema on the database.
+pub(crate) const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The CLI version that last recorded the internal schema, if any. A row an
+/// older CLI wrote has none; an older CLI's later `UPSERT ... SET hash,
+/// updated_at` leaves a newer CLI's value in place (checked on 3.3.5 and
+/// 4.0.1), so it keeps naming the newest CLI that pushed.
+fn read_stored_cli_version(client: &dyn MigrationDB) -> Option<String> {
+    let responses = client
+        .execute("SELECT cli_version FROM _00_schema_state:internal;")
+        .ok()?;
+    responses
+        .into_iter()
+        .filter(|r| r.status == "OK")
+        .find_map(|r| {
+            r.result?
+                .as_array()?
+                .first()?
+                .get("cli_version")?
+                .as_str()
+                .map(str::to_string)
+        })
+}
+
+/// A version under semver 2.0 precedence: the three core numbers, then the
+/// pre-release identifiers (`0.0.1-canary.385 < 1.0.0-beta.4 < 1.0.0-beta.5 <
+/// 1.0.0`). Build metadata is ignored.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Version {
+    core: [u64; 3],
+    /// True for a release, which sorts after every pre-release of its core.
+    release: bool,
+    pre: Vec<PreRelease>,
+}
+
+/// One pre-release identifier: numeric ones compare numerically and sort
+/// before alphanumeric ones, which compare as ASCII (the variant order).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreRelease {
+    Num(u64),
+    Alpha(String),
+}
+
+fn parse_version(s: &str) -> Option<Version> {
+    let s = s.trim().trim_start_matches('v');
+    let s = s.split('+').next()?;
+    let (core, pre) = match s.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (s, None),
+    };
+    let nums: Vec<u64> = core.split('.').map(|n| n.parse().ok()).collect::<Option<_>>()?;
+    let core: [u64; 3] = nums.try_into().ok()?;
+    let pre = match pre {
+        None => Vec::new(),
+        Some(pre) => pre
+            .split('.')
+            .map(|id| {
+                if id.is_empty() {
+                    None
+                } else if id.bytes().all(|b| b.is_ascii_digit()) {
+                    id.parse().ok().map(PreRelease::Num)
+                } else {
+                    Some(PreRelease::Alpha(id.to_string()))
+                }
+            })
+            .collect::<Option<_>>()?,
+    };
+    Some(Version { core, release: pre.is_empty(), pre })
+}
+
+/// Whether `stored` is a newer version than `this`; `None` when either does
+/// not parse.
+fn is_newer(stored: &str, this: &str) -> Option<bool> {
+    Some(parse_version(stored)? > parse_version(this)?)
+}
+
+/// What to do before pushing the internal schema over one a CLI of version
+/// `stored` recorded.
+#[derive(Debug, PartialEq)]
+enum DowngradeCheck {
+    Allow,
+    Warn(String),
+    Refuse(String),
+}
+
+fn schema_downgrade_check(stored: Option<&str>, this: &str, local: bool, allowed: bool) -> DowngradeCheck {
+    let Some(stored) = stored else {
+        return DowngradeCheck::Allow;
+    };
+    if is_newer(stored, this) != Some(true) {
+        return DowngradeCheck::Allow;
+    }
+    let what = format!(
+        "the internal Sp00ky schema on this database was pushed by spky {stored}, and this is spky {this}: \
+         pushing would replace its generated events, functions and indexes with older ones"
+    );
+    if allowed {
+        DowngradeCheck::Warn(format!("{what} (allowed by --allow-schema-downgrade)"))
+    } else if local {
+        DowngradeCheck::Warn(format!("{what} (a local database, so only a warning)"))
+    } else {
+        DowngradeCheck::Refuse(format!(
+            "refusing to push: {what}. Use that CLI instead (`npm i -g @spooky-sync/cli@{stored}`, \
+             or the repository's pinned one by its path; `spky --version` says which one runs), \
+             or pass --allow-schema-downgrade to roll back on purpose"
+        ))
+    }
+}
+
+/// A database on this machine (`spky dev`, a plain `migrate apply` to
+/// localhost): switching to an older branch there only warns.
+fn is_local_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "host.docker.internal")
+        || host.ends_with(".localhost")
+}
+
+/// `--allow-schema-downgrade` (or `SPKY_ALLOW_SCHEMA_DOWNGRADE` set).
+fn schema_downgrade_allowed() -> bool {
+    std::env::var("SPKY_ALLOW_SCHEMA_DOWNGRADE").is_ok()
+}
+
+/// Refuse to push sp00ky's internal schema or remote functions over ones a
+/// newer CLI recorded, before anything is written. An older `spky` on PATH
+/// (0.0.1-canary.385, run as `spky migrate prod` against WhitePawn on
+/// 2026-11-17) re-pushed the events from before the keyed ledger, and SurrealDB
+/// 4.0.1 then scanned the 3M-row ledger on every write until a current CLI
+/// pushed again. On a local database it only warns; `--allow-schema-downgrade`
+/// lets a deliberate rollback through. A missing or unparsable stored version
+/// (rows from before this check) allows the push. `dev` (`spky dev`, whatever
+/// database it points at) only warns too.
+pub fn guard_schema_downgrade(client: &dyn MigrationDB, url: &str, dev: bool) -> Result<()> {
+    let stored = read_stored_cli_version(client);
+    let local = dev || is_local_url(url);
+    match schema_downgrade_check(stored.as_deref(), CLI_VERSION, local, schema_downgrade_allowed()) {
+        DowngradeCheck::Allow => Ok(()),
+        DowngradeCheck::Warn(msg) => {
+            ui::warn(msg);
+            Ok(())
+        }
+        DowngradeCheck::Refuse(msg) => anyhow::bail!(msg),
     }
 }
 
@@ -1624,6 +1778,8 @@ mod tests {
         // Build statuses answered to `INFO FOR INDEX <ix> ON <t>;`, in order
         // (the last one repeats); an index not listed is `ready`.
         index_statuses: RefCell<std::collections::HashMap<String, Vec<String>>>,
+        // `cli_version` answered to the downgrade guard's read.
+        stored_cli_version: RefCell<Option<String>>,
     }
 
     impl MockDB {
@@ -1636,6 +1792,7 @@ mod tests {
                 stored_hash: RefCell::new(None),
                 live_indexes: RefCell::new(Default::default()),
                 index_statuses: RefCell::new(Default::default()),
+                stored_cli_version: RefCell::new(None),
             }
         }
 
@@ -1699,6 +1856,16 @@ mod tests {
                 anyhow::bail!("Mock execute failure");
             }
             self.executed_queries.borrow_mut().push(query.to_string());
+            if query.starts_with("SELECT cli_version FROM _00_schema_state:internal") {
+                let result = match self.stored_cli_version.borrow().as_ref() {
+                    Some(v) => serde_json::json!([{ "cli_version": v }]),
+                    None => serde_json::json!([]),
+                };
+                return Ok(vec![SurrealResponse {
+                    status: "OK".to_string(),
+                    result: Some(result),
+                }]);
+            }
             // Answer the schema-hash read with the configured stored hash.
             if query.starts_with("SELECT hash FROM _00_schema_state") {
                 let result = match self.stored_hash.borrow().as_ref() {
@@ -2665,6 +2832,96 @@ mod tests {
         assert!(out2.contains(
             "DEFINE INDEX OVERWRITE idx_record_id ON TABLE _00_version COLUMNS record_id UNIQUE;"
         ));
+    }
+
+    #[test]
+    fn versions_order_by_semver_precedence() {
+        let newer = |a: &str, b: &str| is_newer(a, b).unwrap();
+        // the old canary line is older than every 1.0.0 pre-release
+        assert!(newer("1.0.0-beta.4", "0.0.1-canary.385"));
+        assert!(!newer("0.0.1-canary.385", "1.0.0-beta.4"));
+        // pre-release numbers compare as numbers
+        assert!(newer("1.0.0-beta.5", "1.0.0-beta.4"));
+        assert!(newer("1.0.0-beta.10", "1.0.0-beta.9"));
+        assert!(newer("0.0.1-canary.385", "0.0.1-canary.99"));
+        // a release outranks its pre-releases; identifiers compare in order
+        assert!(newer("1.0.0", "1.0.0-beta.9"));
+        assert!(newer("1.0.0-beta.1", "1.0.0-beta"));
+        assert!(newer("1.0.0-beta.1", "1.0.0-alpha.9"));
+        assert!(newer("1.0.1", "1.0.0"));
+        // equal is not newer; build metadata and a leading v are ignored
+        assert!(!newer("1.0.0-beta.4", "1.0.0-beta.4"));
+        assert!(!newer("v1.0.0-beta.4+abc", "1.0.0-beta.4"));
+        // what does not parse is not compared
+        for bad in ["", "garbage", "1.0", "1.0.0-", "1.0.0-beta..1", "1.x.0"] {
+            assert_eq!(is_newer(bad, "1.0.0"), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_schema_from_a_newer_cli_is_refused_unless_local_or_allowed() {
+        let this = "0.0.1-canary.385";
+        let refused = schema_downgrade_check(Some("1.0.0-beta.4"), this, false, false);
+        let DowngradeCheck::Refuse(msg) = &refused else { panic!("{refused:?}") };
+        for part in [
+            "pushed by spky 1.0.0-beta.4",
+            "this is spky 0.0.1-canary.385",
+            "older ones",
+            "npm i -g @spooky-sync/cli@1.0.0-beta.4",
+            "--allow-schema-downgrade",
+        ] {
+            assert!(msg.contains(part), "{part:?} missing from: {msg}");
+        }
+        assert!(matches!(schema_downgrade_check(Some("1.0.0-beta.4"), this, true, false), DowngradeCheck::Warn(_)));
+        assert!(matches!(schema_downgrade_check(Some("1.0.0-beta.4"), this, false, true), DowngradeCheck::Warn(_)));
+        // same, older, missing or unparsable: push as before
+        for stored in [Some("0.0.1-canary.385"), Some("0.0.1-canary.12"), None, Some("garbage")] {
+            assert_eq!(schema_downgrade_check(stored, this, false, false), DowngradeCheck::Allow, "{stored:?}");
+        }
+        assert_eq!(schema_downgrade_check(Some("1.0.0-beta.4"), "1.0.0-beta.5", false, false), DowngradeCheck::Allow);
+    }
+
+    #[test]
+    fn local_databases_are_recognised_by_host() {
+        for url in [
+            "http://localhost:8000",
+            "ws://127.0.0.1:8666/rpc",
+            "http://[::1]:8000",
+            "http://root:root@localhost:8000",
+            "http://host.docker.internal:8000",
+            "localhost:8000",
+            "http://surreal.localhost",
+        ] {
+            assert!(is_local_url(url), "{url}");
+        }
+        for url in ["https://whitepawn-db.sp00ky.cloud", "http://10.0.0.5:8000", "https://localhost.example.com"] {
+            assert!(!is_local_url(url), "{url}");
+        }
+    }
+
+    /// The guard reads `cli_version` before anything is written, and the
+    /// recorded hash carries this CLI's version.
+    #[test]
+    fn the_guard_reads_the_recorded_version_and_the_hash_records_this_one() {
+        let mock = MockDB::new();
+        *mock.stored_cli_version.borrow_mut() = Some("999.0.0".into());
+        let err = guard_schema_downgrade(&mock, "https://app-db.sp00ky.cloud", false).unwrap_err();
+        assert!(err.to_string().contains("pushed by spky 999.0.0"), "{err}");
+        assert_eq!(
+            mock.executed_queries.borrow().as_slice(),
+            ["SELECT cli_version FROM _00_schema_state:internal;"],
+            "nothing but the read before refusing"
+        );
+        guard_schema_downgrade(&mock, "http://localhost:8000", false).unwrap();
+        guard_schema_downgrade(&mock, "https://app-db.sp00ky.cloud", true).unwrap();
+        *mock.stored_cli_version.borrow_mut() = Some(CLI_VERSION.into());
+        guard_schema_downgrade(&mock, "https://app-db.sp00ky.cloud", false).unwrap();
+
+        let mock = MockDB::new();
+        record_schema_hash(&mock, "internal", "abc");
+        let q = mock.executed_queries.borrow().join("\n");
+        assert!(q.contains(&format!("cli_version = '{CLI_VERSION}'")), "{q}");
+        assert!(q.contains("DEFINE FIELD IF NOT EXISTS cli_version ON TABLE _00_schema_state TYPE option<string>"), "{q}");
     }
 
     /// A live index whose build failed is defined again (the planner never

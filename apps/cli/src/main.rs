@@ -215,6 +215,10 @@ enum Commands {
         /// unchanged (bypasses the schema-hash skip). Use for drift recovery.
         #[arg(long)]
         force_schema: bool,
+        /// Push the internal schema even though a newer CLI recorded the one on
+        /// the database (a deliberate rollback). Without it the push is refused.
+        #[arg(long)]
+        allow_schema_downgrade: bool,
         /// Mark this deploy's frontend release rows with cache_bust = true:
         /// clients reloading onto the new version clear service-worker caches
         /// first. Use when a previous deploy is wedged behind stale caches.
@@ -1577,6 +1581,10 @@ enum MigrateCommands {
         /// unchanged (bypasses the schema-hash skip). Use for drift recovery.
         #[arg(long)]
         force_schema: bool,
+        /// Push the internal schema even though a newer CLI recorded the one on
+        /// the database (a deliberate rollback). Without it the push is refused.
+        #[arg(long)]
+        allow_schema_downgrade: bool,
     },
     /// Apply pending migrations to the project's Sp00ky Cloud deployment (no deploy).
     ///
@@ -1604,6 +1612,10 @@ enum MigrateCommands {
         /// unchanged (bypasses the schema-hash skip). Use for drift recovery.
         #[arg(long)]
         force_schema: bool,
+        /// Push the internal schema even though a newer CLI recorded the one on
+        /// the database (a deliberate rollback). Without it the push is refused.
+        #[arg(long)]
+        allow_schema_downgrade: bool,
     },
     /// Show migration status
     Status {
@@ -2206,9 +2218,13 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
             endpoint,
             secret,
             force_schema,
+            allow_schema_downgrade,
         } => {
             if force_schema {
                 std::env::set_var("SPKY_FORCE_SCHEMA", "1");
+            }
+            if allow_schema_downgrade {
+                std::env::set_var("SPKY_ALLOW_SCHEMA_DOWNGRADE", "1");
             }
             let config_file = config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
             let sp00ky_config = backend::load_config(&config_file);
@@ -2278,9 +2294,13 @@ fn handle_migrate(action: MigrateCommands) -> Result<()> {
             endpoint,
             secret,
             force_schema,
+            allow_schema_downgrade,
         } => {
             if force_schema {
                 std::env::set_var("SPKY_FORCE_SCHEMA", "1");
+            }
+            if allow_schema_downgrade {
+                std::env::set_var("SPKY_ALLOW_SCHEMA_DOWNGRADE", "1");
             }
             let config_file = config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
             let sp00ky_config = backend::load_config(&config_file);
@@ -3434,11 +3454,15 @@ fn main() -> Result<()> {
             clean,
             only,
             force_schema,
+            allow_schema_downgrade,
             cache_bust,
             mandatory,
         }) => {
             if force_schema {
                 std::env::set_var("SPKY_FORCE_SCHEMA", "1");
+            }
+            if allow_schema_downgrade {
+                std::env::set_var("SPKY_ALLOW_SCHEMA_DOWNGRADE", "1");
             }
             cloud::deploy(upgrade, clean, only, cache_bust, mandatory)
         }

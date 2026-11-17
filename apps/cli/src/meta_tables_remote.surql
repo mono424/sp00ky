@@ -436,6 +436,11 @@ DEFINE INDEX OVERWRITE idx_user_feature_user_key ON TABLE _00_user_feature COLUM
 -- (user, key) index above cannot serve that (key is its second column), so each
 -- of them read the whole table: 1.6 s per flag on WhitePawn under SurrealDB 4.0.1.
 DEFINE INDEX OVERWRITE idx_user_feature_key ON TABLE _00_user_feature COLUMNS key;
+-- fn::feature::assign finds a user's row by (user, key) inside a function
+-- body, where SurrealDB 4.0.1 does not use the composite index above for a
+-- parameter: without this one it reads every row of the flag through the
+-- `key` index, once per user `fn::feature::materialize` assigns.
+DEFINE INDEX OVERWRITE idx_user_feature_user ON TABLE _00_user_feature COLUMNS user;
 
 -- Stable hash for percentage rollouts. Combines flag key and user id
 -- so the same (flag, user) pair always lands in the same bucket 0..99
@@ -513,6 +518,59 @@ DEFINE FUNCTION OVERWRITE fn::feature::rules($flag: object) -> array {
 PERMISSIONS WHERE $auth.id != NONE
     AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
 
+-- The reads and writes of the functions below, kept in functions that call
+-- no other `fn::`: in a function that both writes and calls another function,
+-- SurrealDB 4.0.1 plans the lookups as scans of the table (fn::feature::assign
+-- read every row of a flag per user, so materializing one was quadratic).
+-- `spky lint` reports the shape (`lookup-write-with-call`).
+
+-- A flag by key, or NONE.
+DEFINE FUNCTION OVERWRITE fn::feature::flag($key: string) -> option<object> {
+    RETURN (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+}
+PERMISSIONS WHERE $auth.id != NONE
+    AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
+
+-- Write `$user`'s row for `$key`. Root and system users (the scheduler, the
+-- CLI) see every row: find it, then write it by id, because `UPSERT
+-- _00_user_feature ... WHERE` inside a function body is a scan of the table
+-- on SurrealDB 4.0.1. A record user (an admin in DevTools) cannot SELECT
+-- other users' rows, so their lookup finds nothing: for them the UPSERT
+-- matches the row through the update permission instead (and under a select
+-- rule that is not FULL, 4.0.1 reads the table for their lookups anyway).
+-- spky-lint: allow write-where
+DEFINE FUNCTION OVERWRITE fn::feature::put($user: record, $key: string, $variant: string, $payload: any) -> string {
+    LET $row = IF $access = NONE {
+        (SELECT VALUE id FROM _00_user_feature WHERE user = $user AND key = $key LIMIT 1)[0]
+    } ELSE { NONE };
+    IF $row != NONE {
+        UPDATE $row
+            SET evaluated_at = IF variant = $variant AND payload = $payload AND evaluated_at != NONE
+                    { evaluated_at } ELSE { time::now() },
+                user = $user, key = $key, variant = $variant, payload = $payload;
+    } ELSE IF $access = NONE {
+        CREATE _00_user_feature
+            SET evaluated_at = time::now(), user = $user, key = $key, variant = $variant, payload = $payload;
+    } ELSE {
+        UPSERT _00_user_feature
+            SET evaluated_at = IF variant = $variant AND payload = $payload AND evaluated_at != NONE
+                    { evaluated_at } ELSE { time::now() },
+                user = $user, key = $key, variant = $variant, payload = $payload
+            WHERE user = $user AND key = $key;
+    };
+    RETURN $variant;
+}
+PERMISSIONS WHERE $auth.id != NONE
+    AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
+
+-- Drop every assignment of `$key` (a flag that no longer exists).
+DEFINE FUNCTION OVERWRITE fn::feature::drop_assignments($key: string) {
+    LET $ids = (SELECT VALUE id FROM _00_user_feature WHERE key = $key);
+    DELETE $ids;
+}
+PERMISSIONS WHERE $auth.id != NONE
+    AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
+
 -- Evaluate `$flag` for ONE user and write their `_00_user_feature` row.
 -- Faithful port of the Rust evaluator (`apps/cli/src/flag.rs::evaluate_one`
 -- and `apps/scheduler/src/feature_flags.rs::evaluate_one`); the golden
@@ -549,21 +607,7 @@ DEFINE FUNCTION OVERWRITE fn::feature::assign($flag: object, $ranked: array, $us
     LET $variant = IF $win = NONE { $flag.default_variant ?? 'off' } ELSE { $win.variant };
     LET $payload = ($flag.payloads ?? {})[$variant];
 
-    -- Find the row first, then write it by id. `UPSERT _00_user_feature ...
-    -- WHERE user = $user AND key = $key` inside a function body is a scan of
-    -- the whole table on SurrealDB 4.0.1 (an UPDATE / UPSERT / DELETE ... WHERE
-    -- in a body never uses its index there), once per user of a materialize.
-    LET $row = (SELECT VALUE id FROM _00_user_feature WHERE user = $user AND key = $key LIMIT 1)[0];
-    IF $row != NONE {
-        UPDATE $row
-            SET evaluated_at = IF variant = $variant AND payload = $payload AND evaluated_at != NONE
-                    { evaluated_at } ELSE { time::now() },
-                user = $user, key = $key, variant = $variant, payload = $payload;
-    } ELSE {
-        CREATE _00_user_feature
-            SET evaluated_at = time::now(), user = $user, key = $key, variant = $variant, payload = $payload;
-    };
-    RETURN $variant;
+    RETURN fn::feature::put($user, $key, $variant, $payload);
 }
 PERMISSIONS WHERE $auth.id != NONE
     AND array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0;
@@ -573,12 +617,12 @@ PERMISSIONS WHERE $auth.id != NONE
 -- the SSP), see fn::feature::assign. For a change that can only move one
 -- user, fn::feature::allow / disallow re-evaluate just that user instead.
 DEFINE FUNCTION OVERWRITE fn::feature::materialize($key: string) -> object {
-    LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+    LET $flag = fn::feature::flag($key);
 
     -- Unknown/deleted flag: drop the orphaned assignments, mirroring the
     -- load_flag-failed branch of `flag.rs::materialize`.
     IF $flag = NONE {
-        DELETE (SELECT VALUE id FROM _00_user_feature WHERE key = $key);
+        fn::feature::drop_assignments($key);
         RETURN { key: $key, found: false, users: 0 };
     };
 
@@ -622,7 +666,7 @@ PERMISSIONS WHERE $auth.id != NONE
 -- under the caller's select permission, so an app that hides users from an
 -- admin would silently skip the very user they asked for.
 DEFINE FUNCTION OVERWRITE fn::feature::reassign($key: string, $user: record) -> object {
-    LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+    LET $flag = fn::feature::flag($key);
     IF $flag = NONE OR record::tb($user) != 'user' {
         RETURN { key: $key, found: $flag != NONE, users: 0 };
     };
@@ -646,7 +690,7 @@ PERMISSIONS WHERE $auth.id != NONE
 -- (`FlagsAdminService.mutate`); a caller using these functions directly
 -- should do the same.
 DEFINE FUNCTION OVERWRITE fn::feature::allow($key: string, $variant: string, $user: record) -> object {
-    LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+    LET $flag = fn::feature::flag($key);
     IF $flag = NONE { THROW "Unknown flag: " + $key };
     IF !($variant IN ($flag.variants ?? [])) {
         THROW "Unknown variant '" + $variant + "' for flag '" + $key + "'";
@@ -683,7 +727,7 @@ PERMISSIONS WHERE $auth.id != NONE
 -- Mirrors `spky flag unset --for-user`: the rule is kept (possibly with an
 -- empty `users`), only the membership goes.
 DEFINE FUNCTION OVERWRITE fn::feature::disallow($key: string, $user: record) -> object {
-    LET $flag = (SELECT * FROM ONLY _00_feature_flag WHERE key = $key LIMIT 1);
+    LET $flag = fn::feature::flag($key);
     IF $flag = NONE { THROW "Unknown flag: " + $key };
 
     LET $uid  = <string>$user;

@@ -66,6 +66,52 @@ iteration on 4.0.1 (inside an event the same loop over strings did not), and
 list matches (`INSIDE`, `IN`) scan in every position on 4.0.1 and, for a
 `SELECT`, on 3.3.5 too.
 
+### Composite indexes
+
+40,000 rows, a composite index and no single-column one on the matched
+fields, memory engine, per call:
+
+| statement | 3.3.5 | 4.0.1 |
+| --- | ---: | ---: |
+| event: `LET $s = $after.s; SELECT VALUE id FROM u2 WHERE c = $s AND d = $k`, index `(c, d)` | 0.3-3 ms | 37-38 ms |
+| event: the same on the leading column only (`WHERE c = $s`) | | 35-38 ms |
+| event: `UNIQUE` index `(a, b)`, either prefix | | 35-39 ms |
+| event: `DELETE (SELECT VALUE id FROM cdoc WHERE doc = $doc)`, `UNIQUE (doc, field)` (sp00ky's `_00_crdt_cleanup`) | 0.5-1.7 ms | 39-41 ms |
+| the same with `WITH INDEX`, the correlated form, both columns, a `FOR` loop variable | | 28-48 ms |
+| the same, plus a single-column index on `doc` | | 0.9-1.1 ms |
+| function: `RETURN (SELECT VALUE id FROM u2 WHERE c = $s AND d = 'k')`, `$s` an argument | 0.3-0.5 ms | 39 ms |
+| top level: `FOR $s IN [user:u15] { SELECT ... WHERE c = $s }` | | 57-74 ms |
+| top level: `LET $s = ...; SELECT ... WHERE c = $s` | | 0.5 ms |
+| top level, `{ }` block expression, `BEGIN ... COMMIT` | | 0.2-0.6 ms |
+| a literal instead of the parameter, in an event | | 1.6-1.8 ms |
+
+Inside an event or function body, and in a `FOR` loop even at the top level,
+4.0.1 does not use a composite index for a parameter, whichever of its
+columns the WHERE matches; a single-column index on one of them is used.
+
+### Functions that call functions
+
+40,000 rows of `_00_user_feature`, single-column indexes on `user` and
+`key`, per call on 4.0.1 (3.3.5, measured for the subquery and LET-bound
+deletes with a custom call: 0.1-0.2 ms):
+
+| function body | 4.0.1 |
+| --- | ---: |
+| `LET $row = (SELECT VALUE id FROM t WHERE user = $user LIMIT 1)[0]; IF $row != NONE { UPDATE $row SET ... };` | 0.8-1.8 ms |
+| the same plus `LET $h = fn::noop(1);` (a custom function, before or after) | 15-40 ms |
+| `LET $h = fn::noop(1); LET $ids = (SELECT VALUE id FROM t WHERE user = $user); UPDATE $ids SET ...` | 0.6-2 ms |
+| `DELETE (SELECT VALUE id FROM t WHERE key = $key)`, no other call | 0.4-0.9 ms |
+| the same plus a call to a custom function that never runs (after a `RETURN`) | 39-62 ms |
+| the lookup and the write moved into a helper function that calls nothing | 1.7-2.6 ms |
+| `SELECT` lookups only (no write) plus a custom call | 0.3-0.8 ms |
+
+A function that both writes and calls another custom function (`fn::...`;
+built-ins do not count) gets lookups that read the whole table, depending on
+their shape. sp00ky's `fn::feature::assign` (which calls `fn::feature::hash`)
+read every row of a flag per user this way, so materializing a flag was
+quadratic in users; `fn::feature::materialize` read the table for an unknown
+flag. Event bodies are not affected.
+
 ## Reproduction
 
 ```surql
@@ -87,6 +133,29 @@ LET $ids = ['nomatch-a', 'nomatch-b'];
 DELETE t WHERE f INSIDE $ids;
 ```
 
+Composite and calling-function shapes:
+
+```surql
+DEFINE TABLE cdoc SCHEMALESS;
+DEFINE INDEX cdoc_doc ON cdoc FIELDS doc, field UNIQUE;
+-- 40k rows: INSERT INTO cdoc { doc: type::record('thread', 'o' + <string>$i), field: 'summary' } ...
+DEFINE TABLE thread SCHEMALESS;
+DEFINE EVENT cl ON TABLE thread WHEN $event = 'DELETE' THEN {
+    LET $doc = $before.id;
+    DELETE (SELECT VALUE id FROM cdoc WHERE doc = $doc);  -- 40 ms on 4.0.1, 1 ms on 3.3.5
+};
+CREATE thread:d1; DELETE thread:d1;
+
+DEFINE FUNCTION fn::noop($x: any) { RETURN $x; };
+DEFINE FUNCTION fn::drop($key: string) {
+    DELETE (SELECT VALUE id FROM uf WHERE key = $key);    -- index read
+};
+DEFINE FUNCTION fn::drop2($key: string) {
+    DELETE (SELECT VALUE id FROM uf WHERE key = $key);    -- 40 ms at 40k rows on 4.0.1
+    RETURN fn::noop(1);
+};
+```
+
 ## What sp00ky does about it
 
 - Queries sp00ky sends are top-level statements, not `{ ... }` blocks, when
@@ -96,11 +165,20 @@ DELETE t WHERE f INSIDE $ids;
 - Generated functions and events bind event values with `LET` first and write
   through `UPDATE / DELETE (SELECT VALUE id FROM ...)` (`fn::feature::*`,
   `fn::push::*`, `_00_crdt_cleanup`, `_00_channel_signal_sweep`).
+- Every lookup a generated body makes has a single-column index:
+  `_00_crdt_doc(doc)`, `_00_channel_signal(sender)` (was `(sender, at)`),
+  `_00_user_feature(user)` and `(key)`.
+- The feature functions keep their reads and writes in helpers that call no
+  other function (`fn::feature::flag`, `put`, `drop_assignments`).
 - `spky lint` / `spky doctor` flag the shapes in an app's own events and
-  functions (`apps/cli/src/query_lint.rs`), and a test runs the lint over
-  everything sp00ky deploys.
+  functions (`apps/cli/src/query_lint.rs`: `where-on-event-value`,
+  `write-where`, `inside-param`, `composite-index`,
+  `lookup-write-with-call`), and a test runs the lint over everything sp00ky
+  deploys.
 - Cost tests: `cargo test -p schedule-core prunes_with_nothing_due` and
-  `cargo test -p sp00ky-cli generated_functions_and_events_stay_cheap`.
+  `cargo test -p sp00ky-cli generated_functions_and_events_stay_cheap`
+  (flag sweep, `fn::feature::assign`, `materialize`, `_00_crdt_cleanup`,
+  `_00_channel_signal_sweep`, 1,000 against 40,000 rows, within 4x).
 
 When a fixed SurrealDB ships, nothing needs reverting: every rewrite is an
 index read on 3.3.5 too.

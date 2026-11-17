@@ -643,7 +643,11 @@ fn doc_table_ddl(parents: &[CrdtParent]) -> String {
          DEFINE FIELD OVERWRITE lease_by ON TABLE {DOC_TABLE} TYPE option<string>;\n\
          DEFINE FIELD OVERWRITE lease_until ON TABLE {DOC_TABLE} TYPE option<datetime>;\n\
          DEFINE FIELD OVERWRITE folded_at ON TABLE {DOC_TABLE} TYPE option<datetime>;\n\
-         DEFINE INDEX OVERWRITE {DOC_TABLE}_doc ON TABLE {DOC_TABLE} FIELDS doc, field UNIQUE;\n"
+         DEFINE INDEX OVERWRITE {DOC_TABLE}_doc ON TABLE {DOC_TABLE} FIELDS doc, field UNIQUE;\n\
+         -- `_00_crdt_cleanup` finds a deleted parent's rows by `doc` alone: inside\n\
+         -- an event body SurrealDB 4.0.1 does not use the (doc, field) index for\n\
+         -- a parameter and reads the whole table per delete.\n\
+         DEFINE INDEX OVERWRITE {DOC_TABLE}_parent ON TABLE {DOC_TABLE} FIELDS doc;\n"
     )
 }
 

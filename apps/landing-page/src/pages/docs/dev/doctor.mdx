@@ -38,14 +38,21 @@ prints every statement with its rewrite (both forms are index reads on 3.x as we
 | Finding | Rewrite |
 | --- | --- |
 | `where-on-event-value`: a WHERE on `$after.x`, `$before.x`, `$value` | `LET $x = $after.x;` at the top of the body, then `WHERE f = $x` |
-| `write-where`: `UPDATE` / `DELETE` / `UPSERT <table> ... WHERE` with a parameter | `UPDATE (SELECT VALUE id FROM t WHERE ...) SET ...`, `DELETE (SELECT VALUE id FROM t WHERE ...)` |
+| `write-where`: `UPDATE` / `DELETE` / `UPSERT <table> ... WHERE` with a parameter | `LET $ids = (SELECT VALUE id FROM t WHERE ...); UPDATE $ids SET ...;` or `DELETE $ids;` |
 | `inside-param`: `WHERE f INSIDE $list` | `FOR $v IN $list { ... WHERE f = $v ... }` |
+| `composite-index`: a lookup on fields only a composite index covers | a single-column index on one of them, for example `DEFINE INDEX t_f ON TABLE t FIELDS f;` |
+| `lookup-write-with-call`: a lookup in a function that also writes and calls another `fn::` | move the lookups and writes into a helper function that calls no other function |
 | `select-where-true`: `FOR select WHERE true` on a table or field | `FOR select FULL`, the same rule |
 
-The last one matters for record users: with any select rule other than `FULL`, 4.0.1 gives up a
-table's indexes for a lookup an event runs because a signed-in user wrote, and a field's indexes for
-the user's own query on that field. Inside events, also keep lookups on a single-column index (or a
-record key): 4.0.1 did not use the leading column of a four-column index there.
+`select-where-true` matters for record users: with any select rule other than `FULL`, 4.0.1 gives up
+a table's indexes for a lookup an event runs because a signed-in user wrote, and a field's indexes
+for the user's own query on that field. `composite-index` applies to `FOR` loops at the top level
+too: 4.0.1 uses a composite index there only for literal values.
+
+A shape you mean to keep can be marked with a comment on the lines above its definition, which
+silences the named rules for that event or function:
+
+<CodeBlock code={lintAllowCode} lang="sql" />
 
 <CodeBlock code={lintCode} lang="bash" />
 
@@ -115,8 +122,14 @@ spky query --cloud 'SELECT * FROM _00_query LIMIT 5'
 # interactive REPL
 spky query`;
 
+export const lintAllowCode = `-- the caller cannot read other users' rows, so match through the update permission
+-- spky-lint: allow write-where
+DEFINE FUNCTION OVERWRITE fn::feature::put($user: record, $key: string) { ... };`;
+
 export const lintCode = `spky lint
   warning: ./src/schema.surql: event game_children_cleanup ON game [write-where]: DELETE analysis WHERE game = $before.id
-    fix: DELETE (SELECT VALUE id FROM analysis WHERE game = $before.id) with every $after.x / $before.x first bound by a LET at the top of the body
+    fix: LET $ids = (SELECT VALUE id FROM analysis WHERE game = $before.id); DELETE $ids; with every $after.x / $before.x first bound by a LET at the top of the body
+  warning: ./src/schema.surql: event statistics_to_profile ON statistics [composite-index]: SELECT ... FROM statistics WHERE owner = $owner
+    fix: DEFINE INDEX idx_statistics_owner ON TABLE statistics COLUMNS owner;
   warning: ./src/schema.surql: table analysis [select-where-true]: FOR select WHERE true
     fix: FOR select FULL`;

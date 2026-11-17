@@ -13,6 +13,9 @@
 //! | `UPDATE t ... WHERE f = $x` / `DELETE t WHERE f = $x`, `$x` LET-bound | scan | index |
 //! | `UPDATE (SELECT VALUE id FROM t WHERE f = $x) ...` / `DELETE (SELECT VALUE id ...)` | index | index |
 //! | `... WHERE f INSIDE $x`, even in the subquery form | scan | index |
+//! | `SELECT ... WHERE a = $x` where `a` has only a composite index `(a, b)` (any prefix, unique or not; also in a top-level FOR loop) | scan | index |
+//! | in a function that also calls another `fn::` and writes: its lookups (`DELETE (SELECT ...)`, `LET $row = (SELECT ... LIMIT 1)[0]; UPDATE $row`, ...) | scan | index |
+//! | the lookups and writes in a helper function that calls no other `fn::` | index | index |
 //!
 //! So the rewrites below are what both lines plan as index reads, and none of
 //! them is slower on 3.3.5. The lint reads text, not a parse tree: it finds
@@ -45,6 +48,11 @@ pub enum Rule {
     InsideParam,
     /// A table or field select rule written `WHERE true` instead of `FULL`.
     SelectWhereTrue,
+    /// A lookup on fields that only a composite index covers.
+    CompositeIndex,
+    /// A lookup by a parameter in a function body that also writes and calls
+    /// another `fn::` function.
+    LookupWriteWithCall,
 }
 
 impl Rule {
@@ -54,6 +62,8 @@ impl Rule {
             Rule::WriteWhere => "write-where",
             Rule::InsideParam => "inside-param",
             Rule::SelectWhereTrue => "select-where-true",
+            Rule::CompositeIndex => "composite-index",
+            Rule::LookupWriteWithCall => "lookup-write-with-call",
         }
     }
 }
@@ -80,13 +90,299 @@ const EVENT_VALUES: &[&str] = &["$after", "$before", "$value", "$input", "$event
 /// Every finding in a schema source.
 pub fn lint(source: &str) -> Vec<Finding> {
     let clean = strip_comments(source);
+    let indexes = indexes(&clean);
     let mut out = Vec::new();
     for (owner, body) in bodies(&clean) {
-        for stmt in statements(&body) {
-            out.extend(check_statement(&owner, &stmt));
+        let stmts = statements(&body);
+        for stmt in &stmts {
+            out.extend(check_statement(&owner, stmt, &indexes));
+        }
+        if owner.starts_with("function ") && calls_a_function(&body) && writes(&body) {
+            out.extend(stmts.iter().filter_map(|s| lookup_with_call(&owner, s)));
         }
     }
     out.extend(select_where_true(&clean));
+    let allowed = allowed(source);
+    out.retain(|f| {
+        !allowed
+            .iter()
+            .any(|(owner, rule)| owner == &f.owner && rule == f.rule.code())
+    });
+    out
+}
+
+/// `-- spky-lint: allow <rule>[, <rule>]` on the lines right above a `DEFINE
+/// EVENT` or `DEFINE FUNCTION` silences those rules for that event or
+/// function: `(owner, rule)` pairs.
+fn allowed(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for line in source.lines() {
+        let t = line.trim();
+        if let Some(i) = t.find("spky-lint: allow ") {
+            if t.starts_with("--") || t.starts_with("//") {
+                pending.extend(
+                    t[i + 17..]
+                        .split(',')
+                        .map(|r| r.trim().to_string())
+                        .filter(|r| !r.is_empty()),
+                );
+                continue;
+            }
+        }
+        if t.is_empty() || t.starts_with("--") || t.starts_with("//") {
+            continue;
+        }
+        if !pending.is_empty() {
+            if let Some((owner, _)) = bodies(&strip_comments(&format!("{t}\n}};")))
+                .into_iter()
+                .next()
+            {
+                let owner = if owner.starts_with("event ") {
+                    owner
+                } else {
+                    owner.split('(').next().unwrap_or(&owner).to_string()
+                };
+                out.extend(pending.drain(..).map(|r| (owner.clone(), r)));
+            } else if let Some(name) = function_name(t) {
+                out.extend(pending.drain(..).map(|r| (format!("function {name}"), r)));
+            }
+            pending.clear();
+        }
+    }
+    out
+}
+
+/// `fn::x` of a `DEFINE FUNCTION [OVERWRITE | IF NOT EXISTS] fn::x(...` line.
+fn function_name(line: &str) -> Option<String> {
+    let upper = line.to_ascii_uppercase();
+    if !upper.starts_with("DEFINE FUNCTION ") {
+        return None;
+    }
+    line.split_whitespace()
+        .skip(2)
+        .find(|w| {
+            !matches!(
+                w.to_ascii_uppercase().as_str(),
+                "OVERWRITE" | "IF" | "NOT" | "EXISTS"
+            )
+        })
+        .map(|w| w.split('(').next().unwrap_or(w).to_string())
+}
+
+/// The body calls a `fn::` function (a custom one; built-ins do not matter).
+fn calls_a_function(body: &str) -> bool {
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i + 4 < b.len() {
+        if b[i] == b'\'' || b[i] == b'"' || b[i] == b'`' {
+            i = skip_string(b, i);
+            continue;
+        }
+        if body[i..].starts_with("fn::")
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The body writes: UPDATE, DELETE, UPSERT, CREATE, INSERT or RELATE.
+fn writes(body: &str) -> bool {
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\'' || b[i] == b'"' || b[i] == b'`' {
+            i = skip_string(b, i);
+            continue;
+        }
+        let at_word = i == 0
+            || !(b[i - 1].is_ascii_alphanumeric()
+                || b[i - 1] == b'_'
+                || b[i - 1] == b':'
+                || b[i - 1] == b'$');
+        if at_word {
+            for kw in ["UPDATE", "DELETE", "UPSERT", "CREATE", "INSERT", "RELATE"] {
+                let n = kw.len();
+                if i + n < b.len()
+                    && b[i..i + n].eq_ignore_ascii_case(kw.as_bytes())
+                    && b[i + n].is_ascii_whitespace()
+                {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// A function body that calls another `fn::` function and writes: SurrealDB
+/// 4.0.1 plans its lookups as table scans (measured on 40k rows: 20-60 ms per
+/// call against about 1 ms; `fn::feature::assign` and `materialize`, whose
+/// lookups kept their index once moved into helpers that call nothing).
+/// Event bodies and functions without the call are not affected.
+fn lookup_with_call(owner: &str, stmt: &str) -> Option<Finding> {
+    let where_clause = own_where(stmt)?;
+    if params_in(&without_subqueries(&where_clause)).is_empty() {
+        return None;
+    }
+    Some(Finding {
+        owner: owner.to_string(),
+        rule: Rule::LookupWriteWithCall,
+        statement: stmt.to_string(),
+        fix: "move the lookups and the writes into a function of their own that calls no other `fn::` and call it \
+              from here (4.0.1 reads the whole table for a lookup in a function that both writes and calls another function)"
+            .to_string(),
+    })
+}
+
+/// Columns of every index in a source, per table.
+type Indexes = std::collections::HashMap<String, Vec<Vec<String>>>;
+
+/// `DEFINE INDEX ... ON [TABLE] t FIELDS|COLUMNS a, b ...` statements.
+fn indexes(src: &str) -> Indexes {
+    let mut out = Indexes::new();
+    let mut at = 0;
+    while let Some(i) = find_ci(src, "DEFINE INDEX ", at) {
+        let end = statement_end(src.as_bytes(), i);
+        at = end.max(i + 13);
+        let stmt = collapse(&src[i..end]);
+        let words: Vec<&str> = stmt.split_whitespace().collect();
+        let Some(on) = words.iter().position(|w| w.eq_ignore_ascii_case("ON")) else {
+            continue;
+        };
+        let mut t = on + 1;
+        if words
+            .get(t)
+            .is_some_and(|w| w.eq_ignore_ascii_case("TABLE"))
+        {
+            t += 1;
+        }
+        let Some(table) = words.get(t) else { continue };
+        let Some(cols_at) = words
+            .iter()
+            .position(|w| w.eq_ignore_ascii_case("FIELDS") || w.eq_ignore_ascii_case("COLUMNS"))
+        else {
+            continue;
+        };
+        let mut cols = Vec::new();
+        for w in &words[cols_at + 1..] {
+            let ends = !w.ends_with(',');
+            let name = w.trim_end_matches(',').trim_matches('`');
+            if !name.is_empty() {
+                cols.push(name.to_string());
+            }
+            if ends {
+                break;
+            }
+        }
+        if !cols.is_empty() {
+            out.entry(table.trim_matches('`').to_string())
+                .or_default()
+                .push(cols);
+        }
+    }
+    out
+}
+
+/// The table a SELECT reads: its own `FROM <table>`, `None` for a subquery,
+/// a parameter, a record id or an object.
+fn own_from(stmt: &str) -> Option<String> {
+    let b = stmt.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' | b'`' => {
+                i = skip_string(b, i);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0
+            && (i == 0 || b[i - 1].is_ascii_whitespace())
+            && stmt[i..].len() > 5
+            && stmt[i..i + 5].eq_ignore_ascii_case("FROM ")
+        {
+            let mut words = stmt[i + 5..].split_whitespace();
+            let mut t = words.next()?;
+            if t.eq_ignore_ascii_case("ONLY") {
+                t = words.next()?;
+            }
+            let t = t.trim_end_matches([',', ';']);
+            if t.starts_with(['(', '$', '[', '{']) || t.contains([':', '(']) {
+                return None;
+            }
+            return Some(t.trim_matches('`').to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Fields a WHERE compares with a parameter (`f = $x`, `$x < f`, ...).
+fn param_fields(where_own: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let upper = where_own.to_ascii_uppercase();
+    let mut terms = vec![];
+    let mut last = 0;
+    for (i, _) in upper.match_indices(' ') {
+        let rest = &upper[i..];
+        let n = if rest.starts_with(" AND ")
+            || rest.starts_with(" OR ")
+            || rest.starts_with(" && ")
+            || rest.starts_with(" || ")
+        {
+            rest[1..].find(' ').map(|k| k + 1)
+        } else {
+            None
+        };
+        if let Some(n) = n {
+            terms.push(&where_own[last..i]);
+            last = i + n;
+        }
+    }
+    terms.push(&where_own[last..]);
+    for term in terms {
+        let term = term
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let Some((pos, len)) = ["==", "<=", ">=", "=", "<", ">"]
+            .iter()
+            .filter_map(|op| term.find(op).map(|p| (p, op.len())))
+            .filter(|(p, _)| {
+                *p == 0
+                    || !matches!(
+                        term.as_bytes()[p - 1],
+                        b'!' | b'<' | b'>' | b'=' | b'?' | b'~'
+                    )
+            })
+            .min_by_key(|(p, _)| *p)
+        else {
+            continue;
+        };
+        let (left, right) = (term[..pos].trim(), term[pos + len..].trim());
+        let ident = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'`')
+        };
+        let field = if right.contains('$') && ident(left) {
+            left
+        } else if left.contains('$') && ident(right) {
+            right
+        } else {
+            continue;
+        };
+        out.push(field.trim_matches('`').to_string());
+    }
     out
 }
 
@@ -103,7 +399,11 @@ fn select_where_true(src: &str) -> Vec<Finding> {
     let mut at = 0;
     while let Some(i) = find_ci(src, "DEFINE ", at) {
         at = i + 7;
-        let kind = src[at..].split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let kind = src[at..]
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
         if kind != "TABLE" && kind != "FIELD" {
             continue;
         }
@@ -111,24 +411,79 @@ fn select_where_true(src: &str) -> Vec<Finding> {
         let stmt = collapse(&src[i..end]);
         at = end.max(at);
         let upper = stmt.to_ascii_uppercase();
-        let Some(perm) = upper.find(" PERMISSIONS ") else { continue };
+        let Some(perm) = upper.find(" PERMISSIONS ") else {
+            continue;
+        };
         let rules = &stmt[perm + 13..];
         // each `FOR <ops> <rule>` clause
-        for clause in rules.split(" FOR ").chain(rules.strip_prefix("FOR ").into_iter().take(0)) {
-            let clause = clause.trim().trim_start_matches("FOR ").trim_end_matches(',').trim();
+        for clause in rules
+            .split(" FOR ")
+            .chain(rules.strip_prefix("FOR ").into_iter().take(0))
+        {
+            let clause = clause
+                .trim()
+                .trim_start_matches("FOR ")
+                .trim_end_matches(',')
+                .trim();
             let lower = clause.to_ascii_lowercase();
-            let Some(w) = lower.find(" where ") else { continue };
+            let Some(w) = lower.find(" where ") else {
+                continue;
+            };
             let ops: Vec<&str> = lower[..w].split(',').map(str::trim).collect();
             let cond = lower[w + 7..].trim().trim_end_matches(',').trim();
-            let cond = cond.split(|c: char| c == ',' || c == ';').next().unwrap_or("").trim();
+            let cond = cond
+                .split(|c: char| c == ',' || c == ';')
+                .next()
+                .unwrap_or("")
+                .trim();
             if ops.contains(&"select") && cond == "true" {
                 let words: Vec<&str> = stmt.split_whitespace().collect();
                 let owner = if kind == "TABLE" {
-                    format!("table {}", words.iter().skip(2).find(|w| !matches!(w.to_ascii_uppercase().as_str(), "OVERWRITE" | "IF" | "NOT" | "EXISTS")).unwrap_or(&"?"))
+                    format!(
+                        "table {}",
+                        words
+                            .iter()
+                            .skip(2)
+                            .find(|w| !matches!(
+                                w.to_ascii_uppercase().as_str(),
+                                "OVERWRITE" | "IF" | "NOT" | "EXISTS"
+                            ))
+                            .unwrap_or(&"?")
+                    )
                 } else {
-                    let name = words.iter().skip(2).find(|w| !matches!(w.to_ascii_uppercase().as_str(), "OVERWRITE" | "IF" | "NOT" | "EXISTS")).unwrap_or(&"?");
-                    let table = words.windows(2).find(|w| w[0].eq_ignore_ascii_case("ON")).map(|w| if w[1].eq_ignore_ascii_case("TABLE") { "" } else { w[1] }).unwrap_or("?");
-                    let table = if table.is_empty() { words.windows(2).find(|w| w[0].eq_ignore_ascii_case("TABLE") && !w[1].eq_ignore_ascii_case("TYPE")).map(|w| w[1]).unwrap_or("?") } else { table };
+                    let name = words
+                        .iter()
+                        .skip(2)
+                        .find(|w| {
+                            !matches!(
+                                w.to_ascii_uppercase().as_str(),
+                                "OVERWRITE" | "IF" | "NOT" | "EXISTS"
+                            )
+                        })
+                        .unwrap_or(&"?");
+                    let table = words
+                        .windows(2)
+                        .find(|w| w[0].eq_ignore_ascii_case("ON"))
+                        .map(|w| {
+                            if w[1].eq_ignore_ascii_case("TABLE") {
+                                ""
+                            } else {
+                                w[1]
+                            }
+                        })
+                        .unwrap_or("?");
+                    let table = if table.is_empty() {
+                        words
+                            .windows(2)
+                            .find(|w| {
+                                w[0].eq_ignore_ascii_case("TABLE")
+                                    && !w[1].eq_ignore_ascii_case("TYPE")
+                            })
+                            .map(|w| w[1])
+                            .unwrap_or("?")
+                    } else {
+                        table
+                    };
                     format!("field {name} ON {table}")
                 };
                 out.push(Finding {
@@ -281,7 +636,10 @@ fn bodies(src: &str) -> Vec<(String, String)> {
                 let stmt = &rest[..semi];
                 if let Some(then) = find_ci(stmt, "THEN ", 0) {
                     let mut names = stmt.split_whitespace().skip(1).filter(|t| {
-                        !matches!(t.to_ascii_uppercase().as_str(), "OVERWRITE" | "IF" | "NOT" | "EXISTS")
+                        !matches!(
+                            t.to_ascii_uppercase().as_str(),
+                            "OVERWRITE" | "IF" | "NOT" | "EXISTS"
+                        )
                     });
                     let name = names.next().unwrap_or("?");
                     out.push((
@@ -535,7 +893,7 @@ fn write_target(stmt: &str) -> Option<String> {
     Some(t.trim_matches('`').to_string())
 }
 
-fn check_statement(owner: &str, stmt: &str) -> Vec<Finding> {
+fn check_statement(owner: &str, stmt: &str, indexes: &Indexes) -> Vec<Finding> {
     let mut out = Vec::new();
     let Some(where_clause) = own_where(stmt) else {
         return out;
@@ -574,10 +932,10 @@ fn check_statement(owner: &str, stmt: &str) -> Vec<Finding> {
     if matches!(verb.as_str(), "UPDATE" | "DELETE" | "UPSERT") {
         if let Some(table) = write_target(stmt) {
             let fix = match verb.as_str() {
-                "DELETE" => format!("DELETE (SELECT VALUE id FROM {table} WHERE {where_clause})"),
-                "UPDATE" => format!("UPDATE (SELECT VALUE id FROM {table} WHERE {where_clause}) SET ..."),
+                "DELETE" => format!("LET $ids = (SELECT VALUE id FROM {table} WHERE {where_clause}); DELETE $ids;"),
+                "UPDATE" => format!("LET $ids = (SELECT VALUE id FROM {table} WHERE {where_clause}); UPDATE $ids SET ...;"),
                 _ => format!(
-                    "key the row (`UPSERT type::record('{table}', [...]) SET ...`) or `UPDATE (SELECT VALUE id FROM {table} WHERE {where_clause}) SET ...` plus a CREATE when it matched nothing"
+                    "key the row (`UPSERT type::record('{table}', [...]) SET ...`) or `LET $ids = (SELECT VALUE id FROM {table} WHERE {where_clause}); UPDATE $ids SET ...;` plus a CREATE when it matched nothing"
                 ),
             };
             let bind = if params.iter().any(|p| is_event_value(p)) {
@@ -592,6 +950,11 @@ fn check_statement(owner: &str, stmt: &str) -> Vec<Finding> {
                 fix: format!("{fix}{bind} (4.0.1 scans `{verb} {table} ... WHERE` inside a body, even with LET-bound parameters)"),
             });
             return out;
+        }
+    }
+    if verb == "SELECT" {
+        if let Some(found) = composite_only(owner, stmt, &where_own, indexes) {
+            out.push(found);
         }
     }
     let direct: Vec<&String> = params.iter().filter(|p| is_event_value(p)).collect();
@@ -621,9 +984,115 @@ fn check_statement(owner: &str, stmt: &str) -> Vec<Finding> {
     out
 }
 
+/// A SELECT whose parameter-compared fields have a composite index and no
+/// single-column one: 4.0.1 does not use a composite index for a parameter
+/// inside a body (or a FOR loop), not even all of its columns matched with
+/// `=` (`docs/surrealdb-bugs/v4-block-param-index-scan.md`).
+fn composite_only(owner: &str, stmt: &str, where_own: &str, indexes: &Indexes) -> Option<Finding> {
+    let table = own_from(stmt)?;
+    let fields = param_fields(where_own);
+    let defined = indexes.get(&table)?;
+    if fields.is_empty()
+        || fields
+            .iter()
+            .any(|f| defined.iter().any(|cols| cols.len() == 1 && &cols[0] == f))
+    {
+        return None;
+    }
+    let composite = defined
+        .iter()
+        .find(|cols| cols.len() > 1 && cols.iter().any(|c| fields.contains(c)))?;
+    let field = composite.iter().find(|c| fields.contains(c)).unwrap();
+    Some(Finding {
+        owner: owner.to_string(),
+        rule: Rule::CompositeIndex,
+        statement: stmt.to_string(),
+        fix: format!(
+            "DEFINE INDEX idx_{table}_{} ON TABLE {table} COLUMNS {field}; (4.0.1 reads the whole table instead of the index ({}) for a parameter inside a body; a single-column index is used)",
+            field.replace('.', "_"),
+            composite.join(", ")
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allow_comments_silence_a_rule_for_one_definition() {
+        let src = "-- the row may be invisible to the caller\n\
+            -- spky-lint: allow write-where\n\
+            DEFINE FUNCTION OVERWRITE fn::a($k: string) { UPSERT t SET v = 1 WHERE k = $k; };\n\
+            DEFINE FUNCTION fn::b($k: string) { UPSERT t SET v = 1 WHERE k = $k; };\n\
+            -- spky-lint: allow inside-param\n\
+            DEFINE EVENT e ON t THEN { DELETE u WHERE k = $after.k; };";
+        let found = lint(src);
+        assert_eq!(
+            found
+                .iter()
+                .map(|f| (f.owner.as_str(), f.rule))
+                .collect::<Vec<_>>(),
+            vec![
+                ("function fn::b", Rule::WriteWhere),
+                ("event e ON t", Rule::WriteWhere)
+            ],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn flags_lookups_in_functions_that_write_and_call_functions() {
+        let src = "DEFINE FUNCTION fn::m($user: record) { \
+            LET $row = (SELECT VALUE id FROM uf WHERE user = $user LIMIT 1)[0]; \
+            IF $row != NONE { UPDATE $row SET v = fn::other(1); }; };\n\
+            DEFINE FUNCTION fn::put($user: record) { LET $row = (SELECT VALUE id FROM uf WHERE user = $user LIMIT 1)[0]; \
+            IF $row != NONE { UPDATE $row SET v = 1 } ELSE { CREATE uf SET user = $user }; };\n\
+            DEFINE FUNCTION fn::read($user: record) { LET $x = fn::other(1); RETURN (SELECT * FROM uf WHERE user = $user); };\n\
+            DEFINE FUNCTION fn::orchestrate($user: record) { LET $v = fn::other(1); RETURN fn::put($user); };\n\
+            DEFINE EVENT e ON t THEN { LET $k = $after.k; DELETE (SELECT VALUE id FROM uf WHERE key = $k); LET $x = fn::other($k); };";
+        let found = lint(src);
+        assert_eq!(
+            found
+                .iter()
+                .map(|f| (f.rule, f.owner.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(Rule::LookupWriteWithCall, "function fn::m")],
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn flags_lookups_only_a_composite_index_covers() {
+        let src = "DEFINE INDEX d ON TABLE doc FIELDS doc, field UNIQUE;\n\
+            DEFINE INDEX OVERWRITE s ON sig COLUMNS sender, at;\n\
+            DEFINE INDEX r ON sig FIELDS recipient;\n\
+            DEFINE EVENT e ON thread WHEN $event = 'DELETE' THEN { LET $doc = $before.id; \
+            DELETE (SELECT VALUE id FROM doc WHERE doc = $doc); \
+            LET $a = (SELECT VALUE id FROM sig WHERE sender = $doc AND at < time::now()); \
+            LET $b = (SELECT VALUE id FROM sig WHERE recipient = $doc AND sender = $doc); \
+            LET $c = (SELECT VALUE id FROM doc WHERE doc = thread:x); };";
+        let found = lint(src);
+        assert_eq!(
+            found.iter().map(|f| f.rule).collect::<Vec<_>>(),
+            vec![Rule::CompositeIndex, Rule::CompositeIndex],
+            "{found:?}"
+        );
+        assert!(
+            found[0]
+                .fix
+                .starts_with("DEFINE INDEX idx_doc_doc ON TABLE doc COLUMNS doc;"),
+            "{}",
+            found[0].fix
+        );
+        assert!(
+            found[1]
+                .fix
+                .starts_with("DEFINE INDEX idx_sig_sender ON TABLE sig COLUMNS sender;"),
+            "{}",
+            found[1].fix
+        );
+    }
 
     fn rules(src: &str) -> Vec<Rule> {
         lint(src).into_iter().map(|f| f.rule).collect()
@@ -662,16 +1131,16 @@ mod tests {
             vec![Rule::WriteWhere, Rule::WriteWhere]
         );
         assert!(
-            found[0]
-                .fix
-                .starts_with("DELETE (SELECT VALUE id FROM analysis WHERE game = $before.id)"),
+            found[0].fix.starts_with(
+                "LET $ids = (SELECT VALUE id FROM analysis WHERE game = $before.id); DELETE $ids;"
+            ),
             "{}",
             found[0].fix
         );
         assert!(found[0].fix.contains("bound by a `LET`"));
-        assert!(found[1]
-            .fix
-            .starts_with("UPDATE (SELECT VALUE id FROM statistics WHERE database = $db) SET"));
+        assert!(found[1].fix.starts_with(
+            "LET $ids = (SELECT VALUE id FROM statistics WHERE database = $db); UPDATE $ids SET"
+        ));
     }
 
     #[test]
@@ -700,9 +1169,17 @@ mod tests {
             DEFINE TABLE ok SCHEMAFULL PERMISSIONS FOR select FULL, FOR update WHERE true;\n\
             DEFINE FIELD f ON ok TYPE string PERMISSIONS FOR select WHERE $auth.id != NONE;";
         let found = lint(src);
-        assert_eq!(found.iter().map(|f| f.owner.as_str()).collect::<Vec<_>>(), vec!["table game", "field status ON job"], "{found:?}");
+        assert_eq!(
+            found.iter().map(|f| f.owner.as_str()).collect::<Vec<_>>(),
+            vec!["table game", "field status ON job"],
+            "{found:?}"
+        );
         assert!(found.iter().all(|f| f.rule == Rule::SelectWhereTrue));
-        assert!(found[1].fix.starts_with("FOR create, select FULL"), "{}", found[1].fix);
+        assert!(
+            found[1].fix.starts_with("FOR create, select FULL"),
+            "{}",
+            found[1].fix
+        );
     }
 
     #[test]

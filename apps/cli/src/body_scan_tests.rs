@@ -54,12 +54,20 @@ async fn deployed() -> Surreal<Db> {
     sql.push_str(&build_server_events(&builder).expect("server events"));
     let db = Surreal::new::<Mem>(()).await.unwrap();
     db.use_ns("t").use_db("t").await.unwrap();
-    db.query(sql).await.expect("apply schema").check().expect("schema statements");
+    db.query(sql)
+        .await
+        .expect("apply schema")
+        .check()
+        .expect("schema statements");
     db
 }
 
 async fn exec(db: &Surreal<Db>, sql: &str) {
-    db.query(sql).await.expect(sql).check().unwrap_or_else(|e| panic!("{sql}\n-> {e}"));
+    db.query(sql)
+        .await
+        .expect(sql)
+        .check()
+        .unwrap_or_else(|e| panic!("{sql}\n-> {e}"));
 }
 
 /// Median wall time of `sql`, `n` runs, each built from the run index.
@@ -85,7 +93,7 @@ async fn seed(db: &Surreal<Db>, rows: usize) {
                 "OPTION IMPORT;
                  LET $ix = array::map(array::range(0, {n}), |$j| $j + {lo});
                  INSERT INTO user array::map($ix, |$i| {{ id: type::record('user', 'u' + <string>$i) }}) RETURN NONE;
-                 INSERT INTO _00_user_feature array::map($ix, |$i| {{ user: type::record('user', 'u' + <string>$i), key: 'filler' + <string>($i % 50), variant: 'on', evaluated_at: time::now() }}) RETURN NONE;
+                 INSERT INTO _00_user_feature array::map($ix, |$i| {{ user: type::record('user', 'u' + <string>$i), key: IF $i % 2 = 0 {{ 'beta' }} ELSE {{ 'filler' + <string>($i % 50) }}, variant: 'on', evaluated_at: time::now() }}) RETURN NONE;
                  INSERT INTO _00_crdt_doc array::map($ix, |$i| {{ doc: type::record('thread', 'other' + <string>$i), field: 'summary', rev: 1 }}) RETURN NONE;
                  INSERT INTO _00_channel_signal array::map($ix, |$i| {{ sender: type::record('user', 'u' + <string>$i), recipient: user:x, sender_peer: 'p', kind: 'hello', at: time::now() }}) RETURN NONE;"
             ),
@@ -103,9 +111,18 @@ async fn costs(rows: usize) -> Vec<(&'static str, f64)> {
     let db = deployed().await;
     seed(&db, rows).await;
     let mut out = Vec::new();
-    // the scheduler's flag sweep, per flag every 30 s: the `key` index
-    out.push(("flag sweep read", median_ms(&db, 7, |_| "SELECT VALUE <string>user FROM _00_user_feature WHERE key = 'beta';".into()).await));
-    // fn::feature::assign: find the user's row, write it by id
+    // the scheduler's flag sweep, per flag every 30 s: the `key` index (a
+    // flag no one holds, so the answer is the same size at both scales)
+    out.push((
+        "flag sweep read",
+        median_ms(&db, 7, |_| {
+            "SELECT VALUE <string>user FROM _00_user_feature WHERE key = 'absent';".into()
+        })
+        .await,
+    ));
+    // fn::feature::assign: find the user's row, write it by id. Half the
+    // rows hold `beta`: a lookup through the `key` index instead of `user`
+    // reads all of them.
     out.push((
         "fn::feature::assign",
         median_ms(&db, 7, |i| {
@@ -114,16 +131,29 @@ async fn costs(rows: usize) -> Vec<(&'static str, f64)> {
         .await,
     ));
     // fn::feature::materialize's delete of an unknown flag's rows
-    out.push(("fn::feature::materialize (unknown flag)", median_ms(&db, 7, |i| format!("RETURN fn::feature::materialize('gone{i}');")).await));
+    out.push((
+        "fn::feature::materialize (unknown flag)",
+        median_ms(&db, 7, |i| {
+            format!("RETURN fn::feature::materialize('gone{i}');")
+        })
+        .await,
+    ));
     // _00_crdt_cleanup on a parent delete
     out.push((
         "_00_crdt_cleanup",
-        median_ms(&db, 7, |i| format!("CREATE thread:del{i} SET title = 'x'; DELETE thread:del{i};")).await,
+        median_ms(&db, 7, |i| {
+            format!("CREATE thread:del{i} SET title = 'x'; DELETE thread:del{i};")
+        })
+        .await,
     ));
     // _00_channel_signal_sweep on every signal. `sender` is stamped from
     // `$auth.id`, which this root session has none of: let the test set it
     // (the event body under test is unchanged).
-    exec(&db, "DEFINE FIELD OVERWRITE sender ON TABLE _00_channel_signal TYPE record READONLY;").await;
+    exec(
+        &db,
+        "DEFINE FIELD OVERWRITE sender ON TABLE _00_channel_signal TYPE record READONLY;",
+    )
+    .await;
     out.push((
         "_00_channel_signal_sweep",
         median_ms(&db, 7, |i| {
@@ -140,8 +170,13 @@ fn generated_functions_and_events_stay_cheap_on_large_tables() {
         let small = costs(1_000).await;
         let large = costs(40_000).await;
         for ((name, a), (_, b)) in small.iter().zip(large.iter()) {
+            eprintln!("{name}: {a:.1} ms with 1,000 rows, {b:.1} ms with 40,000");
+        }
+        // A table read grows with the rows (40x here); an index read stays
+        // about flat. The slack covers noise on a busy machine.
+        for ((name, a), (_, b)) in small.iter().zip(large.iter()) {
             assert!(
-                *b < a * 10.0 + 25.0,
+                *b < a * 4.0 + 15.0,
                 "{name}: {b:.1} ms with 40,000 rows against {a:.1} ms with 1,000: it reads the table instead of its index"
             );
         }

@@ -363,8 +363,10 @@ fn check_body_index_scans(cfg: &Sp00kyConfig, project_dir: &Path) -> Check {
     Check::warn(
         "body-index-scans",
         "bind event values with `LET $x = $after.x;` at the top of the body, write through \
-         `UPDATE (SELECT VALUE id FROM t WHERE ...) SET ...` / `DELETE (SELECT VALUE id FROM t WHERE ...)`, \
-         and match lists with `FOR $v IN $list { ... = $v }`; `spky lint` prints each statement with its rewrite"
+         `LET $ids = (SELECT VALUE id FROM t WHERE ...); UPDATE $ids SET ...` / `DELETE $ids`, \
+         match lists with `FOR $v IN $list { ... = $v }`, give each lookup a single-column index, and keep \
+         a function's reads and writes out of functions that call other functions; `spky lint` prints each \
+         statement with its rewrite"
             .to_string(),
         format!(
             "{total} statement(s) in {} event/function bodies scan their table on SurrealDB 4.0.1: {}{}",

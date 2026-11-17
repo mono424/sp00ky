@@ -367,6 +367,18 @@ Nothing you read gets worse for it. The counts still land in the rollup (`spky s
   `spky schedules list` shows each schedule's last outcome from the schedule row itself, not by scanning history, so it stays correct after the run rows are gone — and stays fast when one schedule fans out very wide. Within a single fire of a fan-out, a failure is reported in preference to a sibling success, since one status cannot summarise many items.
 </Note>
 
+### Binding values before the query
+
+A `forEach.query` may start with `LET` bindings, separated by `;`, and end in its `SELECT`. The fan-out uses the rows of that last statement. Bind a value you would otherwise compute inline: SurrealDB 4 turns a top-level parameter into an index bound, while an expression written into the `WHERE` (such as `time::floor(time::now(), 1w)`) is evaluated per row after a wider read.
+
+```yaml
+forEach:
+  query: >
+    LET $week = time::floor(time::now() - 4d, 1w) + 4d;
+    SELECT id FROM game WHERE held_until = $week ORDER BY sort_index LIMIT 4
+  key: id
+```
+
 ## Validation
 
 `spky lint` checks schedules as part of the normal config pass, so mistakes surface before a deploy rather than at 03:00:
@@ -374,7 +386,7 @@ Nothing you read gets worse for it. The counts still land in the rollup (`spky s
 - every cron expression parses, and every `every` interval is at least 10s
 - `timezone` is a real IANA zone
 - each `backend` is an app with an outbox method, and each `route` exists in that backend's OpenAPI spec
-- `forEach.query` is a single `SELECT`
+- `forEach.query` is one `SELECT`, optionally preceded by `LET $name = ...;` bindings
 - no name is used by both a schedule and a workflow
 
 <Warning>
@@ -392,7 +404,7 @@ Nothing you read gets worse for it. The counts still land in the rollup (`spky s
   { name: 'backend', type: 'string', default: '(required)', desc: 'Name of an apps: entry with an outbox method.' },
   { name: 'route', type: 'string', default: '(required)', desc: 'POST route on that backend, e.g. /syncGames.' },
   { name: 'payload', type: 'object', default: '{}', desc: 'Static payload merged into every spawned job.' },
-  { name: 'forEach.query', type: 'string', default: '-', desc: 'SurrealQL SELECT run each fire; one job per row, passed as payload.row.' },
+  { name: 'forEach.query', type: 'string', default: '-', desc: 'SurrealQL SELECT run each fire; one job per row, passed as payload.row. May start with LET $name = ...; bindings: the rows come from the last statement.' },
   { name: 'forEach.key', type: 'string', default: 'id', desc: 'Row field whose value keys the per-row concurrency check.' },
   { name: 'concurrency', type: 'skip | allow | replace', default: 'skip', desc: 'What a fire does when the previous run for that key is still going.' },
   { name: 'quarantineAfter', type: 'number', default: '-', desc: 'Consecutive failures of ONE forEach key before it stops firing. It is then probed on a doubling backoff (1h up to 24h) and heals on the first probe that succeeds. Unset means never.' },

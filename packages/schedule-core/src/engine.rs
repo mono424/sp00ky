@@ -501,7 +501,10 @@ impl ScheduleEngine {
         let Some(query) = spec.for_each.as_deref() else {
             return Ok((vec![None], None));
         };
-        let mut items = rows(self.db.query(query, &[]).await?);
+        // The last statement's rows: a query may bind `LET $x = ...;` first
+        // (validated by the CLI), which SurrealDB 4 then uses as an index
+        // bound where an inline expression would scan.
+        let mut items = last_rows(self.db.query(query, &[]).await?);
         let mut truncated_from = None;
         if items.len() > self.cfg.fanout_max {
             // Truncation is surfaced twice on purpose: silently covering "most" of

@@ -380,14 +380,34 @@ fn validate_cadence(
     Ok(())
 }
 
+/// A `forEach.query` is one `SELECT`, optionally preceded by `LET $name = ...;`
+/// bindings. The scheduler runs it as one request and fans out over the LAST
+/// statement's rows. The LETs exist for the planner: SurrealDB 4 turns a
+/// top-level parameter into an index bound, but not a computed expression such
+/// as `time::floor(time::now(), 1w)` written into the WHERE.
 fn validate_for_each(label: &str, for_each: Option<&ForEachConfig>) -> Result<()> {
     let Some(fe) = for_each else { return Ok(()) };
-    let q = fe.query.trim();
-    if !q.to_ascii_uppercase().starts_with("SELECT") {
-        bail!("{label} forEach.query must be a SELECT statement");
+    let statements: Vec<&str> = fe
+        .query
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some((last, lets)) = statements.split_last() else {
+        bail!("{label} forEach.query is empty");
+    };
+    if !last.to_ascii_uppercase().starts_with("SELECT") {
+        bail!("{label} forEach.query must end in a SELECT statement");
     }
-    if q.contains(';') {
-        bail!("{label} forEach.query must be a single statement (no ';')");
+    if let Some(other) = lets
+        .iter()
+        .find(|s| !s.to_ascii_uppercase().starts_with("LET "))
+    {
+        let head: String = other.chars().take(40).collect();
+        bail!(
+            "{label} forEach.query may only bind `LET $name = ...;` before its SELECT, \
+             found `{head}`"
+        );
     }
     Ok(())
 }
@@ -906,7 +926,23 @@ game-sync:
         assert!(validate_all(&multi, &BTreeMap::new())
             .unwrap_err()
             .to_string()
-            .contains("single statement"));
+            .contains("must end in a SELECT"));
+
+        let write_first = schedule(
+            "x:\n  every: 5m\n  backend: api\n  route: /r\n  forEach:\n    query: \"DELETE b; SELECT id FROM a\"\n",
+        );
+        assert!(validate_all(&write_first, &BTreeMap::new())
+            .unwrap_err()
+            .to_string()
+            .contains("may only bind"));
+    }
+
+    #[test]
+    fn accepts_let_bindings_before_the_for_each_select() {
+        let lets = schedule(
+            "x:\n  every: 5m\n  backend: api\n  route: /r\n  forEach:\n    query: >\n      LET $m = time::floor(time::now(), 1w);\n      SELECT id FROM a WHERE at = $m;\n",
+        );
+        validate_all(&lets, &BTreeMap::new()).unwrap();
     }
 
     #[test]

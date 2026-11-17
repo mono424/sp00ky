@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/devtools",
-  "version": "1.0.0-beta.5",
+  "version": "1.0.0-beta.6",
   "description": "Chrome DevTools extension for debugging and inspecting Sp00ky state",
   "private": true,
   "type": "module",

@@ -2698,20 +2698,23 @@ h2 {
     align-items: stretch;
     gap: 14px;
   }
+  /* More sources than fit wrap to a second line rather than run off the edge.
+     Each button draws its own frame and overlaps its neighbours by a pixel,
+     so the lines stay single where the rows and buttons meet. */
   .lx-sources {
     display: flex;
-    min-width: 0;
-    overflow-x: auto;
-    scrollbar-width: none;
+    flex-wrap: wrap;
+    padding: 0 1px 1px 0;
+    border: 0;
   }
-  .lx-sources::-webkit-scrollbar {
-    display: none;
-  }
-  .lx-sources button {
-    flex: 1 0 auto;
+  .lx-sources button,
+  .lx-sources button + button {
+    flex: 1 1 auto;
     justify-content: center;
     height: 32px;
-    padding: 0 12px;
+    margin: 0 -1px -1px 0;
+    padding: 0 10px;
+    border: 1px solid var(--line);
   }
   .lx-total {
     display: flex;
@@ -2739,12 +2742,15 @@ h2 {
   }
   /* tighter columns leave the message most of the row */
   .lx-row {
-    grid-template-columns: 80px 34px minmax(0, 1fr);
+    grid-template-columns: 82px 40px minmax(0, 1fr);
     gap: 10px;
     font-size: 11.5px;
   }
   .lx-lvl {
     font-size: 9.5px;
+    letter-spacing: 0.04em;
+  }
+  .lx-row.lx-thead {
     letter-spacing: 0.04em;
   }
 }

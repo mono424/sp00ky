@@ -3935,18 +3935,66 @@ async fn prunes_with_nothing_due_stay_cheap_on_a_large_history() {
     // a due batch costs about the same per row on either history, and its
     // steps go with it
     let due = json!(stamp(Utc::now() + Duration::days(1)));
-    let mut per_row = Vec::new();
-    for h in [&small, &large] {
-        let found = crate::db::rows(
-            h.engine.db().query(crate::sql::PRUNE_WORKFLOW_RUNS, &[("status", json!("success")), ("before", due.clone()), ("batch", json!(500))]).await.expect("select a batch"),
-        );
-        let ids: Vec<(String, Value)> = found.iter().enumerate().map(|(i, r)| (format!("r{i}"), r["id"].clone())).collect();
-        let refs: Vec<(&str, Value)> = ids.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let started = std::time::Instant::now();
-        h.engine.db().query(&crate::sql::delete_workflow_runs(ids.len()), &refs).await.expect("delete the batch");
-        per_row.push(started.elapsed().as_secs_f64() * 1000.0 / ids.len().max(1) as f64);
+    for (name, select, status, delete, batch) in [
+        ("workflow runs", crate::sql::PRUNE_WORKFLOW_RUNS, "success", crate::sql::delete_workflow_runs as fn(usize) -> String, 500),
+    ] {
+        let mut per_row = Vec::new();
+        for h in [&small, &large] {
+            let found = crate::db::rows(
+                h.engine.db().query(select, &[("status", json!(status)), ("before", due.clone()), ("batch", json!(batch))]).await.expect("select a batch"),
+            );
+            let mut ids: Vec<(String, Value)> = found.iter().enumerate().map(|(i, r)| (format!("r{i}"), r["id"].clone())).collect();
+            ids.push(("status".into(), json!(status)));
+            let refs: Vec<(&str, Value)> = ids.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let started = std::time::Instant::now();
+            h.engine.db().query(&delete(found.len()), &refs).await.expect("delete the batch");
+            per_row.push(started.elapsed().as_secs_f64() * 1000.0 / found.len().max(1) as f64);
+        }
+        assert!(per_row[1] < per_row[0] * 10.0 + 1.0, "{name}, a due batch: {:.2} ms per row on the large history against {:.2}", per_row[1], per_row[0]);
     }
-    assert!(per_row[1] < per_row[0] * 10.0 + 1.0, "a due batch: {:.2} ms per run on the large history against {:.2}", per_row[1], per_row[0]);
-    let steps: i64 = large.raw.query("SELECT VALUE count() FROM _00_step_run GROUP ALL").await.unwrap().take::<Option<i64>>(0).unwrap().unwrap_or(0);
-    assert_eq!(steps, (40_000 - 500) * 3, "the batch's steps go with it");
+    let count = |sql: &'static str| {
+        let raw = large.raw.clone();
+        async move { raw.query(sql).await.unwrap().take::<Option<i64>>(0).unwrap().unwrap_or(0) }
+    };
+    assert_eq!(count("SELECT VALUE count() FROM _00_step_run GROUP ALL").await, (40_000 - 500) * 3, "the runs' steps go with them");
+}
+
+/// The workflow prune selects a batch in one request and deletes it in
+/// another. A run reopened for a retry in between must keep itself and its
+/// steps.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workflow_prune_keeps_a_run_reopened_since_its_selection() {
+    let h = harness().await;
+    h.raw
+        .query(
+            "OPTION IMPORT;
+             INSERT INTO _00_workflow_run [
+                 { id: _00_workflow_run:a, workflow_name: 'w', dag: {}, kill_requested: false, schedule_name: 'nightly', status: 'failed', created_at: time::now(), finished_at: time::now() - 30d, updated_at: time::now() },
+                 { id: _00_workflow_run:b, workflow_name: 'w', dag: {}, kill_requested: false, schedule_name: 'nightly', status: 'failed', created_at: time::now(), finished_at: time::now() - 30d, updated_at: time::now() }
+             ] RETURN NONE;
+             INSERT INTO _00_step_run [
+                 { workflow_run: _00_workflow_run:a, step: 's', status: 'failed' },
+                 { workflow_run: _00_workflow_run:b, step: 's', status: 'failed' }
+             ] RETURN NONE;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    let before = json!(stamp(Utc::now() - Duration::days(1)));
+    let found = crate::db::rows(
+        h.engine.db().query(crate::sql::PRUNE_WORKFLOW_RUNS, &[("status", json!("failed")), ("before", before), ("batch", json!(500))]).await.unwrap(),
+    );
+    assert_eq!(found.len(), 2);
+    // a retry reopens run a after the selection
+    h.engine.db().query(crate::sql::REOPEN_WORKFLOW_RUN, &[("tb", json!("_00_workflow_run")), ("key", json!("a"))]).await.unwrap();
+    let mut binds: Vec<(String, Value)> = found.iter().enumerate().map(|(i, r)| (format!("r{i}"), r["id"].clone())).collect();
+    binds.push(("status".into(), json!("failed")));
+    let refs: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let delete = crate::sql::delete_workflow_runs(found.len());
+    h.engine.db().query(&delete, &refs).await.unwrap();
+    let left: Vec<String> = h.raw.query("SELECT VALUE <string>id FROM _00_workflow_run").await.unwrap().take(0).unwrap();
+    assert_eq!(left, vec!["_00_workflow_run:a".to_string()]);
+    let steps: Vec<String> = h.raw.query("SELECT VALUE <string>workflow_run FROM _00_step_run").await.unwrap().take(0).unwrap();
+    assert_eq!(steps, vec!["_00_workflow_run:a".to_string()], "the reopened run keeps its steps");
 }

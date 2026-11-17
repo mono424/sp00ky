@@ -663,14 +663,20 @@ ORDER BY finished_at ASC LIMIT $batch";
 /// [`PRUNE_WORKFLOW_RUNS`] returned them), with their steps, steps FIRST, in
 /// one transaction of top-level statements. A step row is only reachable
 /// through its run, so a run deleted before its steps would leak them.
+///
+/// Only runs that still have the `$status` the batch was selected with go: the
+/// selection is a request of its own, and a run reopened for a retry in
+/// between ([`REOPEN_WORKFLOW_RUN`]) keeps its steps and itself. The guard
+/// reads the run's own row and the delete writes its key, so a reopen racing
+/// this transaction conflicts with it instead of interleaving.
 pub fn delete_workflow_runs(n: usize) -> String {
     let mut sql = String::from("BEGIN; ");
     for i in 0..n {
-        sql.push_str(&format!("LET $w{i} = type::record($r{i}); DELETE _00_step_run WHERE workflow_run = $w{i}; "));
-    }
-    let runs: Vec<String> = (0..n).map(|i| format!("$w{i}")).collect();
-    if n > 0 {
-        sql.push_str(&format!("DELETE {}; ", runs.join(", ")));
+        sql.push_str(&format!(
+            "LET $w{i} = type::record($r{i}); \
+             DELETE _00_step_run WHERE workflow_run = $w{i} AND $w{i}.status = $status; \
+             DELETE $w{i} WHERE status = $status; "
+        ));
     }
     sql.push_str("COMMIT;");
     sql
@@ -687,17 +693,18 @@ WHERE status = $status AND finished_at != NONE AND finished_at < <datetime>$befo
 ORDER BY finished_at ASC LIMIT $batch";
 
 /// Delete `n` durable instances bound as `$r0..$r{n-1}`, steps and events
-/// first, in one transaction of top-level statements.
+/// first, in one transaction of top-level statements, each only while it still
+/// has the `$status` the batch was selected with (an instance retried in
+/// between keeps its history), as [`delete_workflow_runs`] does.
 pub fn delete_durable_instances(n: usize) -> String {
     let mut sql = String::from("BEGIN; ");
     for i in 0..n {
         sql.push_str(&format!(
-            "LET $w{i} = type::record($r{i}); DELETE _00_wf_step WHERE instance = $w{i}; DELETE _00_wf_event WHERE instance = $w{i}; "
+            "LET $w{i} = type::record($r{i}); \
+             DELETE _00_wf_step WHERE instance = $w{i} AND $w{i}.status = $status; \
+             DELETE _00_wf_event WHERE instance = $w{i} AND $w{i}.status = $status; \
+             DELETE $w{i} WHERE status = $status; "
         ));
-    }
-    let ids: Vec<String> = (0..n).map(|i| format!("$w{i}")).collect();
-    if n > 0 {
-        sql.push_str(&format!("DELETE {}; ", ids.join(", ")));
     }
     sql.push_str("COMMIT;");
     sql
@@ -1150,9 +1157,15 @@ mod tests {
         for sql in [delete_workflow_runs(3), delete_durable_instances(3)] {
             assert!(sql.starts_with("BEGIN; ") && sql.ends_with("COMMIT;"), "{sql}");
             assert!(!sql.contains("INSIDE") && !sql.contains(" IN ") && !sql.contains('{'), "{sql}");
+            // only rows still in the status they were selected with
+            assert!(sql.contains("DELETE $w2 WHERE status = $status;"), "{sql}");
         }
         let wf = delete_workflow_runs(2);
-        assert!(wf.find("DELETE _00_step_run").unwrap() < wf.find("DELETE $w0, $w1").unwrap(), "steps first: {wf}");
+        assert!(
+            wf.find("DELETE _00_step_run WHERE workflow_run = $w0 AND $w0.status = $status").unwrap()
+                < wf.find("DELETE $w0 WHERE").unwrap(),
+            "steps first: {wf}"
+        );
         assert_eq!(delete_workflow_runs(0), "BEGIN; COMMIT;");
     }
 

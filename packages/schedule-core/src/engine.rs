@@ -1561,8 +1561,8 @@ impl ScheduleEngine {
             if ids.is_empty() {
                 return;
             }
-            let binds: Vec<(String, Value)> = ids.iter().enumerate().map(|(i, id)| (format!("r{i}"), json!(id))).collect();
-            let refs: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let refs = batch_binds(&ids, status);
+            let refs: Vec<(&str, Value)> = refs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             match self.db.query(&sql::delete_durable_instances(ids.len()), &refs).await {
                 Ok(_) => {
                     let n = ids.len();
@@ -1598,8 +1598,8 @@ impl ScheduleEngine {
             if ids.is_empty() {
                 return;
             }
-            let binds: Vec<(String, Value)> = ids.iter().enumerate().map(|(i, id)| (format!("r{i}"), json!(id))).collect();
-            let refs: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let refs = batch_binds(&ids, status);
+            let refs: Vec<(&str, Value)> = refs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             if let Err(e) = self.db.query(&sql::delete_workflow_runs(ids.len()), &refs).await {
                 tracing::warn!(error = %e, status = %fold.status, "history prune failed");
                 return;
@@ -1814,6 +1814,14 @@ pub(crate) fn bind_ref(prefix: &str, r: &ids::Ref) -> [(&'static str, Value); 2]
 /// RFC 3339 with millisecond precision — the form SurrealDB's flattened values
 /// hand back, so a stamp we write can be compared against one we read.
 /// The `id` of each row, as the string SurrealDB rendered it.
+/// `$r0..$r{n-1}` for a batch of ids, and the `$status` the batch was
+/// selected with ([`sql::delete_workflow_runs`], [`sql::delete_durable_instances`]).
+fn batch_binds(ids: &[String], status: &str) -> Vec<(String, Value)> {
+    let mut binds: Vec<(String, Value)> = ids.iter().enumerate().map(|(i, id)| (format!("r{i}"), json!(id))).collect();
+    binds.push(("status".to_string(), json!(status)));
+    binds
+}
+
 fn row_ids(rows: &[Value]) -> Vec<String> {
     rows.iter().filter_map(|r| r.get("id").and_then(Value::as_str).map(String::from)).collect()
 }

@@ -2084,6 +2084,8 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  /* a source's name never breaks: "ssp-0-gc78e76" over two lines read as two sources */
+  white-space: nowrap;
   text-transform: none;
   letter-spacing: 0;
   font-size: 11.5px;
@@ -2690,6 +2692,37 @@ h2 {
 }
 
 @media (max-width: 640px) {
+  /* the sources get the whole width, the count goes under them, over its chart */
+  .lx-chart-top {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+  }
+  /* More sources than fit wrap to a second line rather than run off the edge.
+     Each button draws its own frame and overlaps its neighbours by a pixel,
+     so the lines stay single where the rows and buttons meet. */
+  .lx-sources {
+    display: flex;
+    flex-wrap: wrap;
+    padding: 0 1px 1px 0;
+    border: 0;
+  }
+  .lx-sources button,
+  .lx-sources button + button {
+    flex: 1 1 auto;
+    justify-content: center;
+    height: 32px;
+    margin: 0 -1px -1px 0;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+  }
+  .lx-total {
+    display: flex;
+    align-items: baseline;
+    justify-content: flex-start;
+    gap: 10px;
+    text-align: left;
+  }
   .lx-total b {
     font-size: 22px;
   }
@@ -2698,6 +2731,27 @@ h2 {
   }
   .lx-kbd {
     display: none;
+  }
+  /* the search and its filter button share one line */
+  .lx-query-cell {
+    gap: 8px;
+  }
+  .lx-search {
+    flex: 1 1 160px;
+    min-width: 0;
+  }
+  /* tighter columns leave the message most of the row */
+  .lx-row {
+    grid-template-columns: 82px 40px minmax(0, 1fr);
+    gap: 10px;
+    font-size: 11.5px;
+  }
+  .lx-lvl {
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+  }
+  .lx-row.lx-thead {
+    letter-spacing: 0.04em;
   }
 }
 

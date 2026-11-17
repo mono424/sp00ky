@@ -212,9 +212,26 @@ fn bodies(src: &str) -> Vec<(String, String)> {
         if kind != "EVENT" && kind != "FUNCTION" {
             continue;
         }
-        // the header runs to the body's opening brace
-        let Some(open_rel) = rest.find('{') else {
-            continue;
+        // the header runs to the body's opening brace; an event whose THEN is
+        // a single statement (no braces) ends at its own `;`
+        let semi = statement_end(rest.as_bytes(), 0);
+        let open_rel = match rest.find('{') {
+            Some(o) if o < semi => o,
+            _ => {
+                let stmt = &rest[..semi];
+                if let Some(then) = find_ci(stmt, "THEN ", 0) {
+                    let mut names = stmt.split_whitespace().skip(1).filter(|t| {
+                        !matches!(t.to_ascii_uppercase().as_str(), "OVERWRITE" | "IF" | "NOT" | "EXISTS")
+                    });
+                    let name = names.next().unwrap_or("?");
+                    out.push((
+                        format!("{} {name}", kind.to_ascii_lowercase()),
+                        stmt[then + 5..].to_string(),
+                    ));
+                }
+                at += semi;
+                continue;
+            }
         };
         let header = &rest[..open_rel];
         let mut tokens: Vec<&str> = header.split_whitespace().skip(1).collect();
@@ -605,6 +622,15 @@ mod tests {
             UPDATE type::record('t', $key) SET g = 1; DELETE $key; UPSERT t:abc SET g = 1; \
             RETURN (SELECT * FROM t WHERE f = $key); };";
         assert!(lint(src).is_empty(), "{:?}", lint(src));
+    }
+
+    #[test]
+    fn single_statement_event_bodies_stay_in_their_event() {
+        let src = "DEFINE EVENT a ON t WHEN $event = 'CREATE' THEN RELATE ($after.id)->x->($after.game);\n\
+            DEFINE EVENT b ON t WHEN $event = 'DELETE' THEN { DELETE y WHERE t = $before.id; };";
+        let found = lint(src);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].owner, "event b ON t");
     }
 
     #[test]

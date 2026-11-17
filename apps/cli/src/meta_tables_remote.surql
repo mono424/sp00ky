@@ -540,8 +540,13 @@ PERMISSIONS WHERE $auth.id != NONE
 -- rule that is not FULL, 4.0.1 reads the table for their lookups anyway).
 -- spky-lint: allow write-where
 DEFINE FUNCTION OVERWRITE fn::feature::put($user: record, $key: string, $variant: string, $payload: any) -> string {
+    -- `WITH INDEX`: given `user = $user AND key = $key`, SurrealDB 3.3.5 picks
+    -- the `key` index and filters every row of the flag (materializing a
+    -- 5,000-user flag took 25-42 s), 4.0.1 cannot use the (user, key) index
+    -- in a body; through `user` it is one row per flag the user has, on both.
     LET $row = IF $access = NONE {
-        (SELECT VALUE id FROM _00_user_feature WHERE user = $user AND key = $key LIMIT 1)[0]
+        (SELECT VALUE id FROM _00_user_feature WITH INDEX idx_user_feature_user
+            WHERE user = $user AND key = $key LIMIT 1)[0]
     } ELSE { NONE };
     IF $row != NONE {
         UPDATE $row

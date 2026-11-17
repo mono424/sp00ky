@@ -15,12 +15,12 @@ DEFINE ACCESS account ON DATABASE TYPE RECORD
 DEFINE TABLE user SCHEMAFULL
 PERMISSIONS
   FOR update, delete WHERE $access = "account" AND id = $auth.id
-  FOR create, select WHERE true;
+  FOR create, select FULL;
 
 DEFINE FIELD username ON TABLE user TYPE string
 ASSERT $value != NONE AND string::len($value) > 3
 PERMISSIONS
-    FOR select WHERE true
+    FOR select FULL
     FOR create WHERE true
     FOR update WHERE $access = "account" AND id = $auth.id;
 
@@ -42,7 +42,7 @@ PERMISSIONS
 
 DEFINE FIELD profile_picture ON TABLE user TYPE option<string>
 PERMISSIONS
-    FOR select WHERE true
+    FOR select FULL
     FOR create, update WHERE $access = "account" AND id = $auth.id;
 
 -- ##################################################################
@@ -51,7 +51,7 @@ PERMISSIONS
 
 DEFINE TABLE thread SCHEMAFULL
   PERMISSIONS
-    FOR select WHERE true
+    FOR select FULL
     FOR update, delete, create WHERE $access = "account" AND author.id = $auth.id
 ;
 
@@ -78,7 +78,7 @@ DEFINE FIELD active ON TABLE thread TYPE bool VALUE $value OR false;
 
 DEFINE TABLE comment SCHEMAFULL
   PERMISSIONS
-    FOR select WHERE true
+    FOR select FULL
     FOR update, delete, create WHERE $access = "account" AND author.id = $auth.id
 ;
 
@@ -98,7 +98,7 @@ DEFINE FIELD created_at ON TABLE comment TYPE datetime
 
 DEFINE TABLE commented_on SCHEMAFULL TYPE RELATION
   FROM comment TO thread
-  PERMISSIONS FOR select WHERE true;
+  PERMISSIONS FOR select FULL;
 
 DEFINE EVENT comment_created ON TABLE comment WHEN $event = "CREATE" THEN
   RELATE ($after.id)->commented_on->($after.thread)

@@ -482,11 +482,11 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
         Target::Server => s.push_str(&format!(
             "DEFINE TABLE OVERWRITE {log} SCHEMAFULL COMMENT 'sp00ky:crdt_log {kinds}'\n\
              \x20 PERMISSIONS\n\
-             \x20   FOR select WHERE {select}\n\
+             \x20   FOR select {select}\n\
              \x20   FOR create WHERE $access != \"{IMPERSONATE_ACCESS}\" AND ({update})\n\
              \x20   FOR update, delete NONE;\n",
             kinds = kinds.join(","),
-            select = parent.select,
+            select = select_rule(&parent.select),
             update = parent.update,
         )),
         Target::Client => s.push_str(&format!("DEFINE TABLE OVERWRITE {log} SCHEMAFULL PERMISSIONS FULL;\n")),
@@ -513,11 +513,11 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
             Target::Server => s.push_str(&format!(
                 "DEFINE TABLE OVERWRITE {presence} SCHEMAFULL\n\
                  \x20 PERMISSIONS\n\
-                 \x20   FOR select WHERE {select}\n\
+                 \x20   FOR select {select}\n\
                  \x20   FOR create WHERE $access != \"{IMPERSONATE_ACCESS}\" AND ({update})\n\
                  \x20   FOR update WHERE author = $auth.id AND ({update})\n\
                  \x20   FOR delete WHERE author = $auth.id;\n",
-                select = parent.select,
+                select = select_rule(&parent.select),
                 update = parent.update,
             )),
             Target::Client => s.push_str(&format!("DEFINE TABLE OVERWRITE {presence} SCHEMAFULL PERMISSIONS FULL;\n")),
@@ -548,6 +548,17 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
         ));
     }
     s
+}
+
+/// A select rule as the clause after `FOR select`: `FULL` for a rule that is
+/// just `true` (the same rule, but SurrealDB 4.0.1 gives up indexes for record
+/// users under `WHERE true`, see `query_lint`), `WHERE <rule>` otherwise.
+fn select_rule(rule: &str) -> String {
+    if rule.trim().eq_ignore_ascii_case("true") {
+        "FULL".to_string()
+    } else {
+        format!("WHERE {rule}")
+    }
 }
 
 /// `DEFINE FIELD` lines; a name prefixed `@opaque ` gets the annotation that

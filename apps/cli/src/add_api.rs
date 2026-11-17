@@ -27,22 +27,22 @@ PERMISSIONS
 -- makes every scheduled fire fail with "Expected `record` but found `NONE`".
 DEFINE FIELD assigned_to ON TABLE {table} TYPE option<record>
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 DEFINE FIELD path ON TABLE {table} TYPE string
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 DEFINE FIELD payload ON TABLE {table} TYPE any
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 DEFINE FIELD retries ON TABLE {table} TYPE int DEFAULT ALWAYS 0
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 DEFINE FIELD max_retries ON TABLE {table} TYPE int DEFAULT ALWAYS 3;
@@ -50,13 +50,13 @@ DEFINE FIELD max_retries ON TABLE {table} TYPE int DEFAULT ALWAYS 3;
 DEFINE FIELD retry_strategy ON TABLE {table} TYPE string DEFAULT ALWAYS "linear"
 ASSERT $value IN ["linear", "exponential"]
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 DEFINE FIELD status ON TABLE {table} TYPE string DEFAULT ALWAYS "pending"
 ASSERT $value IN ["pending", "processing", "success", "failed"]
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 DEFINE FIELD errors ON TABLE {table} TYPE array<object> DEFAULT ALWAYS []
@@ -80,7 +80,7 @@ DEFINE FIELD OVERWRITE errors[*] ON TABLE {table} TYPE object FLEXIBLE;
 DEFINE FIELD updated_at ON TABLE {table} TYPE datetime
 DEFAULT ALWAYS time::now()
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 -- `DEFAULT`, deliberately NOT `VALUE`. A `VALUE time::now()` field is recomputed
@@ -91,7 +91,7 @@ PERMISSIONS
 DEFINE FIELD created_at ON TABLE {table} TYPE datetime
 DEFAULT time::now()
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 -- Platform claim marker: the sp00ky SSP stamps the owning SSP instance
@@ -101,7 +101,7 @@ PERMISSIONS
 -- documents the full shape of the table.
 DEFINE FIELD assignee ON TABLE {table} TYPE option<string>
 PERMISSIONS
-  FOR select WHERE true
+  FOR select FULL
   FOR create, update WHERE false;
 
 -- Lease expiry for the attempt currently holding this row, and the fencing token
@@ -125,12 +125,12 @@ PERMISSIONS
 -- before the field existed. Readers treat NONE as "no lease" / epoch 0.
 DEFINE FIELD lease_until ON TABLE {table} TYPE option<datetime>
 PERMISSIONS
-  FOR select WHERE true
+  FOR select FULL
   FOR create, update WHERE false;
 
 DEFINE FIELD lease_epoch ON TABLE {table} TYPE option<int>
 PERMISSIONS
-  FOR select WHERE true
+  FOR select FULL
   FOR create, update WHERE false;
 
 -- The backend's response body on success, stored by the job runner. Readable so
@@ -138,7 +138,7 @@ PERMISSIONS
 -- workflow hands to the steps that depend on this one. Platform-written.
 DEFINE FIELD result ON TABLE {table} TYPE any
 PERMISSIONS
-  FOR select WHERE true
+  FOR select FULL
   FOR create, update WHERE false;
 
 -- Per-job HTTP timeout in SECONDS, overriding the backend default. Set by
@@ -156,7 +156,7 @@ PERMISSIONS
 -- CREATE with "Found field 'timeout', but no such field exists".
 DEFINE FIELD timeout ON TABLE {table} TYPE option<int>
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 -- One-shot delay in ms: the job becomes due at `created_at + delay`
@@ -165,7 +165,7 @@ PERMISSIONS
 -- scheduler creates a fresh row here each cycle.
 DEFINE FIELD delay ON TABLE {table} TYPE option<int>
 PERMISSIONS
-  FOR create, select WHERE true
+  FOR create, select FULL
   FOR update WHERE false;
 
 -- ── Indexes ────────────────────────────────────────────────────────────────

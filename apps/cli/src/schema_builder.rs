@@ -207,9 +207,13 @@ where
         if table.is_empty() {
             continue;
         }
+        // Select rules are `FULL`, not the equivalent `WHERE true`: SurrealDB
+        // 4.0.1 gives up the indexes on a field whose select rule is not FULL for
+        // a record user's query. (A deployment that has these fields from an
+        // earlier release keeps its `WHERE true`: `spky lint` points it out.)
         out.push_str(&format!(
             "DEFINE FIELD IF NOT EXISTS assignee ON {} TYPE option<string> \
-             PERMISSIONS FOR select WHERE true FOR create, update WHERE false;\n",
+             PERMISSIONS FOR select FULL, FOR create, update WHERE false;\n",
             table
         ));
         // The reclaim lease and its fencing token. `assignee` above says who claimed
@@ -221,17 +225,17 @@ where
         // it does, both sweeps fall back to the old `updated_at` staleness rule.
         out.push_str(&format!(
             "DEFINE FIELD IF NOT EXISTS lease_until ON {} TYPE option<datetime> \
-             PERMISSIONS FOR select WHERE true FOR create, update WHERE false;\n",
+             PERMISSIONS FOR select FULL, FOR create, update WHERE false;\n",
             table
         ));
         out.push_str(&format!(
             "DEFINE FIELD IF NOT EXISTS lease_epoch ON {} TYPE option<int> \
-             PERMISSIONS FOR select WHERE true FOR create, update WHERE false;\n",
+             PERMISSIONS FOR select FULL, FOR create, update WHERE false;\n",
             table
         ));
         out.push_str(&format!(
             "DEFINE FIELD IF NOT EXISTS result ON {} TYPE any \
-             PERMISSIONS FOR select WHERE true FOR create, update WHERE false;\n",
+             PERMISSIONS FOR select FULL, FOR create, update WHERE false;\n",
             table
         ));
         // The documented outbox template declares `errors` as `array<object>`
@@ -267,7 +271,7 @@ where
         // re-applied its own schema is healed by the next deploy.
         out.push_str(&format!(
             "DEFINE FIELD IF NOT EXISTS timeout ON {} TYPE option<int> \
-             PERMISSIONS FOR create, select WHERE true FOR update WHERE false;\n",
+             PERMISSIONS FOR create, select FULL, FOR update WHERE false;\n",
             table
         ));
         // Backs the retention prune. `(status, updated_at)` in that order: the prune

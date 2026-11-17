@@ -718,7 +718,7 @@ PERMISSIONS WHERE $auth.id != NONE
 -- ==================================================
 DEFINE TABLE OVERWRITE _00_app_release SCHEMAFULL
     PERMISSIONS
-      FOR select WHERE true
+      FOR select FULL
       FOR create, update, delete NONE;
 
 DEFINE FIELD OVERWRITE app ON TABLE _00_app_release TYPE string;

@@ -43,6 +43,8 @@ pub enum Rule {
     WriteWhere,
     /// `WHERE f INSIDE $x` / `IN $x` / `CONTAINSANY $x`.
     InsideParam,
+    /// A table or field select rule written `WHERE true` instead of `FULL`.
+    SelectWhereTrue,
 }
 
 impl Rule {
@@ -51,6 +53,7 @@ impl Rule {
             Rule::WhereOnEventValue => "where-on-event-value",
             Rule::WriteWhere => "write-where",
             Rule::InsideParam => "inside-param",
+            Rule::SelectWhereTrue => "select-where-true",
         }
     }
 }
@@ -81,6 +84,63 @@ pub fn lint(source: &str) -> Vec<Finding> {
     for (owner, body) in bodies(&clean) {
         for stmt in statements(&body) {
             out.extend(check_statement(&owner, &stmt));
+        }
+    }
+    out.extend(select_where_true(&clean));
+    out
+}
+
+/// `FOR select WHERE true` on a table or a field. It is the same rule as
+/// `FOR select FULL`, but SurrealDB 4.0.1 plans them differently for a record
+/// user: with a select rule other than FULL on a field, the user's query
+/// filtering on that field reads the whole table (the index is not used, on
+/// 3.3.5 either); with one on a table, a lookup an event runs for a record
+/// user's write reads the whole table (a WhitePawn game delete by its owner:
+/// 37-115 s, 0.2-0.5 s with FULL).
+fn select_where_true(src: &str) -> Vec<Finding> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = find_ci(src, "DEFINE ", at) {
+        at = i + 7;
+        let kind = src[at..].split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        if kind != "TABLE" && kind != "FIELD" {
+            continue;
+        }
+        let end = statement_end(b, i);
+        let stmt = collapse(&src[i..end]);
+        at = end.max(at);
+        let upper = stmt.to_ascii_uppercase();
+        let Some(perm) = upper.find(" PERMISSIONS ") else { continue };
+        let rules = &stmt[perm + 13..];
+        // each `FOR <ops> <rule>` clause
+        for clause in rules.split(" FOR ").chain(rules.strip_prefix("FOR ").into_iter().take(0)) {
+            let clause = clause.trim().trim_start_matches("FOR ").trim_end_matches(',').trim();
+            let lower = clause.to_ascii_lowercase();
+            let Some(w) = lower.find(" where ") else { continue };
+            let ops: Vec<&str> = lower[..w].split(',').map(str::trim).collect();
+            let cond = lower[w + 7..].trim().trim_end_matches(',').trim();
+            let cond = cond.split(|c: char| c == ',' || c == ';').next().unwrap_or("").trim();
+            if ops.contains(&"select") && cond == "true" {
+                let words: Vec<&str> = stmt.split_whitespace().collect();
+                let owner = if kind == "TABLE" {
+                    format!("table {}", words.iter().skip(2).find(|w| !matches!(w.to_ascii_uppercase().as_str(), "OVERWRITE" | "IF" | "NOT" | "EXISTS")).unwrap_or(&"?"))
+                } else {
+                    let name = words.iter().skip(2).find(|w| !matches!(w.to_ascii_uppercase().as_str(), "OVERWRITE" | "IF" | "NOT" | "EXISTS")).unwrap_or(&"?");
+                    let table = words.windows(2).find(|w| w[0].eq_ignore_ascii_case("ON")).map(|w| if w[1].eq_ignore_ascii_case("TABLE") { "" } else { w[1] }).unwrap_or("?");
+                    let table = if table.is_empty() { words.windows(2).find(|w| w[0].eq_ignore_ascii_case("TABLE") && !w[1].eq_ignore_ascii_case("TYPE")).map(|w| w[1]).unwrap_or("?") } else { table };
+                    format!("field {name} ON {table}")
+                };
+                out.push(Finding {
+                    owner,
+                    rule: Rule::SelectWhereTrue,
+                    statement: format!("FOR {} WHERE true", ops.join(", ")),
+                    fix: format!(
+                        "FOR {} FULL (the same rule; SurrealDB 4.0.1 gives up indexes for record users under `WHERE true`)",
+                        ops.join(", ")
+                    ),
+                });
+            }
         }
     }
     out
@@ -634,6 +694,18 @@ mod tests {
     }
 
     #[test]
+    fn flags_select_where_true() {
+        let src = "DEFINE TABLE game SCHEMAFULL PERMISSIONS FOR select WHERE true, FOR create, update WHERE owner = $auth.id;\n\
+            DEFINE FIELD status ON TABLE job TYPE string PERMISSIONS FOR create, select WHERE true FOR update WHERE false;\n\
+            DEFINE TABLE ok SCHEMAFULL PERMISSIONS FOR select FULL, FOR update WHERE true;\n\
+            DEFINE FIELD f ON ok TYPE string PERMISSIONS FOR select WHERE $auth.id != NONE;";
+        let found = lint(src);
+        assert_eq!(found.iter().map(|f| f.owner.as_str()).collect::<Vec<_>>(), vec!["table game", "field status ON job"], "{found:?}");
+        assert!(found.iter().all(|f| f.rule == Rule::SelectWhereTrue));
+        assert!(found[1].fix.starts_with("FOR create, select FULL"), "{}", found[1].fix);
+    }
+
+    #[test]
     fn flags_inside_param() {
         let src = "DEFINE FUNCTION fn::x($ids: array) { LET $i = $ids; DELETE (SELECT VALUE id FROM t WHERE f INSIDE $i); };";
         assert_eq!(rules(src), vec![Rule::InsideParam]);
@@ -658,7 +730,7 @@ mod tests {
         use crate::schema_builder::{
             build_server_events, build_server_schema, SchemaBuilderConfig,
         };
-        let app = "DEFINE TABLE user SCHEMAFULL PERMISSIONS FOR select WHERE true;\n\
+        let app = "DEFINE TABLE user SCHEMAFULL PERMISSIONS FOR select FULL;\n\
             DEFINE FIELD name ON TABLE user TYPE string;\n\
             DEFINE TABLE thread SCHEMAFULL PERMISSIONS FULL;\n\
             DEFINE FIELD title ON TABLE thread TYPE string;\n\

@@ -15,12 +15,12 @@ DEFINE ACCESS account ON DATABASE TYPE RECORD
 DEFINE TABLE user SCHEMAFULL
 PERMISSIONS
   FOR update, delete WHERE $access = "account" AND id = $auth.id
-  FOR create, select WHERE true;
+  FOR create, select FULL;
 
 DEFINE FIELD username ON TABLE user TYPE string
 ASSERT $value != NONE AND string::len($value) > 3
 PERMISSIONS
-    FOR select WHERE true
+    FOR select FULL
     FOR create WHERE true
     FOR update WHERE $access = "account" AND id = $auth.id;
 
@@ -42,5 +42,5 @@ PERMISSIONS
 
 DEFINE FIELD profile_picture ON TABLE user TYPE option<string>
 PERMISSIONS
-    FOR select WHERE true
+    FOR select FULL
     FOR create, update WHERE $access = "account" AND id = $auth.id;

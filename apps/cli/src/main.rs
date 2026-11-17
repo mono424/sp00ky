@@ -30,6 +30,8 @@ mod push_cmd;
 mod push_db_tests;
 #[cfg(test)]
 mod version_ledger_tests;
+#[cfg(test)]
+mod body_scan_tests;
 mod push_sync;
 mod query;
 mod query_lint;

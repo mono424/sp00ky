@@ -25,7 +25,29 @@ after a schema edit, and it's cheap enough to run constantly.
 | Codegen freshness | `schema.gen.ts` / `.dart` is older than the schema. The single most common cause of "this type is wrong". |
 | Migrations directory | Missing or unreadable migrations folder. |
 | Legacy recurring fields | Outbox tables still carrying the old per-row recurrence fields, superseded by `schedules:`. |
+| Index scans in event and function bodies (`body-index-scans`, a warning) | Statements SurrealDB 4 runs as a scan of the whole table. See below. |
 | Docker | The daemon isn't running or isn't reachable. |
+
+## Event and function bodies on SurrealDB 4
+
+SurrealDB 4.0.1 plans a statement inside a `DEFINE EVENT` or `DEFINE FUNCTION` body differently
+from the same statement at the top level of a query, and reads the whole table for shapes 3.x
+served from an index. On a large table one write through such an event costs seconds. `spky lint`
+prints every statement with its rewrite (both forms are index reads on 3.x as well):
+
+| Finding | Rewrite |
+| --- | --- |
+| `where-on-event-value`: a WHERE on `$after.x`, `$before.x`, `$value` | `LET $x = $after.x;` at the top of the body, then `WHERE f = $x` |
+| `write-where`: `UPDATE` / `DELETE` / `UPSERT <table> ... WHERE` with a parameter | `UPDATE (SELECT VALUE id FROM t WHERE ...) SET ...`, `DELETE (SELECT VALUE id FROM t WHERE ...)` |
+| `inside-param`: `WHERE f INSIDE $list` | `FOR $v IN $list { ... WHERE f = $v ... }` |
+| `select-where-true`: `FOR select WHERE true` on a table or field | `FOR select FULL`, the same rule |
+
+The last one matters for record users: with any select rule other than `FULL`, 4.0.1 gives up a
+table's indexes for a lookup an event runs because a signed-in user wrote, and a field's indexes for
+the user's own query on that field. Inside events, also keep lookups on a single-column index (or a
+record key): 4.0.1 did not use the leading column of a four-column index there.
+
+<CodeBlock code={lintCode} lang="bash" />
 
 ## For agents and CI
 
@@ -42,7 +64,7 @@ This is the intended feedback loop for AI coding agents: edit the schema, run
 
 | Command | Use it when |
 | --- | --- |
-| `spky lint` | You only want to know whether `sp00ky.yml` is valid. Faster than `doctor`. |
+| `spky lint` | You only want to know whether `sp00ky.yml` is valid, and which event and function bodies SurrealDB 4 runs as table scans (each with its rewrite). Faster than `doctor`. |
 | `spky verify` | Query results look stale or incomplete. Compares the SSP/scheduler snapshot against the upstream database. `--fix` forces every SSP to re-bootstrap. |
 | `spky query` | You want to see what's actually in the database. Pass SurrealQL to run once, or omit it for a REPL. `--cloud` targets the deployment. |
 | `spky jobs` | A backend call didn't do anything. Opens the interactive job dashboard. |
@@ -92,3 +114,9 @@ spky query --cloud 'SELECT * FROM _00_query LIMIT 5'
 
 # interactive REPL
 spky query`;
+
+export const lintCode = `spky lint
+  warning: ./src/schema.surql: event game_children_cleanup ON game [write-where]: DELETE analysis WHERE game = $before.id
+    fix: DELETE (SELECT VALUE id FROM analysis WHERE game = $before.id) with every $after.x / $before.x first bound by a LET at the top of the body
+  warning: ./src/schema.surql: table analysis [select-where-true]: FOR select WHERE true
+    fix: FOR select FULL`;

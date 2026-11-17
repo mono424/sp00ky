@@ -17,6 +17,7 @@ members = [
     "packages/pool-core",
     "packages/ssp-node",
     "packages/core-rs",
+    "apps/sdb-parity",
 ]
 
 # loro-internal has a debug assertion (diff_calc) that a valid

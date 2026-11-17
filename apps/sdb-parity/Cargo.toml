@@ -1,0 +1,30 @@
+[package]
+name = "sdb-parity"
+version = "1.0.0-beta.4"
+edition = "2021"
+description = "Local SurrealDB 3.3.5 vs 4.0.1 performance comparison of every query sp00ky runs, at WhitePawn's scale"
+publish = false
+
+[[bin]]
+name = "sdb-parity"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The SDK the SSP and the scheduler use, so bound parameters reach the server
+# typed exactly as they do in production. `protocol-ws` for the LIVE queries.
+surrealdb = { version = "4.0.1", default-features = false, features = ["protocol-http", "protocol-ws", "rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs"] }
+ssp-protocol = { path = "../../packages/ssp-protocol" }
+# The SSP's own statement builders (edge publication, list_ref DDL, the job
+# runner) through its database port, so the bench sends what the SSP sends.
+ssp-node = { path = "../../packages/ssp-node" }
+ssp = { path = "../../packages/ssp", default-features = false, features = ["parallel", "mmap-store"] }
+# The scheduler's schedule engine, its SQL and the jobs sampler.
+schedule-core = { path = "../../packages/schedule-core" }

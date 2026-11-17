@@ -669,6 +669,29 @@ async fn replace_kills_the_previous_run_for_that_key() {
 }
 
 #[tokio::test]
+async fn a_for_each_fans_out_over_its_last_statement_after_let_bindings() {
+    let h = harness().await;
+    h.set("CREATE item:a SET n = 1; CREATE item:b SET n = 2; CREATE item:c SET n = 3;").await;
+    h.define_schedule(
+        "let-fanout",
+        json!({
+            "kind": "job",
+            "every_ms": 300_000,
+            "target_table": "job",
+            "path": "/x",
+            "for_each": "LET $min = 2; SELECT id FROM item WHERE n >= $min",
+        }),
+    )
+    .await;
+    h.engine.tick_pass().await.unwrap();
+    h.set("UPDATE _00_schedule:`let-fanout` SET next_fire_at = time::now() - 1s").await;
+
+    let report = h.engine.tick_pass().await.unwrap();
+    assert_eq!(report.errored, 0, "{report:?}");
+    assert_eq!(h.job_ids().await.len(), 2, "one job per row of the SELECT, none for the LET");
+}
+
+#[tokio::test]
 async fn a_failing_for_each_query_is_recorded_not_fatal() {
     let h = harness().await;
     h.define_schedule(

@@ -280,7 +280,7 @@ A workflow run has no long-lived coordinator process. Every advancement reads th
   { name: 'steps', type: 'map', default: '(required)', desc: 'Steps by name. Declaration order is irrelevant, dependsOn decides execution order.' },
   { name: 'onFailure', type: 'halt | continue-independent', default: 'halt', desc: 'Whether a failed step stops the whole run or only its branch.' },
   { name: 'concurrency', type: 'skip | allow | replace', default: 'skip', desc: 'What a fire does when the previous run (for that forEach key) is still going.' },
-  { name: 'forEach.query', type: 'string', default: '-', desc: 'SurrealQL SELECT run each fire; one whole run per row, passed to every step as payload.input.' },
+  { name: 'forEach.query', type: 'string', default: '-', desc: 'SurrealQL SELECT run each fire; one whole run per row, passed to every step as payload.input. May start with LET $name = ...; bindings: the rows come from the last statement.' },
   { name: 'forEach.key', type: 'string', default: 'id', desc: 'Row field whose value keys the per-row concurrency check.' },
 ]} />
 

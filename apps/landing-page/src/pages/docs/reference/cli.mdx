@@ -20,7 +20,7 @@ somewhere else, and `spky <command> --help` for the flags of any single command.
 | `spky dev` | Start the local stack: SurrealDB, SSP, scheduler, your apps. A [Worker backend](/docs/backend/workers) runs from its `dev` command at its `baseUrl`, not under workerd. With `sync.queryAllowlist` on, passes the mode to the SSP and publishes the allowlist JSON as version `dev` on every start. [Docs](/docs/dev) |
 | `spky generate` (`gen`) | Generate client types from `sp00ky.yml`, or a single file via `--input`/`--output`. `--format json\|typescript\|dart\|surql`, `--all`, `--append`, `--no-header`, `--mode`, `--endpoint`, `--secret`, `--modules-dir`. For a `typescript` entry with `queries`, also records the [query allowlist](/docs/guide/query-allowlist) by running the query module through `@spooky-sync/query-allowlist` (the app's `node_modules/.bin/spooky-query-allowlist`, else `npx`) and writes `<queries>.allowlist.json`; commit it. [Docs](/docs/schema/generated-types) |
 | `spky migrate` | Database migrations: `create`, `apply`, `prod`, `status`, `fix`. `prod` migrates the cloud deployment without deploying. `apply --endpoint <url> --secret <secret>` also installs the sync params a [self-hosted](/docs/self-hosting) database needs; `--mode` defaults to `mode` in `sp00ky.yml`. [Docs](/docs/schema/migrations) |
-| `spky lint` | Validate `sp00ky.yml`, including each [Worker backend](/docs/backend/workers)'s `entry` and `expose` patterns. |
+| `spky lint` | Validate `sp00ky.yml`, including each [Worker backend](/docs/backend/workers)'s `entry` and `expose` patterns, and report event and function bodies SurrealDB 4 runs as table scans, with their rewrites ([details](/docs/dev/doctor#event-and-function-bodies-on-surrealdb-4)). |
 | `spky doctor [--json]` | Project health: config, codegen freshness, migrations, Docker. [Docs](/docs/dev/doctor) |
 | `spky verify [--fix]` | Check the SSP/scheduler snapshot against upstream SurrealDB and print the scheduler's own drift verdict; `--fix` re-clones the replica when its counts are off, else forces every SSP to re-bootstrap. |
 | `spky query [sql]` | Run SurrealQL once, or open a REPL. `--cloud` targets the deployment, `--json` prints raw JSON instead of a table. |
@@ -215,9 +215,19 @@ there. `--namespace` cannot reach outside it.
 | --- | --- |
 | `-y`, `--yes` | The [global flag](#running-unattended--y----yes): confirms applying to production. Without it, and without a terminal, the migration is refused rather than run unasked. |
 | `--force-schema` | Re-apply the internal schema and remote functions even when unchanged, bypassing the schema-hash skip. Also accepted by `spky migrate apply`. Use it for drift recovery. |
+| `--allow-schema-downgrade` | Push the internal schema even though a newer `spky` recorded the one on the database (a deliberate rollback). Also accepted by `spky migrate apply` and `spky deploy`. |
 | `--migrations-dir <dir>` | Override the migrations directory from `sp00ky.yml`. |
 | `--endpoint <url>`, `--secret <s>` | Override the SSP or scheduler endpoint and auth secret used for the internal schema. |
 | `--config <path>` | Point at a `sp00ky.yml` somewhere else. |
+
+Every push of the internal schema records the `spky` version that made it. Before writing
+anything, `migrate prod`, `migrate apply` and `deploy` read that version, and if a newer CLI
+pushed the schema they refuse: an older `spky` (one left on `PATH`, say) would replace the
+generated events, functions and indexes with older ones. The message names both versions;
+install the one it names (`npm i -g @spooky-sync/cli@<version>`) or run the repository's pinned
+CLI by its path, and check with `spky --version`. `--allow-schema-downgrade` (or
+`SPKY_ALLOW_SCHEMA_DOWNGRADE=1`) lets a deliberate rollback through. Against a database on this
+machine (`localhost`, and anything `spky dev` applies) it only warns.
 
 Raise `SPKY_DB_HTTP_TIMEOUT_SECS` when a large migration exceeds the 120 second per-request
 deadline. [Migrations](/docs/schema/migrations)

@@ -92,6 +92,7 @@ Cloudflare project has no containers, see [Cloudflare projects](#cloudflare-proj
 | `--only api,web` | Build and deploy just these apps. Everything else keeps running untouched. |
 | `--clean` | Wipe the scheduler's persistent volume first. Last resort: the scheduler self-heals stale snapshot state on startup, and `spky verify --fix` (or `POST /admin/resync` on the scheduler) repairs it without a wipe. Your SurrealDB data is not touched either way. |
 | `--force-schema` | Re-apply the internal schema and remote functions even when the hash says nothing changed. Drift recovery. |
+| `--allow-schema-downgrade` | Push the internal schema even though a newer `spky` recorded the one on the database. Without it the deploy refuses, naming both versions, so an older CLI cannot put back older generated events and functions. |
 | `--cache-bust` | Clients reloading onto this version clear service-worker caches first. |
 | `--mandatory` | Clients reload immediately instead of being offered a notification. Broken-build kill switch. |
 

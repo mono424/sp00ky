@@ -122,11 +122,13 @@ DEFINE FIELD OVERWRITE parent_rel ON TABLE {tbl} TYPE option<string>;
 
 /// Define the shared `_00_list_ref_anon` table used for unauthenticated
 /// clients when `anonymousLiveQueries` is enabled. Unlike the per-user tables
-/// it is `SELECT WHERE true` (world-readable): a logged-out session has
+/// it is `select FULL` (world-readable): a logged-out session has
 /// `$auth = NONE`, so it can't be gated on `$auth.id`. Safe because the edges
 /// only reference records the client could already read one-shot (the public
-/// tables are `select WHERE true`). Writes stay SSP-only (root bypasses the
-/// rule). Independent of `RefMode` and never auto-dropped.
+/// tables are readable by everyone). FULL rather than the equivalent
+/// `WHERE true`, which SurrealDB 4.0.1 plans without indexes for record users.
+/// Writes stay SSP-only (root bypasses the rule). Independent of `RefMode` and
+/// never auto-dropped.
 ///
 /// Readable by every signed-out session, but not delivered to every one: each
 /// client's LIVE is filtered to edges whose `clientId` names one of its own
@@ -142,7 +144,7 @@ pub async fn ensure_anon_table(db: &dyn Db) -> Result<()> {
     let tbl = "_00_list_ref_anon";
     let ddl = format!(
         "DEFINE TABLE OVERWRITE {tbl} SCHEMALESS \
-         PERMISSIONS FOR select WHERE true, \
+         PERMISSIONS FOR select FULL, \
                      FOR create, update WHERE false, \
                      FOR delete WHERE false;{fields}",
         tbl = tbl,

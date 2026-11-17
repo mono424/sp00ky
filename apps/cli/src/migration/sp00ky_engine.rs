@@ -90,6 +90,12 @@ impl Sp00kyEngine {
 
 impl MigrationEngine for Sp00kyEngine {
     fn apply(&self) -> Result<()> {
+        // 0. Before anything is written: refuse to push sp00ky's schema over
+        // one a newer CLI recorded (an older `spky` on PATH).
+        if self.internal_schema.is_some() || self.remote_functions.is_some() {
+            crate::migrate::guard_schema_downgrade(&self.make_client(), &self.url, false)?;
+        }
+
         // 1. User migrations (delegated to inner engine)
         self.inner.apply()?;
 

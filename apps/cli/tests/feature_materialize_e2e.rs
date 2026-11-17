@@ -628,4 +628,16 @@ fn only_changed_assignments_are_written() {
         "abc stays 'on' through the 100% rollout, so nothing moves: {}",
         posted("w")
     );
+
+    // ---- an admin materializing a deleted flag drops every user's row ---
+    // The admin can SELECT only their own assignment, so a lookup by id
+    // under their session would find (and drop) that one row alone.
+    sql("DELETE _00_feature_flag WHERE key = 'w';");
+    let dropped = sql_as(&admin_token, "RETURN fn::feature::materialize('w');");
+    assert!(all_ok(&dropped), "an admin must be able to materialize a deleted flag: {dropped}");
+    let left = result_of(&sql("SELECT VALUE id FROM _00_user_feature WHERE key = 'w';"));
+    assert!(
+        left.contains("\"result\":[]"),
+        "every user's assignment of a deleted flag must go: {left}"
+    );
 }

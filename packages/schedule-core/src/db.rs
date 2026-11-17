@@ -66,6 +66,12 @@ pub fn rows(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     }
 }
 
+/// Last statement's result as an array of rows: the answer of a multi-statement
+/// request that ends in `RETURN ...` (the prunes in [`crate::sql`]).
+pub fn last_rows(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    rows(results.into_iter().last().into_iter().collect())
+}
+
 /// First row of the first statement, if any.
 pub fn first_row(results: Vec<serde_json::Value>) -> Option<serde_json::Value> {
     rows(results).into_iter().next()

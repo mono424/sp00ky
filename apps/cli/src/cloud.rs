@@ -1552,9 +1552,15 @@ fn verify_data_plane(db_url: &str, ns: &str, db: &str) -> Result<(), String> {
 #[derive(Default)]
 pub(crate) struct SchemaApplyFailures {
     steps: Vec<String>,
+    /// Not pushed on purpose: a newer CLI recorded the schema on the database.
+    refused: Option<String>,
 }
 
 impl SchemaApplyFailures {
+    fn refuse(&mut self, why: String) {
+        self.refused = Some(why);
+    }
+
     fn record(&mut self, step: &str, err: impl std::fmt::Debug) {
         self.steps.push(format!("{step} failed: {err:?}"));
     }
@@ -1564,12 +1570,19 @@ impl SchemaApplyFailures {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.steps.is_empty()
+        self.steps.is_empty() && self.refused.is_none()
     }
 
     /// Print a block an operator cannot scroll past, naming the consequence.
     pub(crate) fn report(&self, what: &str) {
         if self.is_empty() {
+            return;
+        }
+        if let Some(why) = &self.refused {
+            println!();
+            println!("  ✖ {what}: the internal Sp00ky schema was NOT pushed.");
+            println!("      - {why}");
+            println!("    The database keeps the schema the newer CLI pushed.");
             return;
         }
         println!();
@@ -1615,6 +1628,13 @@ fn apply_remote_fns_and_internal_schema(
     };
 
     let mode = config.mode.clone().unwrap_or_default();
+
+    // Never push sp00ky's schema over one a newer CLI recorded.
+    if let Err(e) = crate::migrate::guard_schema_downgrade(&surreal_client, db_url, false) {
+        println!("  ▸ {e}");
+        failures.refuse(format!("{e}"));
+        return failures;
+    }
 
     // Bake a STABLE internal endpoint into the DB schema — never an ephemeral
     // container IP, which goes stale on the next Docker redeploy and hangs every

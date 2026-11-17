@@ -167,6 +167,14 @@ fn relation_endpoints(table: &TableSchema, row: &str) -> String {
         .collect()
 }
 
+/// The legacy ledger rows of `$sp00ky_rid` (`id`, `version`), looked up in
+/// the shape every SurrealDB line and session plans as an index read: see
+/// [`version_bump`].
+pub(crate) const LEDGER_LOOKUP_ROWS: &str = "(SELECT VALUE (SELECT id, version FROM _00_version WHERE record_id = $parent.r) FROM ONLY { r: $sp00ky_rid })";
+
+/// The ids of the legacy ledger rows of `$sp00ky_rid`, as [`LEDGER_LOOKUP_ROWS`].
+pub(crate) const LEDGER_LOOKUP_IDS: &str = "(SELECT VALUE (SELECT VALUE id FROM _00_version WHERE record_id = $parent.r) FROM ONLY { r: $sp00ky_rid })";
+
 /// The ledger half of a `_00_<table>_mutation` event: bump the record's row
 /// in `_00_version` and leave the new version in `$sp00ky_ver`.
 ///
@@ -180,10 +188,20 @@ fn relation_endpoints(table: &TableSchema, row: &str) -> String {
 /// A record whose row still has a random id (written before keyed rows) has
 /// no keyed row yet: its first UPDATE carries the old version over, deleting
 /// the old row first so the UNIQUE index on `record_id` never holds two rows
-/// for it. That lookup binds the id with `LET` first, the form both SurrealDB
-/// lines plan as an index read, and stops being hit once the scheduler's
-/// migration has moved every row. A CREATE never looks: a new record has no
-/// old row (an orphan one fails the UNIQUE index exactly as it did before).
+/// for it. A CREATE never looks: a new record has no old row (an orphan one
+/// fails the UNIQUE index exactly as it did before). The lookup stops being
+/// hit once the scheduler's migration has moved every row.
+///
+/// The lookup is a correlated subquery over a one-field object,
+/// [`LEDGER_LOOKUP_ROWS`]. A `LET`-bound `WHERE record_id = $sp00ky_rid` is an index
+/// read on both SurrealDB lines when root writes, but SurrealDB 4.0.1 plans it
+/// as a scan of the ledger when a RECORD USER's write fires the event (the
+/// table's select permission is not FULL, and the planner works from the
+/// session, although the event body runs elevated): 3.9 s per write on a 3M
+/// row ledger locally, a steady 19 s on WhitePawn (2026-11-17), against 18 ms
+/// for the same write as root. The correlated form is an index read for root
+/// and record users on 3.3.5 and 4.0.1 (4-70 ms measured on the same data).
+/// See `docs/surrealdb-bugs/v4-record-user-event-scan.md`.
 fn version_bump() -> String {
     let keyed = ssp_protocol::version_ledger::keyed_row("$sp00ky_rid");
     format!(
@@ -192,7 +210,7 @@ fn version_bump() -> String {
          \x20   LET $sp00ky_ver = IF $event = \"CREATE\" OR record::exists($sp00ky_vk) {{\n\
          \x20       (UPSERT ONLY $sp00ky_vk SET record_id = $sp00ky_rid, version += 1 RETURN VALUE version)\n\
          \x20   }} ELSE {{\n\
-         \x20       LET $sp00ky_old = (SELECT id, version FROM _00_version WHERE record_id = $sp00ky_rid);\n\
+         \x20       LET $sp00ky_old = {LEDGER_LOOKUP_ROWS};\n\
          \x20       DELETE $sp00ky_old.id;\n\
          \x20       (CREATE ONLY $sp00ky_vk SET record_id = $sp00ky_rid, version = ($sp00ky_old[0].version ?? 0) + 1 RETURN VALUE version)\n\
          \x20   }};\n"
@@ -210,7 +228,7 @@ fn version_drop() -> String {
          \x20   IF record::exists($sp00ky_vk) {{\n\
          \x20       DELETE $sp00ky_vk;\n\
          \x20   }} ELSE {{\n\
-         \x20       DELETE (SELECT VALUE id FROM _00_version WHERE record_id = $sp00ky_rid);\n\
+         \x20       DELETE {LEDGER_LOOKUP_IDS};\n\
          \x20   }};\n"
     )
 }
@@ -1094,10 +1112,17 @@ DEFINE FIELD body ON TABLE doc TYPE string;
                 "UPDATE _00_version",
                 "DELETE _00_version WHERE",
                 "FROM ONLY _00_version",
+                // the uncorrelated lookup a record user's write plans as a
+                // scan of the ledger on 4.0.1 (`LEDGER_LOOKUP_ROWS`)
+                "WHERE record_id = $sp00ky_rid",
             ] {
                 assert!(!out.contains(bad), "`{bad}` is back in the generated events:\n{out}");
             }
-            assert_eq!(out.matches("WHERE record_id = $sp00ky_rid").count(), 6, "one fallback per mutation and delete event");
+            assert_eq!(
+                out.matches("WHERE record_id = $parent.r) FROM ONLY { r: $sp00ky_rid })").count(),
+                6,
+                "one fallback per mutation and delete event"
+            );
             if let Err(e) = surrealdb_core::syn::parse_with_capabilities(&out, &surrealdb_core::dbs::Capabilities::all()) {
                 panic!("generated events do not parse: {e}\n{out}");
             }

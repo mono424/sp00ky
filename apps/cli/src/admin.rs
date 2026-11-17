@@ -146,7 +146,15 @@ mod tests {
     /// after a deploy, and it needs no database.
     #[test]
     fn every_feature_mutation_function_declares_permissions() {
-        let mutating = ["materialize", "reassign", "allow", "disallow"];
+        let mutating = [
+            "materialize",
+            "reassign",
+            "allow",
+            "disallow",
+            "flag",
+            "put",
+            "drop_assignments",
+        ];
         for name in mutating {
             let marker = format!("DEFINE FUNCTION OVERWRITE fn::feature::{name}(");
             let start = META_TABLES_REMOTE
@@ -166,7 +174,8 @@ mod tests {
 
     /// The admin gate is repeated on both flag tables and every fn::feature::*
     /// function that reads or writes assignments (rules, assign, materialize,
-    /// reassign, allow, disallow).
+    /// reassign, allow, disallow, and the helpers that do their reads and
+    /// writes: flag, put, drop_assignments).
     /// If one copy drifts, that gate opens wider than the others and nothing
     /// else would notice.
     #[test]
@@ -175,8 +184,8 @@ mod tests {
             "array::len((SELECT VALUE id FROM _00_admin WHERE user = $auth.id LIMIT 1)) > 0";
         assert_eq!(
             META_TABLES_REMOTE.matches(predicate).count(),
-            8,
-            "expected the admin predicate on _00_feature_flag, _00_user_feature and the six \
+            11,
+            "expected the admin predicate on _00_feature_flag, _00_user_feature and the nine \
              gated fn::feature::* functions; a differing count means one gate has drifted"
         );
     }

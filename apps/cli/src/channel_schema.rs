@@ -50,11 +50,17 @@ pub fn server_ddl(source: &str) -> Option<String> {
          DEFINE FIELD OVERWRITE payload ON TABLE {SIGNAL_TABLE} TYPE option<string> ASSERT $value = NONE OR string::len($value) <= {MAX_PAYLOAD_CHARS} READONLY;\n\
          DEFINE FIELD OVERWRITE at ON TABLE {SIGNAL_TABLE} TYPE datetime VALUE $before OR time::now() READONLY;\n\
          DEFINE INDEX OVERWRITE {SIGNAL_TABLE}_recipient ON TABLE {SIGNAL_TABLE} FIELDS recipient;\n\
-         DEFINE INDEX OVERWRITE {SIGNAL_TABLE}_sender ON TABLE {SIGNAL_TABLE} FIELDS sender, at;\n\
+         -- One column: inside the sweep event SurrealDB 4.0.1 does not use a\n\
+         -- composite (sender, at) index for a parameter and reads the table.\n\
+         DEFINE INDEX OVERWRITE {SIGNAL_TABLE}_sender ON TABLE {SIGNAL_TABLE} FIELDS sender;\n\
          -- A signal is only useful for the seconds a connection takes to set up.\n\
          -- Each new one sweeps its sender's stale rows, so the table stays tiny.\n\
+         -- Values bound first and the rows selected by id: SurrealDB 4.0.1 scans\n\
+         -- a `DELETE <table> WHERE ...` in an event body.\n\
          DEFINE EVENT OVERWRITE {SIGNAL_TABLE}_sweep ON TABLE {SIGNAL_TABLE} WHEN $event = \"CREATE\" THEN {{\n\
-         \x20 DELETE {SIGNAL_TABLE} WHERE sender = $after.sender AND at < time::now() - 2m;\n\
+         \x20 LET $sender = $after.sender;\n\
+         \x20 LET $stale = time::now() - 2m;\n\
+         \x20 DELETE (SELECT VALUE id FROM {SIGNAL_TABLE} WHERE sender = $sender AND at < $stale);\n\
          }};\n"
     ))
 }

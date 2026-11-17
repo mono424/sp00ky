@@ -2748,6 +2748,8 @@ fn apply_internal_sp00ky_schema(
         "root",
     );
 
+    // A local database: a newer CLI's schema here only warns.
+    migrate::guard_schema_downgrade(&client, surreal_url, true)?;
     migrate::apply_internal_schema(
         &client,
         &resolved.schema,

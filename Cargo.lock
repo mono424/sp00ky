@@ -7030,6 +7030,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdb-parity"
+version = "1.0.0-beta.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "futures",
+ "reqwest 0.12.28",
+ "schedule-core",
+ "serde",
+ "serde_json",
+ "ssp",
+ "ssp-node",
+ "ssp-protocol",
+ "surrealdb",
+ "tokio",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

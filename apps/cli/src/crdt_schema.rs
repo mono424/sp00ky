@@ -482,11 +482,11 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
         Target::Server => s.push_str(&format!(
             "DEFINE TABLE OVERWRITE {log} SCHEMAFULL COMMENT 'sp00ky:crdt_log {kinds}'\n\
              \x20 PERMISSIONS\n\
-             \x20   FOR select WHERE {select}\n\
+             \x20   FOR select {select}\n\
              \x20   FOR create WHERE $access != \"{IMPERSONATE_ACCESS}\" AND ({update})\n\
              \x20   FOR update, delete NONE;\n",
             kinds = kinds.join(","),
-            select = parent.select,
+            select = select_rule(&parent.select),
             update = parent.update,
         )),
         Target::Client => s.push_str(&format!("DEFINE TABLE OVERWRITE {log} SCHEMAFULL PERMISSIONS FULL;\n")),
@@ -513,11 +513,11 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
             Target::Server => s.push_str(&format!(
                 "DEFINE TABLE OVERWRITE {presence} SCHEMAFULL\n\
                  \x20 PERMISSIONS\n\
-                 \x20   FOR select WHERE {select}\n\
+                 \x20   FOR select {select}\n\
                  \x20   FOR create WHERE $access != \"{IMPERSONATE_ACCESS}\" AND ({update})\n\
                  \x20   FOR update WHERE author = $auth.id AND ({update})\n\
                  \x20   FOR delete WHERE author = $auth.id;\n",
-                select = parent.select,
+                select = select_rule(&parent.select),
                 update = parent.update,
             )),
             Target::Client => s.push_str(&format!("DEFINE TABLE OVERWRITE {presence} SCHEMAFULL PERMISSIONS FULL;\n")),
@@ -542,11 +542,23 @@ fn parent_ddl(parent: &CrdtParent, target: Target) -> String {
             "\n-- `{table}`: a deleted record takes its canonical documents along; the\n\
              -- SSP sweep removes orphaned log and presence rows.\n\
              DEFINE EVENT OVERWRITE _00_crdt_cleanup ON TABLE {table} WHEN $event = \"DELETE\" THEN {{\n\
-             \x20   DELETE {DOC_TABLE} WHERE doc = $before.id;\n\
+             \x20   LET $doc = $before.id;\n\
+             \x20   DELETE (SELECT VALUE id FROM {DOC_TABLE} WHERE doc = $doc);\n\
              }};\n"
         ));
     }
     s
+}
+
+/// A select rule as the clause after `FOR select`: `FULL` for a rule that is
+/// just `true` (the same rule, but SurrealDB 4.0.1 gives up indexes for record
+/// users under `WHERE true`, see `query_lint`), `WHERE <rule>` otherwise.
+fn select_rule(rule: &str) -> String {
+    if rule.trim().eq_ignore_ascii_case("true") {
+        "FULL".to_string()
+    } else {
+        format!("WHERE {rule}")
+    }
 }
 
 /// `DEFINE FIELD` lines; a name prefixed `@opaque ` gets the annotation that
@@ -631,7 +643,11 @@ fn doc_table_ddl(parents: &[CrdtParent]) -> String {
          DEFINE FIELD OVERWRITE lease_by ON TABLE {DOC_TABLE} TYPE option<string>;\n\
          DEFINE FIELD OVERWRITE lease_until ON TABLE {DOC_TABLE} TYPE option<datetime>;\n\
          DEFINE FIELD OVERWRITE folded_at ON TABLE {DOC_TABLE} TYPE option<datetime>;\n\
-         DEFINE INDEX OVERWRITE {DOC_TABLE}_doc ON TABLE {DOC_TABLE} FIELDS doc, field UNIQUE;\n"
+         DEFINE INDEX OVERWRITE {DOC_TABLE}_doc ON TABLE {DOC_TABLE} FIELDS doc, field UNIQUE;\n\
+         -- `_00_crdt_cleanup` finds a deleted parent's rows by `doc` alone: inside\n\
+         -- an event body SurrealDB 4.0.1 does not use the (doc, field) index for\n\
+         -- a parameter and reads the whole table per delete.\n\
+         DEFINE INDEX OVERWRITE {DOC_TABLE}_parent ON TABLE {DOC_TABLE} FIELDS doc;\n"
     )
 }
 

@@ -113,10 +113,14 @@ Commands:
                          Connection options (or use SURREAL_* env vars)
     --migrations-dir     Override migrations directory
     --force-schema       Re-apply internal schema even when unchanged
+    --allow-schema-downgrade
+                         Push over a schema a newer spky recorded (rollback)
 
   prod                 Apply pending migrations to the cloud deployment
     -y, --yes            Confirm applying to production (global flag; required without a terminal)
     --force-schema       Re-apply internal schema even when unchanged
+    --allow-schema-downgrade
+                         Push over a schema a newer spky recorded (rollback)
     --migrations-dir     Override migrations directory
     --endpoint/--secret  Override the SSP/scheduler endpoint and secret
     --config             Path to sp00ky.yml
@@ -264,6 +268,8 @@ One more variable is not a connection flag but bounds every SurrealDB HTTP call 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SPKY_DB_HTTP_TIMEOUT_SECS` | `120` | Per-request deadline. A large backfill, or applying the internal schema to a big database, can exceed it; the resulting error names this variable. Values of `0` or garbage fall back to the default. |
+| `SPKY_INDEX_BUILD_TIMEOUT_SECS` | `600` | How long applying the internal schema waits for the indexes it builds `CONCURRENTLY`. A build still running then leaves the schema unrecorded, so the next apply checks it again; a failed build fails the apply. |
+| `SPKY_ALLOW_SCHEMA_DOWNGRADE` | unset | Set: the same as `--allow-schema-downgrade`. |
 
 ## Checking Status
 
@@ -359,6 +365,8 @@ The same migration flow also runs after `spky backup reset`, after the database 
 <CodeBlock code={codeMigrateProd} lang="bash" />
 
 It resolves the SurrealDB URL and root password from your login (`spky login`) and the `slug` in `sp00ky.yml`, and takes the mode, namespace and database from `sp00ky.yml`, so there are no connection flags to pass. `--yes` skips the production confirmation, and `--force-schema` re-applies the internal schema and remote functions even when the schema hash says nothing changed.
+
+The internal schema records which `spky` pushed it. If a newer one did, `migrate prod` (and `migrate apply` to a remote database, and `deploy`) refuses before writing anything, naming both versions: an older CLI would put back older generated events and functions. Install the version it names or run the project's pinned CLI; pass `--allow-schema-downgrade` only to roll back on purpose. On `localhost` and under `spky dev` it is a warning.
 
 <Note>
   Applying the internal schema to a large database can run past the CLI's 120 second per-request deadline. Raise it with <code>SPKY_DB_HTTP_TIMEOUT_SECS</code>, for example <code>SPKY_DB_HTTP_TIMEOUT_SECS=900 spky migrate prod</code>.

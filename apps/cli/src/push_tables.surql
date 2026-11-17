@@ -285,13 +285,14 @@ DEFINE FUNCTION OVERWRITE fn::push::register($device: object, $opts: option<obje
 DEFINE FUNCTION OVERWRITE fn::push::update($endpoint: string, $opts: object) {
     IF $auth.id = NONE { THROW "push: sign in first" };
     LET $uid = <string> $auth.id;
-    -- `rules: []` resets the device to every rule.
-    RETURN UPDATE _00_push_subscription SET
+    -- `rules: []` resets the device to every rule. The rows are selected first:
+    -- an `UPDATE <table> ... WHERE` inside a function body is a table scan on
+    -- SurrealDB 4.0.1, the same filter in a subquery uses the index.
+    RETURN UPDATE (SELECT VALUE id FROM _00_push_subscription WHERE auth_id = $uid AND endpoint = $endpoint) SET
         label = $opts.label ?? label,
         rules = IF $opts.rules = NONE { rules } ELSE IF $opts.rules = [] { NONE } ELSE { $opts.rules },
         meta = $opts.meta ?? meta,
         updated_at = time::now()
-    WHERE auth_id = $uid AND endpoint = $endpoint
     RETURN id, endpoint, kid, label, rules, meta, created_at, updated_at;
 } PERMISSIONS FULL;
 
@@ -300,8 +301,8 @@ DEFINE FUNCTION OVERWRITE fn::push::update($endpoint: string, $opts: object) {
 DEFINE FUNCTION OVERWRITE fn::push::unsubscribe($endpoint: option<string>) {
     IF $auth.id = NONE { RETURN 0 };
     LET $uid = <string> $auth.id;
-    LET $gone = DELETE _00_push_subscription
-        WHERE auth_id = $uid AND ($endpoint = NONE OR endpoint = $endpoint)
+    LET $gone = DELETE (SELECT VALUE id FROM _00_push_subscription
+        WHERE auth_id = $uid AND ($endpoint = NONE OR endpoint = $endpoint))
         RETURN BEFORE;
     RETURN array::len($gone);
 } PERMISSIONS FULL;

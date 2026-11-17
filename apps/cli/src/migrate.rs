@@ -786,12 +786,31 @@ fn make_defines_overwrite(sql: &str) -> String {
 ///
 /// A changed definition, a missing index, or an unreadable `INFO FOR TABLE`
 /// keeps the statement: a rebuild is then the right thing, or the safe one.
-fn prune_unchanged_index_defines(client: &dyn MigrationDB, sql: &str) -> (String, usize) {
+/// With `concurrently` (a server engine) a kept statement builds
+/// `CONCURRENTLY`: SurrealDB 4.0.1 makes a blocking build wait for every write
+/// transaction older than it, up to 60 s each (`WRITE_BARRIER_WAIT`), so on a
+/// busy database every new or changed index held the apply request a minute
+/// and two of them ran past the CLI's 120 s HTTP timeout (measured with this
+/// release's schema on a WhitePawn-sized 4.0.1 database). A concurrent build
+/// runs on the server whatever happens to the request, so a timeout cannot cut
+/// it off part way either.
+///
+/// A live index whose definition matches but whose build ended in an error
+/// (a `CONCURRENTLY` build of a UNIQUE index over duplicates) counts as
+/// changed: `INFO FOR TABLE` still lists its definition, but the planner never
+/// uses it, so it is defined again. One whose build is still running is left
+/// to finish and listed with the builds to wait for.
+fn prune_unchanged_index_defines(
+    client: &dyn MigrationDB,
+    sql: &str,
+    concurrently: bool,
+) -> PrunedIndexes {
     use std::collections::HashMap;
     // table -> its live indexes (name -> definition); None when INFO failed.
     let mut live: HashMap<String, Option<HashMap<String, String>>> = HashMap::new();
     let mut out = String::with_capacity(sql.len());
     let mut pruned = 0;
+    let mut building = Vec::new();
     let mut cursor = 0;
     while let Some(rel) = sql[cursor..].find("DEFINE INDEX ") {
         let start = cursor + rel;
@@ -812,20 +831,131 @@ fn prune_unchanged_index_defines(client: &dyn MigrationDB, sql: &str) -> (String
         let indexes = live
             .entry(table.clone())
             .or_insert_with(|| read_live_indexes(client, &table));
-        let unchanged = indexes
+        let same_definition = indexes
             .as_ref()
             .and_then(|m| m.get(&name))
             .map(|def| normalize_index_define(def) == normalize_index_define(stmt))
             .unwrap_or(false);
+        let state = if same_definition {
+            index_build_state(client, &name, &table)
+        } else {
+            None
+        };
+        let unchanged = same_definition && !matches!(state, Some(BuildState::Failed(_)));
         if unchanged {
             pruned += 1;
             out.push_str(&format!("-- index {name} on {table} unchanged; not rebuilt"));
+            if matches!(state, Some(BuildState::Building(_))) {
+                building.push((name, table));
+            }
+        } else if concurrently {
+            if stmt.to_ascii_uppercase().contains(" CONCURRENTLY") {
+                out.push_str(stmt);
+            } else {
+                // a trailing clause, before the `;`
+                let body = stmt.trim_end().trim_end_matches(';').trim_end();
+                out.push_str(&format!("{body} CONCURRENTLY;"));
+            }
+            building.push((name, table));
         } else {
             out.push_str(stmt);
         }
     }
     out.push_str(&sql[cursor..]);
-    (out, pruned)
+    PrunedIndexes { sql: out, unchanged: pruned, building }
+}
+
+/// What [`prune_unchanged_index_defines`] leaves to run.
+struct PrunedIndexes {
+    sql: String,
+    /// Index statements dropped because the live index already matches.
+    unchanged: usize,
+    /// `(index, table)` of every build the SQL starts `CONCURRENTLY`, and of
+    /// unchanged indexes whose earlier build has not finished: the apply
+    /// waits for these before it records the schema hash.
+    building: Vec<(String, String)>,
+}
+
+/// Where an index's build stands, per `INFO FOR INDEX` (`building.status`:
+/// `started` and other in-progress phases, `ready`, `error` with an `error`
+/// message; the same keys on 3.3.5 and 4.0.1).
+#[derive(Debug, Clone, PartialEq)]
+enum BuildState {
+    Ready,
+    Building(String),
+    Failed(String),
+}
+
+/// `None` when the index does not exist or `INFO FOR INDEX` failed.
+fn index_build_state(client: &dyn MigrationDB, name: &str, table: &str) -> Option<BuildState> {
+    let responses = client
+        .execute(&format!("INFO FOR INDEX {name} ON {table};"))
+        .ok()?;
+    let ok = responses.into_iter().find(|r| r.status == "OK")?;
+    let info = ok.result?;
+    let Some(building) = info.get("building") else {
+        return Some(BuildState::Ready);
+    };
+    let status = building
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("ready")
+        .to_string();
+    Some(match status.as_str() {
+        "ready" => BuildState::Ready,
+        s if s == "error" || s.contains("abort") => BuildState::Failed(
+            building
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+                .unwrap_or(status),
+        ),
+        _ => BuildState::Building(status),
+    })
+}
+
+/// How long an apply waits for its `CONCURRENTLY` index builds
+/// (`SPKY_INDEX_BUILD_TIMEOUT_SECS`, default 600).
+fn index_build_timeout() -> std::time::Duration {
+    let secs = std::env::var("SPKY_INDEX_BUILD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(600);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Wait until every listed index is built. `Ok(true)`: all ready; `Ok(false)`:
+/// some still building when `timeout` ran out; `Err`: a build failed (or was
+/// aborted), with the index and SurrealDB's reason. An index that cannot be
+/// read is not waited for (the statement that defined it would have failed).
+fn wait_for_index_builds(
+    client: &dyn MigrationDB,
+    indexes: &[(String, String)],
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<bool> {
+    let started = std::time::Instant::now();
+    let mut pending: Vec<&(String, String)> = indexes.iter().collect();
+    loop {
+        let mut still = Vec::new();
+        for ix in pending {
+            match index_build_state(client, &ix.0, &ix.1) {
+                Some(BuildState::Building(_)) => still.push(ix),
+                Some(BuildState::Failed(reason)) => {
+                    anyhow::bail!("index {} on {} failed to build: {reason}", ix.0, ix.1)
+                }
+                Some(BuildState::Ready) | None => {}
+            }
+        }
+        if still.is_empty() {
+            return Ok(true);
+        }
+        if started.elapsed() >= timeout {
+            return Ok(false);
+        }
+        pending = still;
+        std::thread::sleep(poll);
+    }
 }
 
 /// `(index name, table)` of a `DEFINE INDEX [OVERWRITE|IF NOT EXISTS] <name> ON
@@ -865,7 +995,7 @@ fn normalize_index_define(stmt: &str) -> String {
         let t = raw[i];
         let is = |s: &str| t.eq_ignore_ascii_case(s);
         let after_on = toks.last().map(|p| p.eq_ignore_ascii_case("ON")).unwrap_or(false);
-        if is("OVERWRITE") {
+        if is("OVERWRITE") || is("CONCURRENTLY") {
         } else if is("IF")
             && raw.get(i + 1).map(|x| x.eq_ignore_ascii_case("NOT")).unwrap_or(false)
             && raw.get(i + 2).map(|x| x.eq_ignore_ascii_case("EXISTS")).unwrap_or(false)
@@ -936,17 +1066,185 @@ fn read_stored_schema_hash(client: &dyn MigrationDB, id: &str) -> Option<String>
     None
 }
 
+/// `_00_schema_state` as `meta_tables_remote.surql` defines it, created only
+/// when missing.
+const SCHEMA_STATE_DDL: &str = "DEFINE TABLE IF NOT EXISTS _00_schema_state SCHEMAFULL PERMISSIONS NONE; \
+DEFINE FIELD IF NOT EXISTS hash ON TABLE _00_schema_state TYPE string; \
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE _00_schema_state TYPE datetime VALUE time::now(); \
+DEFINE FIELD IF NOT EXISTS cli_version ON TABLE _00_schema_state TYPE option<string>; ";
+
 /// Record the applied schema hash for `id` in `_00_schema_state` (best-effort:
 /// a failure here only costs a redundant re-apply next time, so it warns rather
 /// than failing the migration).
 fn record_schema_hash(client: &dyn MigrationDB, id: &str, hash: &str) {
+    // The table is defined here, the way meta_tables_remote.surql defines it,
+    // before its first row: the remote functions' hash is recorded before the
+    // internal schema runs, and a row written into a not-yet-defined table
+    // made the internal schema's `DEFINE FIELD OVERWRITE hash ... TYPE string`
+    // a change of a SCHEMAFULL table with rows, which a database at
+    // compatibility level 4 (created on SurrealDB 4) refuses without MIGRATE
+    // EXISTING ROWS. Every first `migrate apply` on a fresh 4.x database
+    // failed there. IF NOT EXISTS leaves an existing definition alone.
     let q = format!(
-        "UPSERT _00_schema_state:{id} SET hash = '{hash}', updated_at = time::now();",
+        "{SCHEMA_STATE_DDL}UPSERT _00_schema_state:{id} SET hash = '{hash}', cli_version = '{CLI_VERSION}', updated_at = time::now();",
         id = id,
         hash = hash
     );
     if let Err(e) = client.execute(&q) {
         ui::warn(format!("failed to record schema hash for '{id}': {e:?}"));
+    }
+}
+
+/// This CLI's version. Recorded beside the schema hash it writes, so a later
+/// push can tell whether a newer CLI wrote the schema on the database.
+pub(crate) const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The CLI version that last recorded the internal schema, if any. A row an
+/// older CLI wrote has none; an older CLI's later `UPSERT ... SET hash,
+/// updated_at` leaves a newer CLI's value in place (checked on 3.3.5 and
+/// 4.0.1), so it keeps naming the newest CLI that pushed.
+fn read_stored_cli_version(client: &dyn MigrationDB) -> Option<String> {
+    let responses = client
+        .execute("SELECT cli_version FROM _00_schema_state:internal;")
+        .ok()?;
+    responses
+        .into_iter()
+        .filter(|r| r.status == "OK")
+        .find_map(|r| {
+            r.result?
+                .as_array()?
+                .first()?
+                .get("cli_version")?
+                .as_str()
+                .map(str::to_string)
+        })
+}
+
+/// A version under semver 2.0 precedence: the three core numbers, then the
+/// pre-release identifiers (`0.0.1-canary.385 < 1.0.0-beta.4 < 1.0.0-beta.5 <
+/// 1.0.0`). Build metadata is ignored.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Version {
+    core: [u64; 3],
+    /// True for a release, which sorts after every pre-release of its core.
+    release: bool,
+    pre: Vec<PreRelease>,
+}
+
+/// One pre-release identifier: numeric ones compare numerically and sort
+/// before alphanumeric ones, which compare as ASCII (the variant order).
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreRelease {
+    Num(u64),
+    Alpha(String),
+}
+
+fn parse_version(s: &str) -> Option<Version> {
+    let s = s.trim().trim_start_matches('v');
+    let s = s.split('+').next()?;
+    let (core, pre) = match s.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (s, None),
+    };
+    let nums: Vec<u64> = core.split('.').map(|n| n.parse().ok()).collect::<Option<_>>()?;
+    let core: [u64; 3] = nums.try_into().ok()?;
+    let pre = match pre {
+        None => Vec::new(),
+        Some(pre) => pre
+            .split('.')
+            .map(|id| {
+                if id.is_empty() {
+                    None
+                } else if id.bytes().all(|b| b.is_ascii_digit()) {
+                    id.parse().ok().map(PreRelease::Num)
+                } else {
+                    Some(PreRelease::Alpha(id.to_string()))
+                }
+            })
+            .collect::<Option<_>>()?,
+    };
+    Some(Version { core, release: pre.is_empty(), pre })
+}
+
+/// Whether `stored` is a newer version than `this`; `None` when either does
+/// not parse.
+fn is_newer(stored: &str, this: &str) -> Option<bool> {
+    Some(parse_version(stored)? > parse_version(this)?)
+}
+
+/// What to do before pushing the internal schema over one a CLI of version
+/// `stored` recorded.
+#[derive(Debug, PartialEq)]
+enum DowngradeCheck {
+    Allow,
+    Warn(String),
+    Refuse(String),
+}
+
+fn schema_downgrade_check(stored: Option<&str>, this: &str, local: bool, allowed: bool) -> DowngradeCheck {
+    let Some(stored) = stored else {
+        return DowngradeCheck::Allow;
+    };
+    if is_newer(stored, this) != Some(true) {
+        return DowngradeCheck::Allow;
+    }
+    let what = format!(
+        "the internal Sp00ky schema on this database was pushed by spky {stored}, and this is spky {this}: \
+         pushing would replace its generated events, functions and indexes with older ones"
+    );
+    if allowed {
+        DowngradeCheck::Warn(format!("{what} (allowed by --allow-schema-downgrade)"))
+    } else if local {
+        DowngradeCheck::Warn(format!("{what} (a local database, so only a warning)"))
+    } else {
+        DowngradeCheck::Refuse(format!(
+            "refusing to push: {what}. Use that CLI instead (`npm i -g @spooky-sync/cli@{stored}`, \
+             or the repository's pinned one by its path; `spky --version` says which one runs), \
+             or pass --allow-schema-downgrade to roll back on purpose"
+        ))
+    }
+}
+
+/// A database on this machine (`spky dev`, a plain `migrate apply` to
+/// localhost): switching to an older branch there only warns.
+fn is_local_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "host.docker.internal")
+        || host.ends_with(".localhost")
+}
+
+/// `--allow-schema-downgrade` (or `SPKY_ALLOW_SCHEMA_DOWNGRADE` set).
+fn schema_downgrade_allowed() -> bool {
+    std::env::var("SPKY_ALLOW_SCHEMA_DOWNGRADE").is_ok()
+}
+
+/// Refuse to push sp00ky's internal schema or remote functions over ones a
+/// newer CLI recorded, before anything is written. An older `spky` on PATH
+/// (0.0.1-canary.385, run as `spky migrate prod` against WhitePawn on
+/// 2026-11-17) re-pushed the events from before the keyed ledger, and SurrealDB
+/// 4.0.1 then scanned the 3M-row ledger on every write until a current CLI
+/// pushed again. On a local database it only warns; `--allow-schema-downgrade`
+/// lets a deliberate rollback through. A missing or unparsable stored version
+/// (rows from before this check) allows the push. `dev` (`spky dev`, whatever
+/// database it points at) only warns too.
+pub fn guard_schema_downgrade(client: &dyn MigrationDB, url: &str, dev: bool) -> Result<()> {
+    let stored = read_stored_cli_version(client);
+    let local = dev || is_local_url(url);
+    match schema_downgrade_check(stored.as_deref(), CLI_VERSION, local, schema_downgrade_allowed()) {
+        DowngradeCheck::Allow => Ok(()),
+        DowngradeCheck::Warn(msg) => {
+            ui::warn(msg);
+            Ok(())
+        }
+        DowngradeCheck::Refuse(msg) => anyhow::bail!(msg),
     }
 }
 
@@ -1219,7 +1517,12 @@ pub fn apply_internal_schema(
     // 5. Never rebuild an index that has not changed. The hash above covers the
     // assembled SQL; what runs is that SQL minus the index statements whose
     // live definition already matches (see prune_unchanged_index_defines).
-    let (internal_sql, unchanged_indexes) = prune_unchanged_index_defines(client, &internal_sql);
+    let concurrently = matches!(mode, DeployMode::Singlenode | DeployMode::Cluster);
+    let PrunedIndexes {
+        sql: internal_sql,
+        unchanged: unchanged_indexes,
+        building,
+    } = prune_unchanged_index_defines(client, &internal_sql, concurrently);
     if unchanged_indexes > 0 {
         ui::detail(format!(
             "{} unchanged index(es) kept as-is (no rebuild)",
@@ -1238,10 +1541,46 @@ pub fn apply_internal_schema(
         return Err(e).context("Failed to apply internal Sp00ky schema");
     }
 
-    // Record the applied hash only after a successful execute. The
-    // _00_schema_state table is defined by the internal_sql we just ran, so it
-    // exists by now.
-    record_schema_hash(client, "internal", &hash);
+    // The `CONCURRENTLY` builds run on after the request returns. Wait for
+    // them: a build that fails (a UNIQUE index over duplicates) leaves an index
+    // the planner never uses but `INFO FOR TABLE` still lists, so it fails the
+    // apply; one still running at the timeout leaves the hash unrecorded, so
+    // the next apply looks at it again.
+    let mut built = true;
+    if !building.is_empty() {
+        step.set_message(format!("building {} index(es)", building.len()));
+        match wait_for_index_builds(
+            client,
+            &building,
+            index_build_timeout(),
+            std::time::Duration::from_millis(500),
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                built = false;
+                ui::warn(format!(
+                    "index builds still running after {}s: {}; the schema hash is not recorded, so the next apply checks them again",
+                    index_build_timeout().as_secs(),
+                    building
+                        .iter()
+                        .map(|(ix, tb)| format!("{ix} on {tb}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            Err(e) => {
+                step.fail("failed");
+                return Err(e).context("Failed to build the internal Sp00ky schema's indexes");
+            }
+        }
+    }
+
+    // Record the applied hash only after a successful execute and finished
+    // index builds. The _00_schema_state table is defined by the internal_sql
+    // we just ran, so it exists by now.
+    if built {
+        record_schema_hash(client, "internal", &hash);
+    }
 
     step.done(format!(
         "applied{}{} tables{}{} events",
@@ -1436,6 +1775,11 @@ mod tests {
         // `indexes` map. A table not listed here answers with an ERR (as a
         // missing table does).
         live_indexes: RefCell<std::collections::HashMap<String, Vec<(String, String)>>>,
+        // Build statuses answered to `INFO FOR INDEX <ix> ON <t>;`, in order
+        // (the last one repeats); an index not listed is `ready`.
+        index_statuses: RefCell<std::collections::HashMap<String, Vec<String>>>,
+        // `cli_version` answered to the downgrade guard's read.
+        stored_cli_version: RefCell<Option<String>>,
     }
 
     impl MockDB {
@@ -1447,7 +1791,16 @@ mod tests {
                 fail_execute: RefCell::new(false),
                 stored_hash: RefCell::new(None),
                 live_indexes: RefCell::new(Default::default()),
+                index_statuses: RefCell::new(Default::default()),
+                stored_cli_version: RefCell::new(None),
             }
+        }
+
+        fn set_index_statuses(&self, index: &str, table: &str, statuses: &[&str]) {
+            self.index_statuses.borrow_mut().insert(
+                format!("{index} ON {table}"),
+                statuses.iter().map(|s| s.to_string()).collect(),
+            );
         }
 
         fn set_live_indexes(&self, table: &str, indexes: &[(&str, &str)]) {
@@ -1503,6 +1856,16 @@ mod tests {
                 anyhow::bail!("Mock execute failure");
             }
             self.executed_queries.borrow_mut().push(query.to_string());
+            if query.starts_with("SELECT cli_version FROM _00_schema_state:internal") {
+                let result = match self.stored_cli_version.borrow().as_ref() {
+                    Some(v) => serde_json::json!([{ "cli_version": v }]),
+                    None => serde_json::json!([]),
+                };
+                return Ok(vec![SurrealResponse {
+                    status: "OK".to_string(),
+                    result: Some(result),
+                }]);
+            }
             // Answer the schema-hash read with the configured stored hash.
             if query.starts_with("SELECT hash FROM _00_schema_state") {
                 let result = match self.stored_hash.borrow().as_ref() {
@@ -1512,6 +1875,26 @@ mod tests {
                 return Ok(vec![SurrealResponse {
                     status: "OK".to_string(),
                     result: Some(result),
+                }]);
+            }
+            if let Some(key) = query
+                .strip_prefix("INFO FOR INDEX ")
+                .and_then(|q| q.strip_suffix(';'))
+            {
+                let mut statuses = self.index_statuses.borrow_mut();
+                let status = match statuses.get_mut(key) {
+                    Some(list) if list.len() > 1 => list.remove(0),
+                    Some(list) => list.first().cloned().unwrap_or_else(|| "ready".into()),
+                    None => "ready".into(),
+                };
+                let building = if status == "error" {
+                    serde_json::json!({ "status": "error", "error": "Database index `x` already contains 1" })
+                } else {
+                    serde_json::json!({ "status": status })
+                };
+                return Ok(vec![SurrealResponse {
+                    status: "OK".to_string(),
+                    result: Some(serde_json::json!({ "building": building })),
                 }]);
             }
             if let Some(table) = query
@@ -2070,7 +2453,7 @@ mod tests {
         assert_eq!(upserts(&q), 1, "normal path stores the config: {q:?}");
         let internal_hash = q
             .iter()
-            .find_map(|s| s.strip_prefix("UPSERT _00_schema_state:internal SET hash = '"))
+            .find_map(|s| s.split_once("UPSERT _00_schema_state:internal SET hash = '").map(|(_, rest)| rest))
             .map(|rest| rest.split('\'').next().unwrap().to_string())
             .expect("internal hash recorded");
 
@@ -2414,7 +2797,8 @@ mod tests {
                    DEFINE INDEX OVERWRITE idx_new ON TABLE _00_feature_flag COLUMNS key UNIQUE;\n\
                    DEFINE EVENT OVERWRITE e ON TABLE _00_version WHEN true THEN { RETURN 1; };";
 
-        let (out, pruned) = prune_unchanged_index_defines(&db, sql);
+        let PrunedIndexes { sql: out, unchanged: pruned, .. } =
+            prune_unchanged_index_defines(&db, sql, false);
         assert_eq!(pruned, 1);
         assert!(
             !out.contains("DEFINE INDEX OVERWRITE idx_record_id"),
@@ -2442,10 +2826,224 @@ mod tests {
         assert_eq!(infos, 1);
 
         // Nothing readable about the live schema: every statement stays.
-        let (out2, pruned2) = prune_unchanged_index_defines(&MockDB::new(), sql);
+        let PrunedIndexes { sql: out2, unchanged: pruned2, .. } =
+            prune_unchanged_index_defines(&MockDB::new(), sql, false);
         assert_eq!(pruned2, 0);
         assert!(out2.contains(
             "DEFINE INDEX OVERWRITE idx_record_id ON TABLE _00_version COLUMNS record_id UNIQUE;"
         ));
+    }
+
+    #[test]
+    fn versions_order_by_semver_precedence() {
+        let newer = |a: &str, b: &str| is_newer(a, b).unwrap();
+        // the old canary line is older than every 1.0.0 pre-release
+        assert!(newer("1.0.0-beta.4", "0.0.1-canary.385"));
+        assert!(!newer("0.0.1-canary.385", "1.0.0-beta.4"));
+        // pre-release numbers compare as numbers
+        assert!(newer("1.0.0-beta.5", "1.0.0-beta.4"));
+        assert!(newer("1.0.0-beta.10", "1.0.0-beta.9"));
+        assert!(newer("0.0.1-canary.385", "0.0.1-canary.99"));
+        // a release outranks its pre-releases; identifiers compare in order
+        assert!(newer("1.0.0", "1.0.0-beta.9"));
+        assert!(newer("1.0.0-beta.1", "1.0.0-beta"));
+        assert!(newer("1.0.0-beta.1", "1.0.0-alpha.9"));
+        assert!(newer("1.0.1", "1.0.0"));
+        // equal is not newer; build metadata and a leading v are ignored
+        assert!(!newer("1.0.0-beta.4", "1.0.0-beta.4"));
+        assert!(!newer("v1.0.0-beta.4+abc", "1.0.0-beta.4"));
+        // what does not parse is not compared
+        for bad in ["", "garbage", "1.0", "1.0.0-", "1.0.0-beta..1", "1.x.0"] {
+            assert_eq!(is_newer(bad, "1.0.0"), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_schema_from_a_newer_cli_is_refused_unless_local_or_allowed() {
+        let this = "0.0.1-canary.385";
+        let refused = schema_downgrade_check(Some("1.0.0-beta.4"), this, false, false);
+        let DowngradeCheck::Refuse(msg) = &refused else { panic!("{refused:?}") };
+        for part in [
+            "pushed by spky 1.0.0-beta.4",
+            "this is spky 0.0.1-canary.385",
+            "older ones",
+            "npm i -g @spooky-sync/cli@1.0.0-beta.4",
+            "--allow-schema-downgrade",
+        ] {
+            assert!(msg.contains(part), "{part:?} missing from: {msg}");
+        }
+        assert!(matches!(schema_downgrade_check(Some("1.0.0-beta.4"), this, true, false), DowngradeCheck::Warn(_)));
+        assert!(matches!(schema_downgrade_check(Some("1.0.0-beta.4"), this, false, true), DowngradeCheck::Warn(_)));
+        // same, older, missing or unparsable: push as before
+        for stored in [Some("0.0.1-canary.385"), Some("0.0.1-canary.12"), None, Some("garbage")] {
+            assert_eq!(schema_downgrade_check(stored, this, false, false), DowngradeCheck::Allow, "{stored:?}");
+        }
+        assert_eq!(schema_downgrade_check(Some("1.0.0-beta.4"), "1.0.0-beta.5", false, false), DowngradeCheck::Allow);
+    }
+
+    #[test]
+    fn local_databases_are_recognised_by_host() {
+        for url in [
+            "http://localhost:8000",
+            "ws://127.0.0.1:8666/rpc",
+            "http://[::1]:8000",
+            "http://root:root@localhost:8000",
+            "http://host.docker.internal:8000",
+            "localhost:8000",
+            "http://surreal.localhost",
+        ] {
+            assert!(is_local_url(url), "{url}");
+        }
+        for url in ["https://whitepawn-db.sp00ky.cloud", "http://10.0.0.5:8000", "https://localhost.example.com"] {
+            assert!(!is_local_url(url), "{url}");
+        }
+    }
+
+    /// The guard reads `cli_version` before anything is written, and the
+    /// recorded hash carries this CLI's version.
+    #[test]
+    fn the_guard_reads_the_recorded_version_and_the_hash_records_this_one() {
+        let mock = MockDB::new();
+        *mock.stored_cli_version.borrow_mut() = Some("999.0.0".into());
+        let err = guard_schema_downgrade(&mock, "https://app-db.sp00ky.cloud", false).unwrap_err();
+        assert!(err.to_string().contains("pushed by spky 999.0.0"), "{err}");
+        assert_eq!(
+            mock.executed_queries.borrow().as_slice(),
+            ["SELECT cli_version FROM _00_schema_state:internal;"],
+            "nothing but the read before refusing"
+        );
+        guard_schema_downgrade(&mock, "http://localhost:8000", false).unwrap();
+        guard_schema_downgrade(&mock, "https://app-db.sp00ky.cloud", true).unwrap();
+        *mock.stored_cli_version.borrow_mut() = Some(CLI_VERSION.into());
+        guard_schema_downgrade(&mock, "https://app-db.sp00ky.cloud", false).unwrap();
+
+        let mock = MockDB::new();
+        record_schema_hash(&mock, "internal", "abc");
+        let q = mock.executed_queries.borrow().join("\n");
+        assert!(q.contains(&format!("cli_version = '{CLI_VERSION}'")), "{q}");
+        assert!(q.contains("DEFINE FIELD IF NOT EXISTS cli_version ON TABLE _00_schema_state TYPE option<string>"), "{q}");
+    }
+
+    /// A live index whose build failed is defined again (the planner never
+    /// uses it, though `INFO FOR TABLE` lists it); one still building is left
+    /// alone and waited for.
+    #[test]
+    fn a_failed_build_is_redefined_and_a_running_one_waited_for() {
+        let db = MockDB::new();
+        db.set_live_indexes(
+            "t",
+            &[("a", "DEFINE INDEX a ON t FIELDS x"), ("b", "DEFINE INDEX b ON t FIELDS y")],
+        );
+        db.set_index_statuses("a", "t", &["error"]);
+        db.set_index_statuses("b", "t", &["started"]);
+        let sql = "DEFINE INDEX OVERWRITE a ON TABLE t COLUMNS x;\n\
+                   DEFINE INDEX OVERWRITE b ON TABLE t COLUMNS y;";
+        let p = prune_unchanged_index_defines(&db, sql, true);
+        assert_eq!(p.unchanged, 1, "{}", p.sql);
+        assert!(p.sql.contains("DEFINE INDEX OVERWRITE a ON TABLE t COLUMNS x CONCURRENTLY;"), "{}", p.sql);
+        assert!(p.sql.contains("-- index b on t unchanged; not rebuilt"), "{}", p.sql);
+        assert_eq!(
+            p.building,
+            vec![("a".to_string(), "t".to_string()), ("b".to_string(), "t".to_string())]
+        );
+    }
+
+    #[test]
+    fn index_builds_are_waited_for_until_ready_failed_or_timed_out() {
+        use std::time::Duration;
+        let ix = |n: &str| vec![(n.to_string(), "t".to_string())];
+        let db = MockDB::new();
+        db.set_index_statuses("a", "t", &["started", "started", "ready"]);
+        assert!(wait_for_index_builds(&db, &ix("a"), Duration::from_secs(5), Duration::from_millis(1)).unwrap());
+        db.set_index_statuses("b", "t", &["started"]);
+        assert!(!wait_for_index_builds(&db, &ix("b"), Duration::ZERO, Duration::from_millis(1)).unwrap());
+        db.set_index_statuses("c", "t", &["started", "error"]);
+        let err = wait_for_index_builds(&db, &ix("c"), Duration::from_secs(5), Duration::from_millis(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("index c on t failed to build"), "{err}");
+    }
+
+    /// A concurrent build that fails (a UNIQUE index over duplicates) fails
+    /// the apply and leaves the schema hash unrecorded, so the next apply
+    /// defines the index again instead of skipping an unusable one.
+    #[test]
+    fn a_failed_index_build_fails_the_apply_and_records_no_hash() {
+        let dir = TempDir::new().unwrap();
+        let schema = dir.path().join("schema.surql");
+        fs::write(&schema, "DEFINE TABLE message SCHEMAFULL;\nDEFINE FIELD body ON TABLE message TYPE string;\n")
+            .unwrap();
+        let recorded = |m: &MockDB| {
+            m.executed_queries
+                .borrow()
+                .iter()
+                .any(|s| s.contains("UPSERT _00_schema_state:internal"))
+        };
+        let mock = MockDB::new();
+        mock.set_index_statuses("idx_record_id", "_00_version", &["started", "error"]);
+        let err = apply_internal_schema(&mock, &schema, None, &DeployMode::Cluster, None, None, &mut Vec::new)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("idx_record_id on _00_version failed to build"), "{err:#}");
+        assert!(!recorded(&mock));
+        let ddl = mock
+            .executed_queries
+            .borrow()
+            .iter()
+            .find(|s| s.contains("DEFINE INDEX OVERWRITE idx_record_id"))
+            .cloned()
+            .unwrap();
+        assert!(ddl.contains("ON TABLE _00_version COLUMNS record_id UNIQUE CONCURRENTLY;"));
+
+        let mock = MockDB::new();
+        apply_internal_schema(&mock, &schema, None, &DeployMode::Cluster, None, None, &mut Vec::new).unwrap();
+        assert!(recorded(&mock), "every build ready: the hash is recorded");
+    }
+
+    /// On a server engine the indexes that do get (re)defined build
+    /// `CONCURRENTLY`: a blocking build on SurrealDB 4.0.1 waits up to 60 s for
+    /// the write transactions older than it, which held a deploy past the
+    /// CLI's HTTP timeout. An unchanged one still compares equal to its live
+    /// definition with the clause on our side.
+    #[test]
+    fn redefined_indexes_build_concurrently_on_servers() {
+        let db = MockDB::new();
+        db.set_live_indexes(
+            "_00_version",
+            &[(
+                "idx_record_id",
+                "DEFINE INDEX idx_record_id ON _00_version FIELDS record_id UNIQUE",
+            )],
+        );
+        let sql = "DEFINE INDEX OVERWRITE idx_record_id ON TABLE _00_version COLUMNS record_id UNIQUE CONCURRENTLY;\n\
+                   DEFINE INDEX OVERWRITE idx_new ON TABLE _00_user_feature COLUMNS user;\n\
+                   DEFINE INDEX IF NOT EXISTS idx_job ON job COLUMNS status, created_at CONCURRENTLY;";
+        let PrunedIndexes { sql: out, unchanged: pruned, building } =
+            prune_unchanged_index_defines(&db, sql, true);
+        assert_eq!(
+            building,
+            vec![
+                ("idx_new".to_string(), "_00_user_feature".to_string()),
+                ("idx_job".to_string(), "job".to_string())
+            ]
+        );
+        assert_eq!(pruned, 1, "{out}");
+        assert!(
+            out.contains(
+                "DEFINE INDEX OVERWRITE idx_new ON TABLE _00_user_feature COLUMNS user CONCURRENTLY;"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "DEFINE INDEX IF NOT EXISTS idx_job ON job COLUMNS status, created_at CONCURRENTLY;"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("CONCURRENTLY CONCURRENTLY"), "{out}");
+        if let Err(e) = surrealdb_core::syn::parse_with_capabilities(
+            &out,
+            &surrealdb_core::dbs::Capabilities::all(),
+        ) {
+            panic!("does not parse: {e}\n{out}");
+        }
     }
 }

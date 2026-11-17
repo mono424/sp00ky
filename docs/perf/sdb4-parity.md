@@ -403,8 +403,13 @@ workloads after `materialize` in separate passes.)
   waited 31.8 s for an unrelated running write. On the busy dataset, each new
   index in `spky migrate apply` took exactly 60 s, so the internal schema took
   67 s with one changed index and failed at the CLI's 120 s timeout with two.
-  `spky` now sends new and changed internal indexes `CONCURRENTLY` (13 ms).
-  WhitePawn's patch already defines its indexes `CONCURRENTLY`.
+  `spky` now sends new and changed internal indexes `CONCURRENTLY` (13 ms)
+  and then waits for each build: one that fails (a UNIQUE index over
+  duplicates ends in `building.status = "error"`, which the planner never
+  uses though `INFO FOR TABLE` lists it) fails the apply, one still running
+  after `SPKY_INDEX_BUILD_TIMEOUT_SECS` (600) leaves the schema hash
+  unrecorded so the next apply checks again. WhitePawn's patch already
+  defines its indexes `CONCURRENTLY`.
 
 ## 7. What remains slower on 4.0.1, and why
 
@@ -469,7 +474,8 @@ games (1.9 s against 23 s), and the first scheduler tick.
 - **The internal-schema changes of this branch** add three indexes on
   existing tables (`_00_user_feature(user)`, `_00_crdt_doc(doc)`,
   `_00_channel_signal(sender)` replacing `(sender, at)`), built
-  `CONCURRENTLY`; until built, the lookups they serve scan as before.
+  `CONCURRENTLY`; the apply waits for them (up to 10 minutes by default)
+  before it records the schema, and the lookups they serve scan until then.
 
 ## Reproduce
 

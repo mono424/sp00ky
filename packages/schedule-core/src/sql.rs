@@ -668,18 +668,28 @@ ORDER BY finished_at ASC LIMIT $batch";
 /// selection is a request of its own, and a run reopened for a retry in
 /// between ([`REOPEN_WORKFLOW_RUN`]) keeps its steps and itself. The guard
 /// reads the run's own row and the delete writes its key, so a reopen racing
-/// this transaction conflicts with it instead of interleaving.
+/// this transaction conflicts with it instead of interleaving. Answers the ids
+/// it deleted: two schedulers (blue/green) can select the same batch, and only
+/// the one whose delete removed a run may fold it into the rollup.
 pub fn delete_workflow_runs(n: usize) -> String {
     let mut sql = String::from("BEGIN; ");
     for i in 0..n {
         sql.push_str(&format!(
             "LET $w{i} = type::record($r{i}); \
              DELETE _00_step_run WHERE workflow_run = $w{i} AND $w{i}.status = $status; \
-             DELETE $w{i} WHERE status = $status; "
+             LET $d{i} = (DELETE $w{i} WHERE status = $status RETURN BEFORE); "
         ));
     }
-    sql.push_str("COMMIT;");
+    sql.push_str("COMMIT; ");
+    sql.push_str(&deleted_ids(n));
     sql
+}
+
+/// The closing `RETURN` of a batch delete: the ids of the rows `$d0..$d{n-1}`
+/// (each a `DELETE ... RETURN BEFORE`) actually removed.
+fn deleted_ids(n: usize) -> String {
+    let gone: Vec<String> = (0..n).map(|i| format!("$d{i}")).collect();
+    format!("RETURN array::flatten([{}]).map(|$r| $r.id);", gone.join(", "))
 }
 
 /// The next batch of finished durable workflow instances (`@spooky-sync/backend`)
@@ -695,7 +705,8 @@ ORDER BY finished_at ASC LIMIT $batch";
 /// Delete `n` durable instances bound as `$r0..$r{n-1}`, steps and events
 /// first, in one transaction of top-level statements, each only while it still
 /// has the `$status` the batch was selected with (an instance retried in
-/// between keeps its history), as [`delete_workflow_runs`] does.
+/// between keeps its history), as [`delete_workflow_runs`] does. Answers the
+/// ids it deleted.
 pub fn delete_durable_instances(n: usize) -> String {
     let mut sql = String::from("BEGIN; ");
     for i in 0..n {
@@ -703,10 +714,11 @@ pub fn delete_durable_instances(n: usize) -> String {
             "LET $w{i} = type::record($r{i}); \
              DELETE _00_wf_step WHERE instance = $w{i} AND $w{i}.status = $status; \
              DELETE _00_wf_event WHERE instance = $w{i} AND $w{i}.status = $status; \
-             DELETE $w{i} WHERE status = $status; "
+             LET $d{i} = (DELETE $w{i} WHERE status = $status RETURN BEFORE); "
         ));
     }
-    sql.push_str("COMMIT;");
+    sql.push_str("COMMIT; ");
+    sql.push_str(&deleted_ids(n));
     sql
 }
 
@@ -1155,10 +1167,11 @@ mod tests {
         }
         // the batch's own delete: per id, no list match, no block
         for sql in [delete_workflow_runs(3), delete_durable_instances(3)] {
-            assert!(sql.starts_with("BEGIN; ") && sql.ends_with("COMMIT;"), "{sql}");
-            assert!(!sql.contains("INSIDE") && !sql.contains(" IN ") && !sql.contains('{'), "{sql}");
+            assert!(sql.starts_with("BEGIN; "), "{sql}");
+            assert!(sql.ends_with("COMMIT; RETURN array::flatten([$d0, $d1, $d2]).map(|$r| $r.id);"), "{sql}");
+            assert!(!sql.contains("INSIDE") && !sql.contains(" IN ") && !sql.contains("{ "), "{sql}");
             // only rows still in the status they were selected with
-            assert!(sql.contains("DELETE $w2 WHERE status = $status;"), "{sql}");
+            assert!(sql.contains("LET $d2 = (DELETE $w2 WHERE status = $status RETURN BEFORE);"), "{sql}");
         }
         let wf = delete_workflow_runs(2);
         assert!(
@@ -1166,7 +1179,7 @@ mod tests {
                 < wf.find("DELETE $w0 WHERE").unwrap(),
             "steps first: {wf}"
         );
-        assert_eq!(delete_workflow_runs(0), "BEGIN; COMMIT;");
+        assert_eq!(delete_workflow_runs(0), "BEGIN; COMMIT; RETURN array::flatten([]).map(|$r| $r.id);");
     }
 
     /// No prune statement may use `NOT INSIDE`. SurrealDB parses `INSIDE` as a

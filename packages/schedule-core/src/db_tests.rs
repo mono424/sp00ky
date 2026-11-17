@@ -3947,8 +3947,9 @@ async fn prunes_with_nothing_due_stay_cheap_on_a_large_history() {
             ids.push(("status".into(), json!(status)));
             let refs: Vec<(&str, Value)> = ids.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             let started = std::time::Instant::now();
-            h.engine.db().query(&delete(found.len()), &refs).await.expect("delete the batch");
+            let removed = crate::db::last_rows(h.engine.db().query(&delete(found.len()), &refs).await.expect("delete the batch"));
             per_row.push(started.elapsed().as_secs_f64() * 1000.0 / found.len().max(1) as f64);
+            assert_eq!(removed.len(), batch, "{name}: the delete answers the ids it removed");
         }
         assert!(per_row[1] < per_row[0] * 10.0 + 1.0, "{name}, a due batch: {:.2} ms per row on the large history against {:.2}", per_row[1], per_row[0]);
     }
@@ -3961,7 +3962,9 @@ async fn prunes_with_nothing_due_stay_cheap_on_a_large_history() {
 
 /// The workflow prune selects a batch in one request and deletes it in
 /// another. A run reopened for a retry in between must keep itself and its
-/// steps.
+/// steps, and a second delete of the same batch (a second scheduler during a
+/// blue/green handover) removes nothing and answers nothing, so nothing is
+/// folded into the rollup twice.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_workflow_prune_keeps_a_run_reopened_since_its_selection() {
     let h = harness().await;
@@ -3992,9 +3995,74 @@ async fn a_workflow_prune_keeps_a_run_reopened_since_its_selection() {
     binds.push(("status".into(), json!("failed")));
     let refs: Vec<(&str, Value)> = binds.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let delete = crate::sql::delete_workflow_runs(found.len());
-    h.engine.db().query(&delete, &refs).await.unwrap();
+    let removed = crate::db::last_rows(h.engine.db().query(&delete, &refs).await.unwrap());
+    assert_eq!(removed, vec![json!("_00_workflow_run:b")], "only the run still failed goes");
     let left: Vec<String> = h.raw.query("SELECT VALUE <string>id FROM _00_workflow_run").await.unwrap().take(0).unwrap();
     assert_eq!(left, vec!["_00_workflow_run:a".to_string()]);
     let steps: Vec<String> = h.raw.query("SELECT VALUE <string>workflow_run FROM _00_step_run").await.unwrap().take(0).unwrap();
     assert_eq!(steps, vec!["_00_workflow_run:a".to_string()], "the reopened run keeps its steps");
+    // the same batch deleted again (a second scheduler) removes nothing
+    let again = crate::db::last_rows(h.engine.db().query(&delete, &refs).await.unwrap());
+    assert!(again.is_empty(), "{again:?}");
+}
+
+/// What [`ScheduleEngine`]'s workflow prune sees when it races: right after the
+/// selection returns a batch, a retry reopens run `a`; and with `replay`,
+/// another scheduler deletes the same batch just before this one does.
+struct RacingPrune {
+    inner: MemDb,
+    reopen: std::sync::atomic::AtomicBool,
+    replay: bool,
+}
+
+#[async_trait::async_trait]
+impl ScheduleDb for RacingPrune {
+    async fn query(&self, surql: &str, binds: &[(&str, Value)]) -> Result<Vec<Value>, ScheduleDbError> {
+        if self.replay && surql.starts_with("BEGIN; LET $w0 = type::record($r0); DELETE _00_step_run") {
+            self.inner.query(surql, binds).await?;
+        }
+        let out = self.inner.query(surql, binds).await?;
+        if surql == crate::sql::PRUNE_WORKFLOW_RUNS
+            && !crate::db::rows(out.clone()).is_empty()
+            && self.reopen.swap(false, Ordering::SeqCst)
+        {
+            self.inner
+                .query(crate::sql::REOPEN_WORKFLOW_RUN, &[("tb", json!("_00_workflow_run")), ("key", json!("a"))])
+                .await?;
+        }
+        Ok(out)
+    }
+}
+
+/// The rollup counts only the runs the prune's own delete removed: not a run a
+/// retry reopened after the selection, and nothing when a second scheduler
+/// deleted the batch first (blue/green), which would otherwise count it twice.
+#[tokio::test]
+async fn the_workflow_prune_folds_only_what_its_delete_removed() {
+    for (replay, expected) in [(false, vec!["schedule/nightly s=0 f=1 sk=0 r=0 k=0"]), (true, vec![])] {
+        let h = harness().await;
+        set_retention(&h, "run_success_secs: 60, run_failed_secs: 60").await;
+        h.set(
+            "OPTION IMPORT;
+             INSERT INTO _00_workflow_run [
+                 { id: _00_workflow_run:a, workflow_name: 'w', dag: {}, kill_requested: false, schedule_name: 'nightly', status: 'failed', created_at: time::now(), finished_at: time::now() - 1d, updated_at: time::now() },
+                 { id: _00_workflow_run:b, workflow_name: 'w', dag: {}, kill_requested: false, schedule_name: 'nightly', status: 'failed', created_at: time::now(), finished_at: time::now() - 1d, updated_at: time::now() }
+             ] RETURN NONE;",
+        )
+        .await;
+        let engine = ScheduleEngine::new(
+            Arc::new(RacingPrune {
+                inner: MemDb(Arc::clone(&h.raw)),
+                reopen: std::sync::atomic::AtomicBool::new(true),
+                replay,
+            }),
+            Arc::clone(&h.kill) as Arc<dyn JobKill>,
+            EngineConfig::default(),
+        );
+        engine.tick_pass().await.unwrap();
+        let left = h.strings("SELECT VALUE type::string(id) FROM _00_workflow_run").await;
+        assert_eq!(left, vec!["_00_workflow_run:a".to_string()], "the reopened run stays (replay {replay})");
+        let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+        assert_eq!(rollup_rows(&h).await, expected, "replay {replay}");
+    }
 }

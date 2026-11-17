@@ -1564,10 +1564,11 @@ impl ScheduleEngine {
             let refs = batch_binds(&ids, status);
             let refs: Vec<(&str, Value)> = refs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
             match self.db.query(&sql::delete_durable_instances(ids.len()), &refs).await {
-                Ok(_) => {
-                    let n = ids.len();
-                    report.pruned += n;
-                    if n < DURABLE_PRUNE_BATCH {
+                Ok(results) => {
+                    // count what this delete removed: another scheduler, or a
+                    // retry, may have taken some of the batch
+                    report.pruned += last_rows(results).len();
+                    if ids.len() < DURABLE_PRUNE_BATCH {
                         return;
                     }
                 }
@@ -1600,12 +1601,23 @@ impl ScheduleEngine {
             }
             let refs = batch_binds(&ids, status);
             let refs: Vec<(&str, Value)> = refs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-            if let Err(e) = self.db.query(&sql::delete_workflow_runs(ids.len()), &refs).await {
-                tracing::warn!(error = %e, status = %fold.status, "history prune failed");
-                return;
-            }
-            report.pruned += doomed.len();
-            self.fold_rollup(&doomed, fold).await;
+            let removed = match self.db.query(&sql::delete_workflow_runs(ids.len()), &refs).await {
+                Ok(results) => last_rows(results),
+                Err(e) => {
+                    tracing::warn!(error = %e, status = %fold.status, "history prune failed");
+                    return;
+                }
+            };
+            // Fold only the runs this delete removed: a run reopened since the
+            // selection stays, and a second scheduler that selected the same
+            // batch deletes nothing and must not count it again.
+            let gone: Vec<Value> = doomed
+                .iter()
+                .filter(|row| row.get("id").is_some_and(|id| removed.contains(id)))
+                .cloned()
+                .collect();
+            report.pruned += gone.len();
+            self.fold_rollup(&gone, fold).await;
             if doomed.len() < PRUNE_BATCH {
                 return;
             }

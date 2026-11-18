@@ -1166,6 +1166,11 @@ pub async fn run_server() -> anyhow::Result<()> {
     });
     let runtime = ssp_node::Runtime::new(node.clone());
 
+    // Which indexes this SSP holds, kept in the database for the SSP that
+    // replaces it (`ssp_node::index_memory`); the shutdown path writes once more.
+    let index_recorder = Arc::new(ssp_node::index_memory::IndexRecorder::new(config.ssp_id.clone()));
+    spawn_index_recorder(Arc::clone(&node), Arc::clone(&index_recorder));
+
     // Standalone changefeed tail: with no scheduler in front, this node reads
     // `SHOW CHANGES` itself when the schema was deployed with
     // `sync.transport: changefeed`. In cluster mode the scheduler tails.
@@ -1605,6 +1610,7 @@ pub async fn run_server() -> anyhow::Result<()> {
             meter_provider,
             Arc::clone(&clean_requested),
             row_checkpoints.map(|rows| (rows, processor_arc.clone(), status.clone())),
+            (index_recorder, Arc::clone(&node)),
         ))
         .await
         .context("Server error")?;
@@ -1659,6 +1665,7 @@ async fn shutdown_signal(
     meter_provider: opentelemetry_sdk::metrics::SdkMeterProvider,
     clean_requested: Arc<AtomicBool>,
     rows: Option<ShutdownRows>,
+    indexes: (Arc<ssp_node::index_memory::IndexRecorder>, Arc<ssp_node::SspNode>),
 ) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1683,6 +1690,19 @@ async fn shutdown_signal(
     }
 
     info!("Signal received, starting graceful shutdown");
+
+    // What this SSP holds, for the one that replaces it, while it still
+    // serves (before `Stopping` below). Bounded: a stalled database must not
+    // eat the SIGTERM grace the row checkpoint needs.
+    let (recorder, node) = indexes;
+    if !node.is_standby() && *node.status.read().await == SspStatus::Ready {
+        let write = recorder.record(node.platform.db.as_ref(), &node.processor, true);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), write).await {
+            Ok(Ok(_)) => info!("Recorded which indexes this SSP holds for its successor"),
+            Ok(Err(e)) => warn!(error = %e, "Could not record which indexes this SSP holds"),
+            Err(_) => warn!("Recording which indexes this SSP holds timed out"),
+        }
+    }
 
     // Cluster rows: a final checkpoint so the next boot is warm. Only a
     // verified circuit is worth keeping, and ingest stops first (503, which
@@ -2051,18 +2071,12 @@ impl ClusterBoot {
                     // refreshes the allowlist): its predecessor's edges stand
                     // until `POST /handover/promote` compares digests.
                     let standby = node.is_standby();
-                    // Rebuild the indexes the previous process held before
+                    // Rebuild the indexes the SSPs before this one held before
                     // serving: a list opened before the restart would
                     // otherwise pay the build, a pass over its whole table
-                    // under the circuit lock, on its first window after.
-                    if let Some(rows) = row_checkpoints.as_deref() {
-                        let wanted = rows.read_built_indexes();
-                        if !wanted.is_empty() {
-                            let started = std::time::Instant::now();
-                            let built = processor.read().await.prebuild_indexes(&wanted).indexes_built;
-                            info!(built, ms = started.elapsed().as_millis() as u64, "Rebuilt the indexes the previous process held");
-                        }
-                    }
+                    // that its registration waits for, on its first window
+                    // after. A standby does this while its predecessor serves.
+                    prebuild_held_indexes(node.platform.db.as_ref(), processor, row_checkpoints.as_deref()).await;
                     let republish_started = std::time::Instant::now();
                     if let Err(e) = node.republish_restored_views().await {
                         error!(error = %e, "Bootstrap membership repair failed");
@@ -2095,6 +2109,86 @@ impl ClusterBoot {
             }
         }
     }
+}
+
+/// Rebuild the indexes the SSPs before this one held (their records in
+/// `_00_sync_evidence`, see [`ssp_node::index_memory`]), within
+/// `SPKY_SSP_INDEX_PREBUILD_SECS` and `SPKY_SSP_INDEX_PREBUILD_MAX_MB`. With
+/// no record to go by (none written yet, the read failed, or the prebuild
+/// turned off) it falls back to what the row checkpoint directory says the
+/// previous process held. Never fails the bootstrap: whatever is not built
+/// here is built by the first registration that needs it.
+async fn prebuild_held_indexes(
+    db: &dyn ssp_node::ports::Db,
+    processor: &Arc<RwLock<Circuit>>,
+    rows: Option<&warm::RowCheckpoints>,
+) {
+    use ssp_node::index_memory;
+    let grace = processor.read().await.index_idle_release();
+    let limits = index_memory::PrebuildLimits::from_env(grace);
+    let records = if limits.time.is_zero() {
+        Vec::new()
+    } else {
+        match index_memory::read_records(db).await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!(error = %e, "Could not read which indexes the SSPs before this one held");
+                Vec::new()
+            }
+        }
+    };
+    if !records.is_empty() {
+        let selection = index_memory::select(&records, ssp_node::now_epoch_ms(), &limits);
+        let byte_budget = selection.byte_budget;
+        let report = index_memory::prebuild(processor, selection, limits.time).await;
+        info!(
+            records = records.len(),
+            built = report.built.len(),
+            already_built = report.already_built,
+            skipped = report.skipped.len(),
+            rows_indexed = report.stats.rows_indexed,
+            ms = report.elapsed.as_millis() as u64,
+            budget_ms = limits.time.as_millis() as u64,
+            budget_mb = byte_budget / (1024 * 1024),
+            built_indexes = %report.built_summary(),
+            "Rebuilt the indexes the SSPs before this one held"
+        );
+        if !report.skipped.is_empty() {
+            info!(
+                skipped = %report.skipped_summary(),
+                "Left indexes to build on first use"
+            );
+        }
+        return;
+    }
+    if let Some(rows) = rows {
+        let wanted = rows.read_built_indexes();
+        if !wanted.is_empty() {
+            let started = std::time::Instant::now();
+            let built = processor.read().await.prebuild_indexes(&wanted).indexes_built;
+            info!(built, ms = started.elapsed().as_millis() as u64, "Rebuilt the indexes the previous process held");
+        }
+    }
+}
+
+/// Keep this SSP's record of the indexes it holds current while it serves
+/// (see [`ssp_node::index_memory`]): a check every
+/// [`ssp_node::index_memory::RECORD_EVERY`], a write when it changed. A
+/// standby or a retired SSP writes nothing.
+fn spawn_index_recorder(node: Arc<ssp_node::SspNode>, recorder: Arc<ssp_node::index_memory::IndexRecorder>) {
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(ssp_node::index_memory::RECORD_EVERY);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            every.tick().await;
+            if node.is_standby() || *node.status.read().await != SspStatus::Ready {
+                continue;
+            }
+            if let Err(e) = recorder.record(node.platform.db.as_ref(), &node.processor, false).await {
+                warn!(error = %e, "Could not record which indexes this SSP holds");
+            }
+        }
+    });
 }
 
 /// Re-run the cluster bootstrap without leaving the process: views and graphs

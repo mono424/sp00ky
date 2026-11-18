@@ -28,6 +28,7 @@ pub mod db_retry;
 pub mod crdt;
 pub mod edges;
 pub mod http_sql_db;
+pub mod index_memory;
 pub mod jobs;
 pub mod handover;
 pub mod node;

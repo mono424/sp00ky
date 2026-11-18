@@ -36,7 +36,7 @@ const INDEX_BUILD_STEP: std::time::Duration = std::time::Duration::from_millis(2
 
 /// Give the executor one turn. tokio's own `yield_now` needs its `rt` feature,
 /// which this crate leaves out so it still builds for wasm32.
-fn yield_now() -> impl std::future::Future<Output = ()> {
+pub(crate) fn yield_now() -> impl std::future::Future<Output = ()> {
     let mut yielded = false;
     std::future::poll_fn(move |cx| {
         if yielded {

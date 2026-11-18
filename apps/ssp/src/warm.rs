@@ -2281,6 +2281,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The bootstrap rebuilds from the database record when there is one,
+    /// and from the local `indexes.json` only when the database has none to
+    /// give (no record yet, or the read failed).
+    #[tokio::test]
+    async fn the_boot_prebuild_prefers_the_database_record_to_the_local_file() {
+        use ssp::circuit::index::IndexDef;
+        use ssp::circuit::TableMeta;
+        use ssp_node::ports::{Db, DbError};
+
+        struct Records(Option<serde_json::Value>);
+        #[async_trait::async_trait]
+        impl Db for Records {
+            async fn query(&self, _: &str, _: &[(&str, serde_json::Value)]) -> Result<Vec<serde_json::Value>, DbError> {
+                self.0.clone().map(|records| vec![records]).ok_or_else(|| DbError::Transport("unreachable".into()))
+            }
+            async fn version(&self) -> Result<String, DbError> {
+                Ok("test".into())
+            }
+        }
+        let defs = vec![
+            IndexDef { name: "game_n".into(), fields: vec!["n".into()] },
+            IndexDef { name: "game_s".into(), fields: vec!["s".into()] },
+        ];
+        let circuit = || {
+            let processor = table_circuit(10);
+            let defs = defs.clone();
+            async move {
+                processor.write().await.set_table_meta(
+                    "game",
+                    TableMeta { permission: "true".into(), indexes: defs, ..Default::default() },
+                );
+                processor
+            }
+        };
+        // The previous process on this volume held game_s.
+        let dir = scratch_dir("prebuild-source");
+        let checkpoints = RowCheckpoints::at(dir.clone(), BodyVerify::AtLoad, ArenaBacking::Heap);
+        let previous = circuit().await;
+        previous.read().await.prebuild_indexes(&BTreeMap::from([("game".to_string(), vec!["game_s".to_string()])]));
+        change_and_write(&checkpoints, &previous, 2).await;
+        assert_eq!(checkpoints.read_built_indexes()["game"], vec!["game_s".to_string()]);
+
+        // The serving SSP recorded game_n in the database: that wins.
+        let record = serde_json::json!([{
+            "format": 1, "ssp_id": "ssp-0", "at_ms": ssp_node::now_epoch_ms(),
+            "indexes": [{ "table": "game", "name": "game_n", "fields": ["n"], "idle_ms": 0, "rows": 11, "bytes": 1000 }],
+        }]);
+        let fresh = circuit().await;
+        crate::prebuild_held_indexes(&Records(Some(record)), &fresh, Some(&checkpoints)).await;
+        assert_eq!(fresh.read().await.built_indexes()["game"], vec!["game_n".to_string()]);
+
+        // Nothing recorded, or the database unreachable: the local file.
+        for db in [Records(Some(serde_json::json!([]))), Records(None)] {
+            let fresh = circuit().await;
+            crate::prebuild_held_indexes(&db, &fresh, Some(&checkpoints)).await;
+            assert_eq!(fresh.read().await.built_indexes()["game"], vec!["game_s".to_string()]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn a_removed_table_loses_its_base_and_its_deltas() {
         let dir = scratch_dir("removed");

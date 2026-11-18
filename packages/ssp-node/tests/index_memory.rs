@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use ssp::circuit::index::IndexDef;
 use ssp::circuit::{Circuit, OutputFormat, Record, TableMeta};
 use ssp_node::index_memory::{
-    prebuild, prebuild_in_background, read_records, select, write_record, IndexRecorder, PrebuildLimits, SkipReason,
-    SspIndexRecord, RECORD_FORMAT, RECORD_KEEP,
+    prebuild, prebuild_in_background, read_records, select, write_record, IndexRecorder, Lineage, PrebuildLimits,
+    SkipReason, SspIndexRecord, RECORD_FORMAT, RECORD_KEEP,
 };
 use ssp_node::ports::{Db, DbError};
 use surrealdb::engine::local::{Db as MemEngine, Mem};
@@ -142,7 +142,7 @@ async fn a_replacement_ssp_builds_what_the_one_before_it_held_before_it_serves()
     let green = bootstrapped(game_indexes());
     assert!(built(&*green.read().await).is_empty());
     let limits = PrebuildLimits { time: Duration::from_secs(60), max_bytes: None, idle_grace: green.read().await.index_idle_release() };
-    let selection = select(&records, ssp_node::now_epoch_ms(), &limits);
+    let selection = select(&records, ssp_node::now_epoch_ms(), &limits, &green_line());
     let report = prebuild(&green, selection, limits.time).await;
     assert_eq!(report.built.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), vec!["game.game_white", "game.game_black"],
         "most recently read first");
@@ -205,7 +205,7 @@ async fn a_replacement_skips_what_the_schema_dropped_or_redefined_and_what_aged_
     // is gone, game_white now covers other fields.
     let green = bootstrapped(vec![def("game_white", &["white", "source"]), def("game_owner_source", &["owner", "source"])]);
     let limits = PrebuildLimits { time: Duration::from_secs(60), max_bytes: None, idle_grace: Duration::from_secs(3600) };
-    let report = prebuild(&green, select(&records, ssp_node::now_epoch_ms(), &limits), limits.time).await;
+    let report = prebuild(&green, select(&records, ssp_node::now_epoch_ms(), &limits, &green_line()), limits.time).await;
     assert_eq!(report.built.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(), vec!["game.game_owner_source"]);
     let mut skipped = report.skipped.clone();
     skipped.sort_by(|a, b| a.0.cmp(&b.0));
@@ -218,13 +218,13 @@ async fn a_replacement_skips_what_the_schema_dropped_or_redefined_and_what_aged_
     // nobody wrote since) rebuilds nothing from it: the record aged out.
     let much_later = ssp_node::now_epoch_ms() + 2 * 3600 * 1000;
     let later = bootstrapped(game_indexes());
-    let report = prebuild(&later, select(&records, much_later, &limits), limits.time).await;
+    let report = prebuild(&later, select(&records, much_later, &limits, &green_line()), limits.time).await;
     assert!(report.built.is_empty());
     assert!(report.skipped.iter().all(|(_, reason)| *reason == SkipReason::IdlePastGrace), "{}", report.skipped_summary());
 
     // No time left: nothing starts, everything is reported.
     let rushed = bootstrapped(game_indexes());
-    let report = prebuild(&rushed, select(&records, ssp_node::now_epoch_ms(), &limits), Duration::ZERO).await;
+    let report = prebuild(&rushed, select(&records, ssp_node::now_epoch_ms(), &limits, &green_line()), Duration::ZERO).await;
     assert!(report.built.is_empty());
     assert_eq!(report.skipped.len(), 3);
     assert!(report.skipped.iter().all(|(_, reason)| *reason == SkipReason::TimeBudget));
@@ -244,6 +244,11 @@ async fn blue_record(db: &MemDb, rows: usize) -> Vec<SspIndexRecord> {
     tokio::time::sleep(Duration::from_millis(5)).await;
     IndexRecorder::new("ssp-0").record(db, &blue, false).await.unwrap();
     read_records(db).await.unwrap()
+}
+
+/// The SSP that replaces blue's `ssp-0` in these tests.
+fn green_line() -> Lineage {
+    Lineage::new("ssp-0-g1", Some("ssp-0".into()))
 }
 
 fn limits() -> PrebuildLimits {
@@ -288,7 +293,7 @@ async fn a_background_prebuild_and_a_registration_of_the_same_index_build_it_onc
     let db = mem_db().await;
     let records = blue_record(&db, ROWS).await;
     let green = bootstrapped_rows(game_indexes(), ROWS);
-    let selection = select(&records, ssp_node::now_epoch_ms(), &limits());
+    let selection = select(&records, ssp_node::now_epoch_ms(), &limits(), &green_line());
     assert_eq!(selection.build[0].name, "game_white", "the index the client needs goes first");
 
     // One 512-row step each, taking turns (both yield after every step).
@@ -321,7 +326,7 @@ async fn a_background_prebuild_stops_between_steps_and_leaves_the_rest_to_the_ne
     let asked = std::sync::atomic::AtomicUsize::new(0);
     let report = prebuild_in_background(
         &green,
-        select(&records, ssp_node::now_epoch_ms(), &limits()),
+        select(&records, ssp_node::now_epoch_ms(), &limits(), &green_line()),
         Duration::from_secs(60),
         Duration::ZERO,
         || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3,

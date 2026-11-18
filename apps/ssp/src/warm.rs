@@ -2329,13 +2329,13 @@ mod tests {
             "indexes": [{ "table": "game", "name": "game_n", "fields": ["n"], "idle_ms": 0, "rows": 11, "bytes": 1000 }],
         }]);
         let fresh = circuit().await;
-        crate::prebuild_held_indexes(&Records(Some(record)), &fresh, Some(&checkpoints)).await;
+        crate::prebuild_held_indexes(&Records(Some(record)), &fresh, Some(&checkpoints), &ssp_node::index_memory::Lineage::default()).await;
         assert_eq!(fresh.read().await.built_indexes()["game"], vec!["game_n".to_string()]);
 
         // Nothing recorded, or the database unreachable: the local file.
         for db in [Records(Some(serde_json::json!([]))), Records(None)] {
             let fresh = circuit().await;
-            crate::prebuild_held_indexes(&db, &fresh, Some(&checkpoints)).await;
+            crate::prebuild_held_indexes(&db, &fresh, Some(&checkpoints), &ssp_node::index_memory::Lineage::default()).await;
             assert_eq!(fresh.read().await.built_indexes()["game"], vec!["game_s".to_string()]);
         }
         let _ = std::fs::remove_dir_all(&dir);

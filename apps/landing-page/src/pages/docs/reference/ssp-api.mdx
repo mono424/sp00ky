@@ -986,10 +986,12 @@ Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.
   and a record not written for seven days is deleted. After its bootstrap a
   starting SSP reads every such record and builds the indexes the mirrored
   schema still defines with the same fields and that were read within
-  `SPKY_SSP_INDEX_IDLE_RELEASE_SECS`, most recently read first, until
-  `SPKY_SSP_INDEX_PREBUILD_SECS` (default 60) runs out and within
-  `SPKY_SSP_INDEX_PREBUILD_MAX_MB` (default: as much as the largest earlier
-  SSP held). Each index keeps the idle age it had, so it is freed when its
+  `SPKY_SSP_INDEX_IDLE_RELEASE_SECS`, until `SPKY_SSP_INDEX_PREBUILD_SECS`
+  (default 60) runs out and within `SPKY_SSP_INDEX_PREBUILD_MAX_MB` (default:
+  as much as the largest earlier SSP held). Its own line goes first (records
+  written by itself, by the SSP it replaces, or by an SSP of the same `ssp-N`
+  slot), most recently read first; other SSPs' records only fill what is
+  left of the memory budget. Each index keeps the idle age it had, so it is freed when its
   grace runs out rather than a whole grace after every deploy.
   - A blue/green standby does this before it reports Ready, while its
     predecessor still serves: one build at a time, each in one pass under a

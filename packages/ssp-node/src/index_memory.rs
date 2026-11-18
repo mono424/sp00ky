@@ -220,7 +220,7 @@ pub struct PrebuildLimits {
     /// Cap on the recorded bytes of the indexes rebuilt. `None`: as much as
     /// the largest single record held, so a new SSP never takes more index
     /// memory than one SSP before it did (several SSPs' records together
-    /// would otherwise add up).
+    /// would otherwise add up). Its own line's indexes claim it first.
     pub max_bytes: Option<u64>,
     /// The new circuit's idle grace: an index unread that long would be
     /// released at once, so it is not rebuilt.
@@ -295,16 +295,61 @@ pub struct Selection {
     pub byte_budget: u64,
 }
 
+/// Which records are a starting SSP's own line: written by itself (an
+/// in-place re-bootstrap), by the SSP it replaces (`SPKY_SSP_REPLACES`), or by
+/// an SSP of the same `ssp-N` slot (a blue/green successor of `ssp-0` is
+/// `ssp-0-g<hex>`). With several SSPs, the others' indexes are what other
+/// clients read; [`select`] gives this line's first claim on the budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lineage {
+    ssp_id: String,
+    replaces: Option<String>,
+}
+
+impl Lineage {
+    pub fn new(ssp_id: impl Into<String>, replaces: Option<String>) -> Self {
+        Self { ssp_id: ssp_id.into(), replaces: replaces.filter(|r| !r.is_empty()) }
+    }
+
+    /// Whether the SSP `writer` wrote a record of this line.
+    pub fn owns(&self, writer: &str) -> bool {
+        if self.ssp_id.is_empty() {
+            return false;
+        }
+        writer == self.ssp_id
+            || self.replaces.as_deref() == Some(writer)
+            || slot(writer).is_some_and(|slot| Some(slot) == self::slot(&self.ssp_id))
+    }
+}
+
+/// `ssp-N` of `ssp-N` or `ssp-N-<anything>`; `None` for any other id.
+fn slot(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("ssp-")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let end = "ssp-".len() + digits;
+    match (digits, id.as_bytes().get(end)) {
+        (0, _) => None,
+        (_, None | Some(b'-')) => Some(&id[..end]),
+        _ => None,
+    }
+}
+
 /// Pick what to rebuild from every SSP's record, at `now_ms`.
 ///
 /// An index several records list counts once, as the most recently read of
 /// them. Its idle age now is what the record said plus the time since the
 /// record was written (an index in use then has been unread at most that
 /// long): an SSP that stopped writing (retired, crashed) ages out on its own.
-pub fn select(records: &[SspIndexRecord], now_ms: u64, limits: &PrebuildLimits) -> Selection {
+///
+/// The indexes of `own` line come first, most recently read first; other
+/// SSPs' records only fill what is left of the byte budget, so with several
+/// SSPs one does not spend its budget on another's indexes and skip its own.
+pub fn select(records: &[SspIndexRecord], now_ms: u64, limits: &PrebuildLimits, own: &Lineage) -> Selection {
     let mut merged: BTreeMap<(String, String), Wanted> = BTreeMap::new();
+    let mut own_keys: std::collections::BTreeSet<(String, String)> = Default::default();
     for record in records.iter().filter(|r| r.format == RECORD_FORMAT) {
         let since = now_ms.saturating_sub(record.at_ms);
+        let mine = own.owns(&record.ssp_id);
         for index in &record.indexes {
             let wanted = Wanted {
                 table: index.table.clone(),
@@ -313,8 +358,12 @@ pub fn select(records: &[SspIndexRecord], now_ms: u64, limits: &PrebuildLimits) 
                 idle: Duration::from_millis(index.idle_ms.saturating_add(since)),
                 bytes: index.bytes as u64,
             };
+            let key = (wanted.table.clone(), wanted.name.clone());
+            if mine {
+                own_keys.insert(key.clone());
+            }
             merged
-                .entry((wanted.table.clone(), wanted.name.clone()))
+                .entry(key)
                 .and_modify(|seen| {
                     if wanted.idle < seen.idle {
                         *seen = wanted.clone();
@@ -323,15 +372,20 @@ pub fn select(records: &[SspIndexRecord], now_ms: u64, limits: &PrebuildLimits) 
                 .or_insert(wanted);
         }
     }
-    let mut wanted: Vec<Wanted> = merged.into_values().collect();
-    wanted.sort_by(|a, b| a.idle.cmp(&b.idle).then_with(|| (&a.table, &a.name).cmp(&(&b.table, &b.name))));
+    let (mut first, mut rest) = (Vec::new(), Vec::new());
+    for (key, wanted) in merged {
+        if own_keys.contains(&key) { first.push(wanted) } else { rest.push(wanted) }
+    }
+    let by_recency = |a: &Wanted, b: &Wanted| a.idle.cmp(&b.idle).then_with(|| (&a.table, &a.name).cmp(&(&b.table, &b.name)));
+    first.sort_by(by_recency);
+    rest.sort_by(by_recency);
 
     let byte_budget = limits
         .max_bytes
         .unwrap_or_else(|| records.iter().map(SspIndexRecord::bytes).max().unwrap_or(0));
     let mut selection = Selection { byte_budget, ..Default::default() };
     let mut bytes = 0u64;
-    for index in wanted {
+    for index in first.into_iter().chain(rest) {
         if index.idle >= limits.idle_grace {
             selection.skipped.push((index, SkipReason::IdlePastGrace));
         } else if bytes.saturating_add(index.bytes) > byte_budget {
@@ -535,7 +589,7 @@ mod tests {
                 held("game", "idle_59m", 59 * 60_000, 100),
             ],
         )];
-        let picked = select(&records, now, &limits(3600, None));
+        let picked = select(&records, now, &limits(3600, None), &Lineage::default());
         assert_eq!(names(&picked.build), vec!["game.in_use", "game.idle_20m"], "most recently read first");
         assert_eq!(picked.build[0].idle, Duration::from_secs(120), "in use when written two minutes ago");
         assert_eq!(picked.build[1].idle, Duration::from_secs(22 * 60));
@@ -546,7 +600,7 @@ mod tests {
         )]);
         // A record nobody refreshed for a day ages out entirely.
         let stale = vec![record("ssp-old", now - 86_400_000, vec![held("game", "in_use", 0, 100)])];
-        let picked = select(&stale, now, &limits(3600, None));
+        let picked = select(&stale, now, &limits(3600, None), &Lineage::default());
         assert!(picked.build.is_empty());
         assert_eq!(picked.skipped[0].1, SkipReason::IdlePastGrace);
     }
@@ -556,13 +610,13 @@ mod tests {
         let now = 10_000_000;
         let blue = record("ssp-0", now - 30_000, vec![held("game", "white", 600_000, 50), held("game", "black", 0, 50)]);
         let retired = record("ssp-0-gold", now - 1_800_000, vec![held("game", "white", 0, 50), held("contact", "rank", 0, 20)]);
-        let picked = select(&[blue.clone(), retired.clone()], now, &limits(3600, None));
+        let picked = select(&[blue.clone(), retired.clone()], now, &limits(3600, None), &Lineage::default());
         assert_eq!(names(&picked.build), vec!["game.black", "game.white"]);
         assert_eq!(picked.build[1].idle, Duration::from_secs(630), "blue's age, newer than the retired record's 30 min");
         // Together they list 120 bytes; one SSP never held more than 100.
         assert_eq!(picked.byte_budget, 100, "the larger record's total");
         assert_eq!(picked.skipped.iter().map(|(w, r)| (w.label(), *r)).collect::<Vec<_>>(), vec![("contact.rank".to_string(), SkipReason::MemoryBudget)]);
-        let picked = select(&[blue, retired], now, &limits(3600, Some(1 << 20)));
+        let picked = select(&[blue, retired], now, &limits(3600, Some(1 << 20)), &Lineage::default());
         assert_eq!(names(&picked.build), vec!["game.black", "game.white", "contact.rank"]);
     }
 
@@ -571,15 +625,52 @@ mod tests {
         let now = 1_000_000;
         let one = record("a", now, vec![held("t", "fresh", 0, 60), held("t", "older", 1_000, 60), held("t", "small", 2_000, 30)]);
         let other = record("b", now, vec![held("t", "x", 3_000, 10)]);
-        let picked = select(&[one.clone(), other.clone()], now, &limits(3600, None));
+        let picked = select(&[one.clone(), other.clone()], now, &limits(3600, None), &Lineage::default());
         // Budget = the largest record, 150: fresh (60) + older (60) + small (30).
         assert_eq!(picked.byte_budget, 150);
         assert_eq!(names(&picked.build), vec!["t.fresh", "t.older", "t.small"]);
         assert_eq!(picked.skipped.iter().map(|(w, r)| (w.label(), *r)).collect::<Vec<_>>(), vec![("t.x".to_string(), SkipReason::MemoryBudget)]);
         // An explicit cap skips the big one that does not fit and keeps going.
-        let picked = select(&[one, other], now, &limits(3600, Some(100)));
+        let picked = select(&[one, other], now, &limits(3600, Some(100)), &Lineage::default());
         assert_eq!(names(&picked.build), vec!["t.fresh", "t.small", "t.x"]);
         assert_eq!(picked.skipped.iter().map(|(w, r)| (w.label(), *r)).collect::<Vec<_>>(), vec![("t.older".to_string(), SkipReason::MemoryBudget)]);
+    }
+
+    #[test]
+    fn select_gives_its_own_line_the_budget_first() {
+        let now = 1_000_000;
+        let ssp0 = record("ssp-0", now - 1_000, vec![held("game", "a", 0, 80), held("game", "b", 0, 80), held("game", "c", 0, 40)]);
+        let ssp1 = record("ssp-1", now - 50_000, vec![held("contact", "x", 20_000, 60), held("contact", "y", 30_000, 40)]);
+        // Read across all SSPs alike, ssp-0's fresher indexes take the whole
+        // budget (200, ssp-0's total) and ssp-1's own are skipped.
+        let mixed = select(&[ssp0.clone(), ssp1.clone()], now, &limits(3600, None), &Lineage::default());
+        assert_eq!(names(&mixed.build), vec!["game.a", "game.b", "game.c"]);
+        // ssp-1's blue/green successor: its own line first, ssp-0's records
+        // only fill what is left.
+        let own = Lineage::new("ssp-1-g7", Some("ssp-1".into()));
+        let picked = select(&[ssp0, ssp1], now, &limits(3600, None), &own);
+        assert_eq!(names(&picked.build), vec!["contact.x", "contact.y", "game.a"]);
+        assert_eq!(
+            picked.skipped.iter().map(|(w, r)| (w.label(), *r)).collect::<Vec<_>>(),
+            vec![("game.b".to_string(), SkipReason::MemoryBudget), ("game.c".to_string(), SkipReason::MemoryBudget)]
+        );
+    }
+
+    #[test]
+    fn a_lineage_is_the_ssp_itself_the_one_it_replaces_and_its_slot() {
+        let own = Lineage::new("ssp-0-gab12", Some("custom-blue".into()));
+        for writer in ["ssp-0-gab12", "custom-blue", "ssp-0", "ssp-0-g99"] {
+            assert!(own.owns(writer), "{writer}");
+        }
+        for writer in ["ssp-1", "ssp-01", "ssp-10-g1", "other", ""] {
+            assert!(!own.owns(writer), "{writer}");
+        }
+        // A generated `ssp-<uuid>` id has no slot: only itself.
+        let uuid = Lineage::new("ssp-550e8400-e29b", None);
+        assert!(uuid.owns("ssp-550e8400-e29b"));
+        assert!(!uuid.owns("ssp-550e8400-ffff"));
+        assert!(!uuid.owns("ssp-550"));
+        assert!(!Lineage::default().owns(""), "no id, no own line");
     }
 
     #[test]
@@ -587,9 +678,9 @@ mod tests {
         let now = 1_000_000;
         let mut future = record("a", now, vec![held("t", "i", 0, 1)]);
         future.format = RECORD_FORMAT + 1;
-        assert!(select(&[future], now, &limits(3600, None)).build.is_empty());
+        assert!(select(&[future], now, &limits(3600, None), &Lineage::default()).build.is_empty());
         let current = record("a", now - 1, vec![held("t", "i", 0, 1)]);
-        assert!(select(&[current], now, &limits(0, None)).build.is_empty(), "grace 0: nothing outlives its reader");
+        assert!(select(&[current], now, &limits(0, None), &Lineage::default()).build.is_empty(), "grace 0: nothing outlives its reader");
     }
 
     #[test]

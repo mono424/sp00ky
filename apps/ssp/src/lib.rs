@@ -1409,6 +1409,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         replaces: ReplacesClaim::new(std::env::var("SPKY_SSP_REPLACES").ok()),
         rebootstrap: tokio::sync::Mutex::new(()),
         background_prebuild: Arc::clone(&background_prebuild),
+        lineage: ssp_node::index_memory::Lineage::new(config.ssp_id.clone(), std::env::var("SPKY_SSP_REPLACES").ok()),
     });
 
     // Spawn self-bootstrap task (runs while server is already accepting /health requests)
@@ -1776,6 +1777,9 @@ struct ClusterBoot {
     rebootstrap: tokio::sync::Mutex<()>,
     /// The index prebuild of an SSP that serves while it runs.
     background_prebuild: Arc<BackgroundPrebuild>,
+    /// Whose index records are this SSP's own line (its id, the SSP it
+    /// replaces, its `ssp-N` slot).
+    lineage: ssp_node::index_memory::Lineage,
 }
 
 /// What an SSP claims to replace when it registers (`SPKY_SSP_REPLACES`):
@@ -2104,7 +2108,7 @@ impl ClusterBoot {
                     // other SSP goes Ready first and does it in the
                     // background (below), so no restart waits for it.
                     if standby {
-                        prebuild_held_indexes(node.platform.db.as_ref(), processor, row_checkpoints.as_deref()).await;
+                        prebuild_held_indexes(node.platform.db.as_ref(), processor, row_checkpoints.as_deref(), &self.lineage).await;
                     }
                     let republish_started = std::time::Instant::now();
                     if let Err(e) = node.republish_restored_views().await {
@@ -2124,6 +2128,7 @@ impl ClusterBoot {
                             Arc::clone(processor),
                             Arc::clone(status),
                             row_checkpoints.clone(),
+                            self.lineage.clone(),
                         );
                     }
                     if standby {
@@ -2170,6 +2175,7 @@ async fn held_index_plan(
     db: &dyn ssp_node::ports::Db,
     processor: &RwLock<Circuit>,
     rows: Option<&warm::RowCheckpoints>,
+    own: &ssp_node::index_memory::Lineage,
 ) -> Option<HeldIndexPlan> {
     use ssp_node::index_memory;
     let grace = processor.read().await.index_idle_release();
@@ -2187,7 +2193,7 @@ async fn held_index_plan(
     };
     if !records.is_empty() {
         return Some(HeldIndexPlan {
-            selection: index_memory::select(&records, ssp_node::now_epoch_ms(), &limits),
+            selection: index_memory::select(&records, ssp_node::now_epoch_ms(), &limits, own),
             time: limits.time,
             source: "database",
             records: records.len(),
@@ -2228,8 +2234,9 @@ async fn prebuild_held_indexes(
     db: &dyn ssp_node::ports::Db,
     processor: &RwLock<Circuit>,
     rows: Option<&warm::RowCheckpoints>,
+    own: &ssp_node::index_memory::Lineage,
 ) {
-    let Some(mut plan) = held_index_plan(db, processor, rows).await else { return };
+    let Some(mut plan) = held_index_plan(db, processor, rows, own).await else { return };
     let selection = std::mem::take(&mut plan.selection);
     let budget_mb = selection.byte_budget / (1024 * 1024);
     let report = ssp_node::index_memory::prebuild(processor, selection, plan.time).await;
@@ -2269,6 +2276,7 @@ impl BackgroundPrebuild {
         processor: Arc<RwLock<Circuit>>,
         status: Arc<RwLock<SspStatus>>,
         rows: Option<Arc<warm::RowCheckpoints>>,
+        own: ssp_node::index_memory::Lineage,
     ) {
         let stop = Arc::new(AtomicBool::new(false));
         let step = self.step;
@@ -2279,7 +2287,7 @@ impl BackgroundPrebuild {
                 let should_stop = || {
                     stop.load(Ordering::SeqCst) || status.try_read().is_ok_and(|s| *s != SspStatus::Ready)
                 };
-                let Some(mut plan) = held_index_plan(db.as_ref(), &processor, rows.as_deref()).await else { return };
+                let Some(mut plan) = held_index_plan(db.as_ref(), &processor, rows.as_deref(), &own).await else { return };
                 let selection = std::mem::take(&mut plan.selection);
                 let budget_mb = selection.byte_budget / (1024 * 1024);
                 let report = ssp_node::index_memory::prebuild_in_background(
@@ -2482,7 +2490,7 @@ mod background_prebuild_tests {
         let status = Arc::new(RwLock::new(SspStatus::Ready));
         let background = BackgroundPrebuild::default();
         let started = Instant::now();
-        background.start(Arc::new(FakeDb(None)), Arc::clone(&processor), Arc::clone(&status), None);
+        background.start(Arc::new(FakeDb(None)), Arc::clone(&processor), Arc::clone(&status), None, ssp_node::index_memory::Lineage::new("ssp-0", None));
         assert!(started.elapsed() < Duration::from_millis(50), "{:?}", started.elapsed());
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(rows_held(&processor), 0, "still waiting on the database");
@@ -2500,7 +2508,7 @@ mod background_prebuild_tests {
         let processor = circuit();
         let status = Arc::new(RwLock::new(SspStatus::Ready));
         let background = BackgroundPrebuild::default();
-        background.start(Arc::new(records()), Arc::clone(&processor), Arc::clone(&status), None);
+        background.start(Arc::new(records()), Arc::clone(&processor), Arc::clone(&status), None, ssp_node::index_memory::Lineage::new("ssp-0", None));
         assert_eq!(rows_held(&processor), 0, "nothing built before the caller moves on");
         let mut writes = 0;
         while rows_held(&processor) < ROWS {
@@ -2525,7 +2533,7 @@ mod background_prebuild_tests {
         let status = Arc::new(RwLock::new(SspStatus::Ready));
         // 512-row steps: 40 of them for this table.
         let background = BackgroundPrebuild { step: Duration::ZERO, ..Default::default() };
-        background.start(Arc::new(records()), Arc::clone(&processor), Arc::clone(&status), None);
+        background.start(Arc::new(records()), Arc::clone(&processor), Arc::clone(&status), None, ssp_node::index_memory::Lineage::new("ssp-0", None));
         // Take the circuit between two steps (the write lock queues the
         // prebuild's next read behind it) and leave Ready there. From a
         // spawned task: the test body itself is only polled every ~60 polls
@@ -2576,7 +2584,7 @@ mod background_prebuild_tests {
         let processor = circuit();
         let status = Arc::new(RwLock::new(SspStatus::Ready));
         let background = BackgroundPrebuild::default();
-        background.start(Arc::new(FakeDb(None)), Arc::clone(&processor), Arc::clone(&status), None);
+        background.start(Arc::new(FakeDb(None)), Arc::clone(&processor), Arc::clone(&status), None, ssp_node::index_memory::Lineage::new("ssp-0", None));
         let recorder = Arc::new(ssp_node::index_memory::IndexRecorder::new("ssp-0"));
         let hung: Arc<dyn Db> = Arc::new(FakeDb(None));
         let started = Instant::now();
@@ -2612,7 +2620,7 @@ mod background_prebuild_tests {
         let processor = circuit();
         let status = Arc::new(RwLock::new(SspStatus::Ready));
         let background = BackgroundPrebuild::default();
-        background.start(Arc::new(FakeDb(Some(json!([])))), Arc::clone(&processor), status, Some(rows));
+        background.start(Arc::new(FakeDb(Some(json!([])))), Arc::clone(&processor), status, Some(rows), ssp_node::index_memory::Lineage::new("ssp-0", None));
         assert_eq!(rows_held(&processor), 0);
         until("the local index", || rows_held(&processor) == ROWS).await;
         background.stop().await;

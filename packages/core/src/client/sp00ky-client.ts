@@ -39,8 +39,10 @@ import type { FeatureFlagOptions, FeatureFlagOverride } from '../modules/feature
 import { AppReleaseModule, AppReleaseHandle } from '../modules/app-release/index';
 import type { AppReleaseOptions } from '../modules/app-release/index';
 import { WebPushModule } from '../modules/web-push/index';
-import { ChannelManager, type ChannelHandle } from '../modules/channel/index';
+import { ChannelManager, type ChannelHandle, type ChannelState, type ChannelTransportFactory } from '../modules/channel/index';
 import { surrealSignal, webrtcTransport } from '../modules/channel/webrtc';
+import { roomLink, splitTransport } from '../modules/channel/room';
+import { hubTransport } from '../modules/channel/hub';
 import { DevToolsService } from '../modules/devtools/index';
 import type { DevToolsQuerySource } from '../modules/devtools/index';
 import { parseQueryParams, generateId } from '../utils/index';
@@ -187,6 +189,30 @@ export class Sp00kyClient<S extends SchemaStructure> {
     this.disposers.push(this.webPush.attach());
 
     const channelsConfig = config.channels;
+    const relay = typeof channelsConfig?.relay === 'string' ? { url: channelsConfig.relay } : channelsConfig?.relay;
+    // Between users: a WebRTC link per pair of tabs, signaled through the database.
+    const mesh: ChannelTransportFactory = (hooks) =>
+      webrtcTransport(hooks, {
+        signal: surrealSignal(s.remote, s.connectionSupervisor, s.logger),
+        iceServers: channelsConfig?.iceServers,
+        logger: s.logger,
+      });
+    // Between the user's own devices: one link per browser to their room on the relay.
+    const room: ChannelTransportFactory | null = relay
+      ? (hooks) =>
+          hubTransport(hooks, {
+            scope: (user) => `${config.database.namespace}/${config.database.database}/${user}`,
+            link: (linkHooks) =>
+              roomLink(linkHooks, {
+                url: relay.url,
+                direct: relay.direct,
+                token: () => s.remote.getAuthToken(),
+                iceServers: channelsConfig?.iceServers,
+                logger: s.logger,
+              }),
+            logger: s.logger,
+          })
+      : null;
     this.channels = new ChannelManager(config.schema, {
       config: channelsConfig,
       logger: s.logger,
@@ -195,15 +221,14 @@ export class Sp00kyClient<S extends SchemaStructure> {
         delete: (_table, id, ttlMs) => this.runtime.run(peerDelete(this.env, { recordId: id, ttlMs })),
         read: (id) => this.runtime.run(readRow(id)),
       },
-      transport:
-        channelsConfig?.transport ??
-        ((hooks) =>
-          webrtcTransport(hooks, {
-            signal: surrealSignal(s.remote, s.connectionSupervisor, s.logger),
-            iceServers: channelsConfig?.iceServers,
-            logger: s.logger,
-          })),
+      transport: channelsConfig?.transport ?? splitTransport(room, mesh),
     });
+    if (this.channels.sharing && !relay && !channelsConfig?.transport) {
+      s.logger.warn(
+        { Category: 'sp00ky-client::channel' },
+        'channels.share is set without channels.relay: nothing reaches your other devices until a relay address is given'
+      );
+    }
     if (this.channels.enabled) this.disposers.push(s.auth.subscribe((userId) => this.channels.setUser(userId)));
 
     const querySource: DevToolsQuerySource = {
@@ -442,7 +467,10 @@ export class Sp00kyClient<S extends SchemaStructure> {
     if (!this.channels.enabled) return this.runtime.subscribe(queryHash, callback, options);
     // Channel values (peer updates, ephemeral fields) are folded into what
     // subscribers see, never into the store.
-    const tap = this.channels.tap(callback);
+    // With `channels.share`, the user's other devices are told what this
+    // query can show, and only send what it has a use for.
+    const def = this.channels.sharing ? this.runtime.state.queries.get(queryHash)?.def : undefined;
+    const tap = this.channels.tap(callback, def ? this.channels.interestOf(def.plan, def.params) : null);
     const stop = this.runtime.subscribe(queryHash, tap.feed, options);
     return () => {
       stop();
@@ -478,6 +506,21 @@ export class Sp00kyClient<S extends SchemaStructure> {
       create: (id, data) => this.writeCreate(id, data as Record<string, unknown>, scoped(id.slice(0, id.indexOf(':')))) as never,
       delete: (table, id) => this.writeDelete(table, id, scoped(table)),
     };
+  }
+
+  /**
+   * The link to this user's other devices (`channels.share`): `connected`
+   * with the user's id in `peers` while at least one other tab of theirs, in
+   * another browser, is in the room. `idle` when nothing is shared or nobody
+   * is signed in.
+   */
+  shareState(): ChannelState {
+    return this.channels.ownState();
+  }
+
+  /** Called at once with `shareState()`, then on every change. */
+  subscribeShareState(callback: (state: ChannelState) => void): () => void {
+    return this.channels.subscribeOwn(callback);
   }
 
   private channelScopes(queries: ChannelQuery<S, any> | ReadonlyArray<ChannelQuery<S, any>>) {

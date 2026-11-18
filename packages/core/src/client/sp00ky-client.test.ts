@@ -6,6 +6,7 @@ import { fakeAdapters } from '../testing/adapters';
 import { fakeServiceBundle } from '../testing/fake-services';
 import { defaultEnv } from '../query/env';
 import type { StatementResult } from '../kernel/effects';
+import { FakeRelay, settle } from '../modules/channel/rooms.fixture';
 
 const schema = { tables: [{ name: 'thing', columns: { a: {} } }], backends: { api: { outboxTable: 'thing', routes: { go: { args: {} } } } } } as any;
 const config = { database: { namespace: 'n', database: 'd' }, schema, schemaSurql: '', logLevel: 'silent' } as any;
@@ -365,7 +366,7 @@ describe('Sp00kyClient facade (channels)', () => {
     });
     const runtime = new Runtime({ env: defaultEnv(chSchema, { materializeDebounceMs: 1 }), adapters: a.adapters, logger: services.logger, tabId: 'tab-test' });
     const client = new Sp00kyClient<any>({ ...config, schema: chSchema, channels } as any, { services, runtime });
-    return { client, runtime };
+    return { client, runtime, services };
   }
 
   it('opens a channel, keeps ephemeral fields out of writes, scopes its own writes, and wires peer rows to the runtime', async () => {
@@ -423,6 +424,68 @@ describe('Sp00kyClient facade (channels)', () => {
     const ch = client.channel((client.query('room', {} as any) as any).build(), ['user:b']);
     expect(ch.state().status).toBe('unsupported');
     ch.close();
+    await client.close();
+  });
+
+  it('shares writes with the user\'s other devices through the room relay', async () => {
+    const relay = new FakeRelay();
+    const g = globalThis as { WebSocket?: unknown };
+    const before = g.WebSocket;
+    g.WebSocket = relay.WebSocket;
+    try {
+      const channels = { relay: 'ws://relay.test/room', share: { tables: { room: true } } };
+      const phone = channelClient(channels);
+      const laptop = channelClient({ ...channels, relay: { url: 'ws://relay.test/room', direct: false } });
+      for (const device of [phone, laptop]) {
+        (device.services.remote as any).getAuthToken = () => 't-a';
+        await device.client.init();
+        (device.client as any).channels.setUser('user:a');
+      }
+      const states: string[] = [];
+      const stopStates = phone.client.subscribeShareState((s) => states.push(s.status));
+      await settle();
+      // One socket each, signed in with the session token, in the room of their user.
+      expect(relay.sockets.map((sock) => sock.sent[0])).toEqual([
+        expect.objectContaining({ t: 'hello', v: 1, token: 't-a' }),
+        expect.objectContaining({ t: 'hello', v: 1, token: 't-a' }),
+      ]);
+      expect([...relay.rooms.keys()]).toEqual(['user:a']);
+      expect(phone.client.shareState()).toEqual({ status: 'connected', peers: ['user:a'] });
+      expect(states).toEqual(['connecting', 'connected']);
+
+      // The laptop shows nothing of the table yet: the write stays on the phone.
+      const ops = () => relay.sockets[0].sent.filter((f) => f.t === 'msg' && (f.d as any)?.m?.m?.t === 'op');
+      await phone.client.update('room', 'room:1', { a: 7 });
+      await settle();
+      expect(ops()).toEqual([]);
+
+      // Once a query on it is mounted there, the next write goes out.
+      const { hash } = await (laptop.client.query('room', {} as any) as any).build().run();
+      const stop = await laptop.client.subscribe(hash, () => {}, { immediate: true });
+      await settle();
+      await phone.client.update('room', 'room:1', { a: 8 });
+      await settle();
+      expect(ops().map((f) => (f.d as any).m.m)).toEqual([expect.objectContaining({ t: 'op', table: 'room', id: 'room:1', patch: { a: 8 } })]);
+      stop();
+      stopStates();
+      await phone.client.close();
+      await laptop.client.close();
+      await settle();
+      expect(relay.rooms.size).toBe(0);
+    } finally {
+      g.WebSocket = before;
+    }
+  });
+
+  it('says so when sharing is asked for without a relay', async () => {
+    const services = fakeServiceBundle<any>();
+    const warned: string[] = [];
+    (services.logger as any).warn = (_fields: unknown, msg: string) => warned.push(msg);
+    const a = fakeAdapters({ services: { 'hint.read': () => 'u1', 'local.usesSurqlSchema': () => false, 'auth.restoreSession': async () => null, 'auth.sessionAuthId': () => null, 'remote.connect': () => new Promise(() => {}) } });
+    const runtime = new Runtime({ env: defaultEnv(chSchema, { materializeDebounceMs: 1 }), adapters: a.adapters, logger: services.logger, tabId: 'tab-test' });
+    const client = new Sp00kyClient<any>({ ...config, schema: chSchema, channels: { share: { tables: { room: true } } } } as any, { services, runtime });
+    expect(warned.filter((m) => m.includes('channels.relay'))).toHaveLength(1);
+    expect(client.shareState().status).toBe('idle');
     await client.close();
   });
 });

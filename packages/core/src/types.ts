@@ -318,6 +318,11 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
    * apply. `iceServers` configures the default WebRTC transport (a public
    * STUN server when omitted; add TURN for networks that block direct
    * connections), `transport` replaces it.
+   *
+   * `share` sends this user's optimistic writes straight to their other
+   * devices, per table (`share: { tables: { game: true, note: (row) =>
+   * !row.draft } }`), through the room relay named by `relay` (the
+   * `sp00ky-relay` server, one socket per browser). Off unless set.
    */
   channels?: ChannelsConfig;
   /**

@@ -108,11 +108,40 @@ export interface ChannelTransport {
   readonly supported: boolean;
   /** Users this tab wants connections to: the union over open channels. */
   want(users: ReadonlySet<string>): void;
-  send(to: PeerRef, message: ChannelMessage): void;
+  send(to: PeerRef, message: ChannelWire): void;
   close(): void;
 }
 
 export type ChannelTransportFactory = (hooks: TransportHooks) => ChannelTransport;
+
+/** Which rows of a table are shared: all of them, or the ones a test passes. */
+export type ChannelShareRule = boolean | ((row: Row) => boolean);
+
+/**
+ * Sharing optimistic writes with the user's own other devices (see
+ * `ChannelsConfig.share`). Needs `ChannelsConfig.relay`.
+ */
+export interface ChannelShareConfig {
+  /**
+   * Per table: `true` shares every row, a function only the rows it returns
+   * true for (asked on the device that writes, and again on the one that
+   * receives). A table left out, or set to `false`, is never shared. The
+   * table needs no `-- @channel` mark: these writes only ever reach devices
+   * signed in as the same user.
+   */
+  tables: Record<string, ChannelShareRule>;
+}
+
+/** Where the room relay (`sp00ky-relay`) is, and how to use it. */
+export interface ChannelRelayConfig {
+  /** Its WebSocket address, e.g. `wss://relay.example.com/room`. */
+  url: string;
+  /**
+   * Two browsers alone in a room also open a direct WebRTC link and talk over
+   * that while it is up. `false` keeps everything on the relay. Default true.
+   */
+  direct?: boolean;
+}
 
 export interface ChannelsConfig {
   /**
@@ -128,6 +157,18 @@ export interface ChannelsConfig {
   transport?: ChannelTransportFactory;
   /** How long a peer's persistent value shows without the server confirming it. Default 5000. */
   confirmTimeoutMs?: number;
+  /**
+   * The room relay this user's devices meet on: its address, or an object
+   * with more. One socket per browser, whatever the number of tabs.
+   */
+  relay?: string | ChannelRelayConfig;
+  /**
+   * Send this user's optimistic writes straight to their other devices, so a
+   * change made on the phone shows on the laptop before the server has seen
+   * it. Off unless set, and per table. The devices tell each other which
+   * rows their open queries can show, and a write nobody shows is not sent.
+   */
+  share?: ChannelShareConfig;
 }
 
 // ---- pure helpers ----------------------------------------------------------------
@@ -363,6 +404,8 @@ export function peerUsers(peers: Iterable<unknown>, self: string | null): Set<st
 export interface ChannelScope {
   readonly table: string;
   readonly where: ReadonlyArray<WhereNode>;
+  /** A further test on the row (a share rule given as a function). */
+  readonly test?: (row: Row) => boolean;
 }
 
 const OPS: Record<string, (a: unknown, b: unknown) => boolean> = {
@@ -481,6 +524,190 @@ export function compileScope(schema: SchemaStructure, plan: QueryPlan): ChannelS
   return { table: plan.table, where };
 }
 
+// ---- interest: what a device's open queries can show -------------------------------
+
+/** One query's claim on a table: the rows its filter passes, or (`null`) all of them. */
+export interface QueryInterest {
+  readonly table: string;
+  readonly where: ReadonlyArray<WhereNode> | null;
+}
+
+/** Per table: `true` for every row, else the filters of the queries on it. A table left out shows nothing. */
+export type Interest = Readonly<Record<string, true | ReadonlyArray<ReadonlyArray<WhereNode>>>>;
+
+/**
+ * A device telling its user's other devices what it shows, so they do not
+ * send it writes it has no use for. `all`: everything (it could not say more).
+ * Only ever exchanged between devices of one user.
+ */
+export interface InterestMessage {
+  readonly t: 'interest';
+  readonly all?: true;
+  /** Per table `true` or a list of filters, their values wire-encoded (see `encodeValue`). */
+  readonly v?: Record<string, unknown>;
+}
+
+/** Everything a transport carries. */
+export type ChannelWire = ChannelMessage | InterestMessage;
+
+/** Past this many filters on one table a device just asks for all of it: the message stays small. */
+const MAX_INTEREST_FILTERS = 24;
+
+const knownOp = (op: unknown): op is string => typeof op === 'string' && Object.prototype.hasOwnProperty.call(OPS, op);
+
+/**
+ * A `where` as a test the row alone decides, parameters filled in. `null`
+ * when it cannot be one (an operator this file does not evaluate, a path
+ * through a record link, a parameter without a value): then the query counts
+ * as showing the whole table, which only costs a few messages too many.
+ */
+function rowFilter(
+  columns: Record<string, ColumnSchema> | undefined,
+  where: ReadonlyArray<WhereNode>,
+  params: Readonly<Record<string, unknown>>
+): WhereNode[] | null {
+  const out: WhereNode[] = [];
+  for (const node of where) {
+    const resolved: WhereComparison[] = [];
+    for (const c of 'or' in node ? node.or : [node]) {
+      if (!knownOp(c.op)) return null;
+      if (c.field.includes('.') && columns?.[c.field.split('.')[0]]?.recordId) return null;
+      let value = c.value;
+      if (value === undefined && c.paramRef) {
+        if (!(c.paramRef in params)) return null;
+        value = params[c.paramRef];
+      }
+      resolved.push(c.swap ? { field: c.field, op: c.op, value, swap: true } : { field: c.field, op: c.op, value });
+    }
+    out.push('or' in node ? { or: resolved } : resolved[0]);
+  }
+  return out;
+}
+
+/**
+ * What a registered query can show: the rows of its own table that pass its
+ * filter, and every row of the tables it reads through `.related()` (which
+ * children it shows depends on the parents, not on the child row alone).
+ * Order, limit and offset are ignored: a row inside the filter and outside
+ * the window is sent and then not shown.
+ */
+export function queryInterest(
+  columnsOf: (table: string) => Record<string, ColumnSchema> | undefined,
+  plan: QueryPlan,
+  params: Readonly<Record<string, unknown>> = {}
+): QueryInterest[] {
+  const out: QueryInterest[] = [{ table: plan.table, where: plan.ids ? null : rowFilter(columnsOf(plan.table), plan.where ?? [], params) }];
+  const walk = (relations: QueryPlan['relations']): void => {
+    for (const r of relations ?? []) {
+      out.push({ table: r.table, where: null });
+      walk(r.relations);
+    }
+  };
+  walk(plan.relations);
+  return out;
+}
+
+/**
+ * The interests of every open subscription as one, for the tables `shared`
+ * names. `'all'` once one of them is unknown. Each filter once and in a fixed
+ * order, so the same set of queries always reads the same.
+ */
+export function mergeInterest(list: Iterable<ReadonlyArray<QueryInterest> | null>, shared: (table: string) => boolean): Interest | 'all' {
+  const tables = new Map<string, true | Map<string, ReadonlyArray<WhereNode>>>();
+  for (const queries of list) {
+    if (queries === null) return 'all';
+    for (const q of queries) {
+      if (!shared(q.table)) continue;
+      const cur = tables.get(q.table);
+      if (cur === true) continue;
+      if (q.where === null || q.where.length === 0) {
+        tables.set(q.table, true);
+        continue;
+      }
+      const filters = cur ?? new Map<string, ReadonlyArray<WhereNode>>();
+      filters.set(JSON.stringify(encodeWhere(q.where)), q.where);
+      tables.set(q.table, filters.size > MAX_INTEREST_FILTERS ? true : filters);
+    }
+  }
+  const out: Record<string, true | ReadonlyArray<WhereNode>[]> = {};
+  for (const [table, filters] of [...tables].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    out[table] = filters === true ? true : [...filters].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, where]) => where);
+  }
+  return out;
+}
+
+const encodeComparison = (c: WhereComparison): unknown =>
+  c.swap ? { field: c.field, op: c.op, value: encodeValue(c.value), swap: true } : { field: c.field, op: c.op, value: encodeValue(c.value) };
+
+function encodeWhere(where: ReadonlyArray<WhereNode>): unknown[] {
+  return where.map((n) => ('or' in n ? { or: n.or.map(encodeComparison) } : encodeComparison(n)));
+}
+
+export function encodeInterest(interest: Interest | 'all'): InterestMessage {
+  if (interest === 'all') return { t: 'interest', all: true };
+  const v: Record<string, unknown> = {};
+  for (const [table, filters] of Object.entries(interest)) {
+    v[table] = filters === true ? true : filters.map(encodeWhere);
+  }
+  return { t: 'interest', v };
+}
+
+function decodeComparison(raw: unknown): WhereComparison | null {
+  if (raw === null || typeof raw !== 'object') return null;
+  const c = raw as Record<string, unknown>;
+  if (typeof c.field !== 'string' || !knownOp(c.op)) return null;
+  return c.swap === true ? { field: c.field, op: c.op, value: decodeValue(c.value), swap: true } : { field: c.field, op: c.op, value: decodeValue(c.value) };
+}
+
+/**
+ * A peer's interest message, or `null` when it is not one. A filter this
+ * side cannot read turns its table into "all of it": never into less than
+ * the peer asked for.
+ */
+export function decodeInterest(raw: unknown): Interest | 'all' | null {
+  if (raw === null || typeof raw !== 'object' || (raw as { t?: unknown }).t !== 'interest') return null;
+  const m = raw as { all?: unknown; v?: unknown };
+  if (m.all === true) return 'all';
+  if (m.v === null || typeof m.v !== 'object' || Array.isArray(m.v)) return null;
+  const out: Record<string, true | WhereNode[][]> = {};
+  for (const [table, filters] of Object.entries(m.v as Record<string, unknown>)) {
+    if (!Array.isArray(filters)) {
+      if (filters === true) out[table] = true;
+      continue;
+    }
+    const decoded: WhereNode[][] = [];
+    let readable = filters.length <= MAX_INTEREST_FILTERS;
+    for (const where of readable ? filters : []) {
+      if (!Array.isArray(where)) {
+        readable = false;
+        break;
+      }
+      const nodes: WhereNode[] = [];
+      for (const n of where) {
+        const group = n !== null && typeof n === 'object' && Array.isArray((n as { or?: unknown }).or) ? (n as { or: unknown[] }).or : null;
+        const list = (group ?? [n]).map(decodeComparison);
+        if (list.includes(null) || list.length === 0) {
+          readable = false;
+          break;
+        }
+        nodes.push(group ? { or: list as WhereComparison[] } : (list[0] as WhereComparison));
+      }
+      if (!readable) break;
+      decoded.push(nodes);
+    }
+    out[table] = readable ? decoded : true;
+  }
+  return out;
+}
+
+/** Whether a device with this interest can show one of `rows` (a row before and after a write) of `table`. */
+export function showsRow(interest: Interest | 'all', table: string, rows: ReadonlyArray<Row>): boolean {
+  if (interest === 'all') return true;
+  const filters = interest[table];
+  if (filters === undefined) return false;
+  return filters === true || filters.some((where) => rows.some((r) => matchesWhere(where, r)));
+}
+
 // ---- manager ---------------------------------------------------------------------
 
 interface Tap {
@@ -488,6 +715,8 @@ interface Tap {
   raw: Row[] | null;
   /** Every record id in `raw`, computed on first need. */
   ids: Set<string> | null;
+  /** What its query can show, or null when nobody said. */
+  readonly interest: ReadonlyArray<QueryInterest> | null;
 }
 
 interface Channel {
@@ -498,6 +727,8 @@ interface Channel {
   readonly listeners: Set<(s: ChannelState) => void>;
   state: ChannelState;
   closed: boolean;
+  /** The one channel to the user's own other devices (`channels.share`): its only user is whoever is signed in. */
+  readonly own?: boolean;
 }
 
 /** An open channel. `client.channel(...)` wraps it with scoped writes. */
@@ -554,6 +785,14 @@ export class ChannelManager {
   /** Unused-argument warnings already given, so a reactive query does not repeat them. */
   private readonly warnedUnused = new Set<string>();
   private readonly peerId = randomPeerId();
+  /** `channels.share`: the rule per shared table, and the channel that carries them to the user's own devices. */
+  private readonly shared = new Map<string, ChannelShareRule>();
+  private readonly ownChannel: Channel | null = null;
+  /** What each of the user's other tabs said it shows, by `peerKey`. A tab that said nothing gets everything. */
+  private readonly interest = new Map<string, Interest | 'all'>();
+  /** The interest message last sent, so an unchanged one is not sent again. */
+  private announced: string | null = null;
+  private announcing = false;
   private user: string | null = null;
   private clock: Hlc;
   private transport: ChannelTransport | null = null;
@@ -567,16 +806,62 @@ export class ChannelManager {
     private readonly deps: ChannelManagerDeps = {}
   ) {
     this.schema = schema;
-    this.tables = new Map(schema.tables.map((t) => [t.name, { columns: t.columns, channel: t.channel === true }]));
+    for (const [table, rule] of Object.entries(deps.config?.share?.tables ?? {})) {
+      if (rule === false || rule === undefined) continue;
+      if (!schema.tables.some((t) => t.name === table)) {
+        deps.logger?.warn({ table, Category: 'sp00ky-client::channel' }, `channels.share names '${table}', which is not a table of the schema`);
+        continue;
+      }
+      this.shared.set(table, rule);
+    }
+    // A shared table takes peer writes like a `@channel` one. It needs no mark
+    // in the schema: its writes only reach devices of the same user.
+    this.tables = new Map(schema.tables.map((t) => [t.name, { columns: t.columns, channel: t.channel === true || this.shared.has(t.name) }]));
     this.now = deps.now ?? Date.now;
     this.confirmMs = Math.max(0, deps.config?.confirmTimeoutMs ?? 5000);
     this.clock = [0, 0, this.peerId];
+    if (this.shared.size > 0) {
+      this.ownChannel = {
+        scopes: [...this.shared].map(([table, rule]) => (typeof rule === 'function' ? { table, where: [], test: safeTest(rule) } : { table, where: [] })),
+        listed: [],
+        users: new Set(),
+        listeners: new Set(),
+        state: { status: 'idle', peers: [] },
+        closed: false,
+        own: true,
+      };
+      this.channels.add(this.ownChannel);
+    }
   }
 
-  /** True when any table is a channel table; otherwise the client skips all of this. */
+  /** True when any table is a channel table or shared; otherwise the client skips all of this. */
   get enabled(): boolean {
     for (const t of this.tables.values()) if (t.channel) return true;
     return false;
+  }
+
+  /** Whether the user's own devices are part of this (`channels.share` names a table). */
+  get sharing(): boolean {
+    return this.ownChannel !== null;
+  }
+
+  /** How the user's own devices are doing (`channels.share`): `idle` when nothing is shared or nobody is signed in. */
+  ownState(): ChannelState {
+    return this.ownChannel?.state ?? { status: 'idle', peers: [] };
+  }
+
+  /** Called at once with the state of the link to the user's own devices, then on every change. */
+  subscribeOwn(cb: (s: ChannelState) => void): () => void {
+    const ch = this.ownChannel;
+    cb(this.ownState());
+    if (!ch) return () => {};
+    ch.listeners.add(cb);
+    return () => void ch.listeners.delete(cb);
+  }
+
+  /** What a registered query can show, as `tap` takes it. */
+  interestOf(plan: QueryPlan | undefined, params?: Readonly<Record<string, unknown>>): QueryInterest[] | null {
+    return plan ? queryInterest((table) => this.tables.get(table)?.columns, plan, params) : null;
   }
 
   /** The signed-in user changed: peers, their values and the transport start over. */
@@ -587,9 +872,11 @@ export class ChannelManager {
     this.transport = null;
     this.connected.clear();
     this.userStatus.clear();
+    this.interest.clear();
+    this.announced = null;
     const touched = new Set(this.overlay.keys());
     this.overlay.clear();
-    for (const ch of this.channels) ch.users = peerUsers(ch.listed, user);
+    for (const ch of this.channels) ch.users = ch.own ? new Set(user ? [user] : []) : peerUsers(ch.listed, user);
     this.syncWanted();
     this.emitFor(touched);
     this.notifyAll();
@@ -675,9 +962,10 @@ export class ChannelManager {
    * Follow a subscription: `feed` it the raw rows, and `cb` gets them with
    * the overlay folded in, again whenever the overlay changes for its rows.
    */
-  tap(cb: (rows: Row[]) => void): { feed: (rows: Row[]) => void; stop: () => void } {
-    const tap: Tap = { cb, raw: null, ids: null };
+  tap(cb: (rows: Row[]) => void, interest: ReadonlyArray<QueryInterest> | null = null): { feed: (rows: Row[]) => void; stop: () => void } {
+    const tap: Tap = { cb, raw: null, ids: null, interest };
     this.taps.add(tap);
+    this.announceSoon();
     return {
       feed: (rows) => {
         tap.raw = rows;
@@ -685,7 +973,7 @@ export class ChannelManager {
         this.emit(tap);
       },
       stop: () => {
-        this.taps.delete(tap);
+        if (this.taps.delete(tap)) this.announceSoon();
       },
     };
   }
@@ -729,7 +1017,8 @@ export class ChannelManager {
     // out of a channel's filter still reaches its peers.
     void this.rowFor(rid).then((row) => {
       const after = { ...(row ?? { id: rid }), ...patch };
-      this.send(this.targets(table, row ? [row, after] : [after], scope), table, rid, patch, hlc, 'update');
+      const rows = row ? [row, after] : [after];
+      this.send(this.targets(table, rows, scope), table, rid, patch, hlc, 'update', rows);
     });
   }
 
@@ -750,7 +1039,8 @@ export class ChannelManager {
       this.overlay.set(rid, map);
       this.emitFor(new Set([rid]));
     }
-    this.send(this.targets(table, [{ ...full, id: rid }], scope), table, rid, full, hlc, 'create');
+    const rows = [{ ...full, id: rid }];
+    this.send(this.targets(table, rows, scope), table, rid, full, hlc, 'create', rows);
   }
 
   /**
@@ -763,13 +1053,14 @@ export class ChannelManager {
     const rid = normalizeId(table, id);
     const hlc = this.tick();
     const row = await this.rowFor(rid);
-    if (row) this.send(this.targets(table, [row], scope), table, rid, {}, hlc, 'delete');
+    if (row) this.send(this.targets(table, [row], scope), table, rid, {}, hlc, 'delete', [row]);
     if (this.overlay.delete(rid)) this.emitFor(new Set([rid]));
   }
 
   /** A transport delivered a message from `from`. */
   receive(from: PeerRef, raw: unknown): void {
     if (this.closed) return;
+    if (raw !== null && typeof raw === 'object' && (raw as { t?: unknown }).t === 'interest') return this.receiveInterest(from, raw);
     const msg = parseMessage(raw);
     if (!msg) return this.drop(from, 'malformed message');
     this.observe(msg.hlc);
@@ -861,6 +1152,14 @@ export class ChannelManager {
     );
   }
 
+  /** One of the user's own tabs said what it shows. Anybody else's word on that is ignored. */
+  private receiveInterest(from: PeerRef, raw: unknown): void {
+    if (from.user !== this.user || !this.ownChannel) return this.drop(from, 'interest from another user');
+    const interest = decodeInterest(raw);
+    if (!interest) return this.drop(from, 'malformed interest');
+    this.interest.set(peerKey(from), interest);
+  }
+
   private accepts(op: ChannelOp): boolean {
     const rule = this.deps.config?.accept?.[op.table];
     if (!rule) return true;
@@ -878,9 +1177,11 @@ export class ChannelManager {
     if (up) {
       this.connected.set(key, peer);
       this.userStatus.set(peer.user, 'connected');
+      if (this.ownChannel && peer.user === this.user) this.transport?.send(peer, encodeInterest(this.ownInterest()));
       this.sendSnapshot(peer);
     } else {
       this.connected.delete(key);
+      this.interest.delete(key);
       const touched = new Set<string>();
       for (const [rid, fields] of this.overlay) {
         for (const [f, e] of fields) {
@@ -952,7 +1253,8 @@ export class ChannelManager {
   private targets(table: string, rows: ReadonlyArray<Row>, scope?: ChannelHandle): ReadonlySet<string> {
     const users = new Set<string>();
     const pick = scope ? this.handles.get(scope) : undefined;
-    for (const ch of pick ? [pick] : this.channels) {
+    // A write made through one channel still reaches the user's own devices.
+    for (const ch of pick ? (this.ownChannel ? [pick, this.ownChannel] : [pick]) : this.channels) {
       if (ch.closed || !carries(ch, table, rows)) continue;
       for (const u of ch.users) users.add(u);
     }
@@ -967,14 +1269,45 @@ export class ChannelManager {
     return stored ? applyOverlay([stored], this.overlay)[0] : null;
   }
 
-  private send(users: ReadonlySet<string>, table: string, rid: string, patch: Row, hlc: Hlc, kind: ChannelOpKind): void {
+  private send(users: ReadonlySet<string>, table: string, rid: string, patch: Row, hlc: Hlc, kind: ChannelOpKind, rows: ReadonlyArray<Row>): void {
     const transport = this.transport;
     if (!transport || users.size === 0) return;
     const encoded: Row = {};
     for (const [k, v] of Object.entries(patch)) encoded[k] = encodeValue(v);
     const message: ChannelMessage =
       kind === 'update' ? { t: 'op', table, id: rid, patch: encoded, hlc } : { t: 'op', kind, table, id: rid, patch: encoded, hlc };
-    for (const peer of this.connected.values()) if (users.has(peer.user)) transport.send(peer, message);
+    for (const [key, peer] of this.connected) {
+      if (!users.has(peer.user)) continue;
+      // One of the user's own tabs that said what it shows, and it is not this
+      // row: it has no use for the write, and the server brings it anyway.
+      const interest = peer.user === this.user ? this.interest.get(key) : undefined;
+      if (interest !== undefined && !showsRow(interest, table, rows)) continue;
+      transport.send(peer, message);
+    }
+  }
+
+  /** What this tab's subscriptions show of the shared tables. */
+  private ownInterest(): Interest | 'all' {
+    return mergeInterest(
+      [...this.taps].map((t) => t.interest),
+      (table) => this.shared.has(table)
+    );
+  }
+
+  /** Tell the user's other tabs what this one shows, once the subscriptions of this turn are all in. */
+  private announceSoon(): void {
+    if (!this.ownChannel || this.announcing || this.closed) return;
+    this.announcing = true;
+    void Promise.resolve().then(() => {
+      this.announcing = false;
+      const transport = this.transport;
+      if (this.closed || !transport || !this.user) return;
+      const message = encodeInterest(this.ownInterest());
+      const text = JSON.stringify(message);
+      if (text === this.announced) return;
+      this.announced = text;
+      for (const peer of this.connected.values()) if (peer.user === this.user) transport.send(peer, message);
+    });
   }
 
   /** Own ephemeral values of rows inside a channel a newly connected peer is listed on. */
@@ -1109,8 +1442,19 @@ export class ChannelManager {
 
 /** Whether a channel has a query on `table` that one of `rows` matches. */
 function carries(ch: Channel, table: string, rows: ReadonlyArray<Row>): boolean {
-  return ch.scopes.some((sc) => sc.table === table && rows.some((r) => matchesWhere(sc.where, r)));
+  return ch.scopes.some((sc) => sc.table === table && rows.some((r) => matchesWhere(sc.where, r) && (!sc.test || sc.test(r))));
 }
+
+/** A share rule that never throws: a rule that does shares nothing. */
+const safeTest =
+  (rule: (row: Row) => boolean) =>
+  (row: Row): boolean => {
+    try {
+      return rule(row) === true;
+    } catch {
+      return false;
+    }
+  };
 
 /** The fields of `row` the table has as plain columns (no id, no `@crdt`). */
 function pickColumns(columns: Record<string, ColumnSchema>, row: Row): Row {

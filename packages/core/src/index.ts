@@ -10,14 +10,21 @@ export {
   unusedArgs,
   type ChannelMessage,
   type ChannelOp,
+  type ChannelRelayConfig,
+  type ChannelShareConfig,
+  type ChannelShareRule,
   type ChannelState,
   type ChannelStatus,
   type ChannelTransport,
   type ChannelTransportFactory,
+  type ChannelWire,
   type ChannelsConfig,
+  type InterestMessage,
   type PeerRef,
   type TransportHooks,
 } from './modules/channel/index';
+export { roomLink, splitTransport, type RoomLink, type RoomLinkHooks, type RoomLinkOptions } from './modules/channel/room';
+export { hubTransport, type HubOptions } from './modules/channel/hub';
 export { webrtcTransport, surrealSignal, type SignalPort, type Signal, type OutgoingSignal } from './modules/channel/webrtc';
 export {
   FeatureFlagModule,

@@ -2,7 +2,7 @@ import type { Surreal, Uuid } from 'surrealdb';
 import type { ConnectionState } from '../../types';
 import type { Logger } from '../../services/logger/index';
 import { parseRecordIdString } from '../../utils/index';
-import type { ChannelMessage, ChannelTransport, PeerRef, TransportHooks } from './index';
+import type { ChannelTransport, ChannelWire, PeerRef, TransportHooks } from './index';
 import { idKey, peerKey } from './index';
 
 /**
@@ -347,7 +347,7 @@ export function webrtcTransport(hooks: TransportHooks, opts: WebRtcOptions): Cha
         hooks.onStatus(user, 'connecting');
       }
     },
-    send(to, message: ChannelMessage) {
+    send(to, message: ChannelWire) {
       const link = links.get(peerKey(to));
       if (!link?.open || !link.dc || link.dc.readyState !== 'open') return;
       try {

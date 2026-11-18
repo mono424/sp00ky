@@ -209,6 +209,30 @@ pub struct Circuit {
 /// [`Circuit::release_unused_indexes`] frees it.
 pub const INDEX_IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// The idle grace every new or restored circuit starts with:
+/// [`INDEX_IDLE_RELEASE`], unless `SPKY_SSP_INDEX_IDLE_RELEASE_SECS` names
+/// another number of seconds (read once per process; unset, unparsable or a
+/// host without an environment, such as wasm, keeps the default).
+///
+/// A released index is rebuilt by the next registration that plans over it,
+/// under the circuit's write lock, so every other registration and ingest
+/// waits for the build: WhitePawn's 750k-row `game_broadcast` took 3.6-6.8 s
+/// each time a view came back to it after more than an hour (prod,
+/// 2026-11-17). A longer grace trades that for the index's memory
+/// (~80 B per row plus its key) while nothing reads it.
+pub fn index_idle_release_default() -> std::time::Duration {
+    static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        parse_index_idle_release(std::env::var("SPKY_SSP_INDEX_IDLE_RELEASE_SECS").ok().as_deref())
+    })
+}
+
+fn parse_index_idle_release(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(INDEX_IDLE_RELEASE)
+}
+
 /// One table's schema as the circuit uses it, read from upstream DDL: the
 /// select permission from `DEFINE TABLE`, the rest from `INFO FOR TABLE`.
 /// Applied with [`Circuit::set_table_meta`].
@@ -448,7 +472,7 @@ impl Circuit {
             projection: false,
             missing_fields: BTreeMap::new(),
             index_defs: HashMap::new(),
-            index_idle_release: INDEX_IDLE_RELEASE,
+            index_idle_release: index_idle_release_default(),
         }
     }
 
@@ -1933,7 +1957,7 @@ impl Circuit {
             projection: false,
             missing_fields: BTreeMap::new(),
             index_defs: HashMap::new(),
-            index_idle_release: INDEX_IDLE_RELEASE,
+            index_idle_release: index_idle_release_default(),
         };
 
         for qs in state.queries {
@@ -2726,6 +2750,16 @@ mod tests {
     use crate::operator::plan::{OperatorPlan, OrderSpec, Projection};
     use crate::types::Path;
     use serde_json::json;
+
+    #[test]
+    fn index_idle_release_reads_seconds_and_falls_back_to_the_hour() {
+        use std::time::Duration;
+        assert_eq!(parse_index_idle_release(None), INDEX_IDLE_RELEASE);
+        assert_eq!(parse_index_idle_release(Some("43200")), Duration::from_secs(43200));
+        assert_eq!(parse_index_idle_release(Some(" 0 ")), Duration::ZERO);
+        assert_eq!(parse_index_idle_release(Some("12h")), INDEX_IDLE_RELEASE);
+        assert_eq!(parse_index_idle_release(Some("")), INDEX_IDLE_RELEASE);
+    }
 
     fn scan_query(id: &str, table: &str) -> QueryPlan {
         QueryPlan {

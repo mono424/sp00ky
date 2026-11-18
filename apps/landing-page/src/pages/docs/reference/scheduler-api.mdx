@@ -1041,7 +1041,9 @@ An unavailable upstream database returns `503`; invalid kinds return `400`.
 
 The private `_00_sync_evidence:slow_operations` record retains the newest 100
 recorded successful registration and ingest requests taking at least 250 ms
-across SSP/scheduler restarts and view TTL cleanup.
+across SSP/scheduler restarts and view TTL cleanup. The same table holds one
+`ssp_indexes` record per SSP, the indexes it holds, which the SSP that replaces
+it rebuilds before Ready (see [State persistence](/docs/reference/ssp-api#state-persistence)).
 Recording is best effort: at most four evidence writes run concurrently per
 process; excess requests increment `ssp_slow_evidence_dropped_total` and do not
 wait or spawn another writer. Samples contain

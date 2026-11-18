@@ -1693,45 +1693,64 @@ async fn shutdown_signal(
 
     info!("Signal received, starting graceful shutdown");
 
-    // A background index prebuild stops first (it leaves the circuit within
-    // a step). Then what this SSP holds, for the one that replaces it, while
-    // it still serves (before `Stopping` below). Bounded: a stalled database
-    // must not eat the SIGTERM grace the row checkpoint needs.
+    // Whether this SSP serves, read before the checkpoint below marks it
+    // `Stopping`: only a serving SSP records its indexes.
     let (recorder, node, background_prebuild) = indexes;
-    background_prebuild.stop().await;
-    if !node.is_standby() && *node.status.read().await == SspStatus::Ready {
-        let write = recorder.record(node.platform.db.as_ref(), &node.processor, true);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), write).await {
-            Ok(Ok(_)) => info!("Recorded which indexes this SSP holds for its successor"),
-            Ok(Err(e)) => warn!(error = %e, "Could not record which indexes this SSP holds"),
-            Err(_) => warn!("Recording which indexes this SSP holds timed out"),
-        }
-    }
-
-    // Cluster rows: a final checkpoint so the next boot is warm. Only a
-    // verified circuit is worth keeping, and ingest stops first (503, which
-    // the scheduler buffers and redelivers to whoever comes next) so the
-    // write does not race it for the lock. Skipped outright after a
-    // clean-restart directive, which just deleted the files.
-    if clean_requested.load(Ordering::SeqCst) {
-        info!("Skipping shutdown checkpoint: clean restart requested");
-    } else if let Some((rows, processor, status)) = rows {
-        let was = {
-            let mut status = status.write().await;
-            std::mem::replace(&mut *status, SspStatus::Stopping)
-        };
-        match was {
-            // `write` itself refuses for a standby (the gate).
-            SspStatus::Ready => rows.write(&processor, "shutdown").await,
-            SspStatus::Retired => info!("Skipping row checkpoint: retired, the successor owns the checkpoint dir"),
-            _ => info!("Skipping row checkpoint: the circuit was not Ready"),
-        }
-    }
+    let serving = !node.is_standby() && *node.status.read().await == SspStatus::Ready;
+    let record = serving.then(|| (recorder, Arc::clone(&node.platform.db), Arc::clone(&node.processor)));
+    shutdown_writes(clean_requested.load(Ordering::SeqCst), rows, record, &background_prebuild).await;
 
     if let Err(e) = meter_provider.shutdown() {
         error!(error = %e, "Failed to shutdown meter provider");
     }
 }
+
+/// What a graceful shutdown writes, all at once so none waits for another:
+/// the row checkpoint (cluster rows, so the next boot is warm), the record
+/// of the indexes this SSP holds (`record`, when it serves) and the stop of a
+/// background index prebuild. The record is capped at
+/// [`SHUTDOWN_INDEX_RECORD`]: a stalled database must not hold the
+/// checkpoint, or eat the stop grace it needs.
+async fn shutdown_writes(
+    clean_requested: bool,
+    rows: Option<ShutdownRows>,
+    record: Option<(Arc<ssp_node::index_memory::IndexRecorder>, Arc<dyn ssp_node::ports::Db>, Arc<RwLock<Circuit>>)>,
+    background_prebuild: &BackgroundPrebuild,
+) {
+    // Only a verified circuit is worth keeping, and ingest stops first (503,
+    // which the scheduler buffers and redelivers to whoever comes next) so
+    // the write does not race it for the lock. Skipped outright after a
+    // clean-restart directive, which just deleted the files. `Stopping`
+    // also stops a background prebuild between two steps.
+    let checkpoint = async {
+        if clean_requested {
+            info!("Skipping shutdown checkpoint: clean restart requested");
+        } else if let Some((rows, processor, status)) = rows {
+            let was = {
+                let mut status = status.write().await;
+                std::mem::replace(&mut *status, SspStatus::Stopping)
+            };
+            match was {
+                // `write` itself refuses for a standby (the gate).
+                SspStatus::Ready => rows.write(&processor, "shutdown").await,
+                SspStatus::Retired => info!("Skipping row checkpoint: retired, the successor owns the checkpoint dir"),
+                _ => info!("Skipping row checkpoint: the circuit was not Ready"),
+            }
+        }
+    };
+    let index_record = async {
+        let Some((recorder, db, processor)) = record else { return };
+        match tokio::time::timeout(SHUTDOWN_INDEX_RECORD, recorder.record(db.as_ref(), &processor, true)).await {
+            Ok(Ok(_)) => info!("Recorded which indexes this SSP holds for its successor"),
+            Ok(Err(e)) => warn!(error = %e, "Could not record which indexes this SSP holds"),
+            Err(_) => warn!("Recording which indexes this SSP holds timed out"),
+        }
+    };
+    tokio::join!(checkpoint, index_record, background_prebuild.stop());
+}
+
+/// See [`shutdown_writes`].
+const SHUTDOWN_INDEX_RECORD: std::time::Duration = std::time::Duration::from_secs(2);
 
 // --- Cluster bootstrap ---
 
@@ -2540,6 +2559,42 @@ mod background_prebuild_tests {
         tokio::time::timeout(Duration::from_secs(1), task).await.expect("stopped on its own").unwrap();
         let held = rows_held(&processor);
         assert!(held > 0 && held < ROWS, "stopped part way: {held}");
+    }
+
+    /// Shutdown with a database that never answers: the row checkpoint is
+    /// written at once, not after the index record gives up, and the record
+    /// gives up after its two seconds.
+    #[tokio::test]
+    async fn a_stalled_database_does_not_hold_the_shutdown_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("ssp-shutdown-{}-{}", std::process::id(), ssp_node::now_epoch_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = Arc::new(warm::RowCheckpoints::at(
+            dir.clone(),
+            ssp::circuit::checkpoint::BodyVerify::AtLoad,
+            ssp::circuit::arena::ArenaBacking::Heap,
+        ));
+        let processor = circuit();
+        let status = Arc::new(RwLock::new(SspStatus::Ready));
+        let background = BackgroundPrebuild::default();
+        background.start(Arc::new(FakeDb(None)), Arc::clone(&processor), Arc::clone(&status), None);
+        let recorder = Arc::new(ssp_node::index_memory::IndexRecorder::new("ssp-0"));
+        let hung: Arc<dyn Db> = Arc::new(FakeDb(None));
+        let started = Instant::now();
+        let shutdown = shutdown_writes(
+            false,
+            Some((Arc::clone(&rows), Arc::clone(&processor), Arc::clone(&status))),
+            Some((recorder, hung, Arc::clone(&processor))),
+            &background,
+        );
+        tokio::pin!(shutdown);
+        assert!(tokio::time::timeout(Duration::from_millis(500), &mut shutdown).await.is_err(), "the record is still waiting");
+        assert!(dir.join("game.rows").exists(), "...but the checkpoint is written");
+        assert_eq!(*status.read().await, SspStatus::Stopping);
+        shutdown.await;
+        let took = started.elapsed();
+        assert!(took >= SHUTDOWN_INDEX_RECORD && took < SHUTDOWN_INDEX_RECORD + Duration::from_secs(1), "{took:?}");
+        assert!(background.current.lock().unwrap().is_none(), "the background prebuild was stopped too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// No record in the database: the warm restart's `indexes.json` follows

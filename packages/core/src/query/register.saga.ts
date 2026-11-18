@@ -17,7 +17,7 @@ import { listRefTable } from './env';
 import { queryHashInput, viewKeyInput } from './hash';
 import { FAILED, isResolvedBefore, parseViewRow, snapshotFromSingle } from './membership';
 import { applyMembership, applySubqueryChildren, markMembershipDirty } from './membership.saga';
-import { paintEffect, renderRead } from './materialize';
+import { paintEffect, paintKeyOf, renderRead } from './materialize';
 import * as sql from './sql';
 
 const NONE: ReadonlySet<string> = new Set();
@@ -55,7 +55,7 @@ function* paintedRows(entry: QueryEntry): Saga<Record<string, unknown>[] | null>
     ReadonlySet<string>,
   ];
   const read = renderRead(entry, ov, known);
-  const peek = paintEffect(entry.def, read.ids, entry.def.viewKey);
+  const peek = paintEffect(entry.def, read.ids, paintKeyOf(entry.def, read.ids));
   if (!peek) return null;
   try {
     const rows = (yield peek) as Record<string, unknown>[] | null | undefined;

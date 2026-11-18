@@ -50,11 +50,42 @@ function App() {
 | Prop | Type | Description |
 |------|------|-------------|
 | `config` | `SyncedDbConfig<S>` | Same as `Sp00kyConfig` from core |
-| `fallback` | `JSX.Element` | Shown while the database is initializing |
+| `fallback` | `JSX.Element` | Shown while the database is initializing. Never shown with `eager` |
 | `preload` | `(db: SyncedDb<S>) => Promise<void>` | Prewarm essential data before revealing the UI. Runs after `init()`; `fallback` stays until it resolves. See [Preload](#preload). |
 | `onReady` | `(db: SyncedDb<S>) => void` | Called when initialization succeeds |
 | `onError` | `(error: Error) => void` | Called if initialization fails |
-| `children` | `JSX.Element` | App content, rendered after init |
+| `eager` | `boolean` | Render `children` at once, before the client is initialized. See [Rendering before the client is ready](#rendering-before-the-client-is-ready) |
+| `children` | `JSX.Element` | App content, rendered after init (at once with `eager`) |
+
+### Rendering before the client is ready
+
+By default nothing below the provider renders until `init()` (and `preload`) is done. With `eager`
+the children render at once, on a `SyncedDb` that is not initialized yet:
+
+```tsx
+<Sp00kyProvider config={config} eager>
+  <MyApp />
+</Sp00kyProvider>
+```
+
+With `localEngine: 'rows'`, `useQuery` then has, the first time `data()` is read, the rows the
+query showed the last time the app was open, and `isLoading()` is `false`. The query starts as
+soon as the client is ready and replaces them when its answer differs. `isSettled()` stays `false`
+until the query itself has delivered.
+
+What changes for the tree:
+
+- Queries and writes made early wait for the client. Nothing has to be reordered.
+- Hooks that report state (`useSyncStatus`, `useFeatureFlag`) and `db.auth.subscribe` report their
+  not-known-yet value until the client is ready. Gate what a signed-out visitor must not see on
+  `await db.whenReady()` or on `db.isReady`.
+- `db.isReady` is a plain getter, not a signal. To render from it, set a signal when
+  `db.whenReady()` resolves (it rejects if the client fails to start).
+- `fallback` is never rendered, and `preload` no longer holds the UI back.
+- Client-rendered trees only: a server render still produces the fallback.
+
+Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
+same browser, and only while no write has touched their tables since.
 
 ## useQuery
 
@@ -189,7 +220,8 @@ Behavior:
 ### Blocking first-load: `Sp00kyProvider` `preload` prop
 
 Gate the whole app on essential data. The `fallback` stays visible until preload resolves; on
-warm loads it's instant, so there's no perceptible gate after the first run.
+warm loads it's instant, so there's no perceptible gate after the first run. With `eager` the
+children are already rendered, so `preload` still runs after `init()` but gates nothing.
 
 ```tsx
 <Sp00kyProvider

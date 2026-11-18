@@ -55,9 +55,10 @@ describe('registerLocal', () => {
       expect(entry.lifecycle.answered).toBe(false);
       // The render that answers still runs: the query is dirty like any new one.
       expect(out.state.dirty.has(out.result)).toBe(true);
-      // The peek names the read by the view key (a reload keeps it) and asks for the render set.
+      // The peek names the read after the query (its text and parameters, which a
+      // page has before the client is open) and asks for the render set.
       const peek = out.log.find((e) => e.kind === 'local.peekSelect') as any;
-      expect(peek.paintKey).toBe(entry.def.viewKey);
+      expect(peek.paintKey).toBe(JSON.stringify({ surql: input.surql, params: input.params }));
       expect(peek.plan.ids.map((id: RecordId) => String(id.id))).toEqual(['1', '2']);
     });
 
@@ -91,7 +92,10 @@ describe('registerLocal', () => {
       const entry = out.state.queries.get(out.result)!;
       expect(entry.lifecycle.phase).toBe('cold');
       expect(entry.records).toEqual([{ id: 'thing:1' }]);
-      expect((out.log.find((e) => e.kind === 'local.peekSelect') as any).plan.ids).toBeUndefined();
+      const peek = out.log.find((e) => e.kind === 'local.peekSelect') as any;
+      expect(peek.plan.ids).toBeUndefined();
+      // A scan's copy has a name of its own: it is not what a closed client may paint.
+      expect(peek.paintKey).toBe(`${JSON.stringify({ surql: input.surql, params: input.params })}\ncold`);
     });
   });
 

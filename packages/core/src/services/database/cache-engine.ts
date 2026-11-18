@@ -174,6 +174,12 @@ export interface LocalStore extends LocalCacheEngine {
    * OPTIONAL: only an engine that keeps such a copy (`'rows'`) has them.
    */
   peekSelect?(plan: QueryPlan, params?: Record<string, unknown>, opts?: { paintKey?: string }): Row[] | null;
+  /**
+   * The bucket `connect` is about to be called with, told ahead: a store that
+   * keeps rows to paint from can then answer {@link peekSelect} before it is
+   * open. Ignored by a store that keeps none.
+   */
+  expectBucket?(bucketId: string): void;
   peekByIds?(table: string, ids: Id[], opts?: { select?: string[]; orderBy?: OrderBy }): Row[] | null;
   getSnapshot?(key: string): Promise<StoredSnapshot | null>;
   putSnapshot?(key: string, bytes: Uint8Array, meta: SnapshotMeta): Promise<void>;

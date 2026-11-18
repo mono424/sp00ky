@@ -244,7 +244,90 @@ describe('useQuery', () => {
   });
 });
 
+describe('useQuery on a client that is not ready yet (an eager provider)', () => {
+  const painted = [{ id: 'a', n: 1 }];
+  function eagerEngine() {
+    const eng = mockEngine();
+    (eng.sp00ky as any).isLocalReady = () => false;
+    (eng.sp00ky as any).peekQuery = vi.fn(() => painted);
+    (eng.db as any).peekQuery = (q: unknown) => (eng.sp00ky as any).peekQuery(q);
+    return eng;
+  }
+
+  it('renders the rows the query showed last time on the first render, then the answer', async () => {
+    const eng = eagerEngine();
+    const { result } = renderHook((h: string) => useQuery(eng.db, mockQuery(h)), 'h1' as string);
+    expect(result.current.data).toEqual(painted);
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.isAuthoritative).toBe(false);
+    const first = result.current.data;
+
+    await flush();
+    // Attaching did not swap them out for a loading state.
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.data).toBe(first);
+    // The query answers with the same rows: nothing changes on screen.
+    eng.emit('h1', [{ id: 'a', n: 1 }]);
+    expect(result.current.data).toBe(first);
+    // And with other rows: they win.
+    eng.emit('h1', [{ id: 'a', n: 2 }]);
+    expect(result.current.data).toEqual([{ id: 'a', n: 2 }]);
+  });
+
+  it('paints nothing once the client is ready, or when the store kept nothing', async () => {
+    const ready = eagerEngine();
+    (ready.sp00ky as any).isLocalReady = () => true;
+    (ready.db as any).peekQuery = () => null;
+    const a = renderHook((h: string) => useQuery(ready.db, mockQuery(h)), 'h1' as string);
+    await flush();
+    expect(a.result.current.data).toEqual([]);
+    expect(a.result.current.isLoading).toBe(true);
+
+    const empty = eagerEngine();
+    (empty.sp00ky as any).peekQuery = () => null;
+    const b = renderHook((h: string) => useQuery(empty.db, mockQuery(h)), 'h1' as string);
+    await flush();
+    expect(b.result.current.data).toEqual([]);
+    expect(b.result.current.isLoading).toBe(true);
+  });
+});
+
 describe('Sp00kyProvider', () => {
+  it('eager: renders the children at once, on an instance that is initialized behind them', async () => {
+    let resolveInit!: () => void;
+    const init = vi.spyOn(SyncedDb.prototype, 'init').mockImplementation(() => new Promise<void>((r) => (resolveInit = r)));
+    const close = vi.spyOn(SyncedDb.prototype, 'close').mockResolvedValue();
+    const onReady = vi.fn();
+    const preload = vi.fn(async () => {});
+    function Child() {
+      const db = useDb();
+      return <span>{db instanceof SyncedDb ? `child ready=${db.isReady}` : 'no'}</span>;
+    }
+    const view = render(
+      <StrictMode>
+        <Sp00kyProvider config={{} as any} eager fallback="loading" onReady={onReady} preload={preload}>
+          <Child />
+        </Sp00kyProvider>
+      </StrictMode>
+    );
+    // No fallback, no waiting: the tree is there on the first render.
+    expect(view.container.textContent).toBe('child ready=false');
+    expect(onReady).not.toHaveBeenCalled();
+    await flush();
+    expect(init).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveInit();
+      await new Promise((r) => setTimeout(r, 5));
+    });
+    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(preload).toHaveBeenCalledTimes(1);
+    expect(view.container.textContent).toContain('child');
+    view.unmount();
+    await flush();
+    // In the tree's hands from the start: never closed under it.
+    expect(close).not.toHaveBeenCalled();
+  });
+
   it('shows the fallback, inits once under StrictMode, then provides the db', async () => {
     // Slower than StrictMode's remount, so a client the remount failed to
     // reclaim would be closed before it is revealed.

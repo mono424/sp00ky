@@ -77,6 +77,37 @@ describe('sameValue', () => {
   });
 });
 
+describe('reduceQuery with rows painted from the last session', () => {
+  const rows = [{ id: 'a', n: 1 }];
+
+  it('a reset that carries them shows them and is not a loading state', () => {
+    const s = reduceQuery(initialQueryState, { type: 'reset', painted: { rows, isOne: false } });
+    expect(s.data).toEqual(rows);
+    expect(s.hasPainted).toBe(true);
+    expect(s.isAuthoritative).toBe(false);
+    // The same reset again (the effect after the first render) changes nothing.
+    expect(reduceQuery(s, { type: 'reset', painted: { rows: [{ id: 'a', n: 1 }], isOne: false } })).toBe(s);
+    // The query's own rows, when they are the same, do not either; other rows replace them.
+    expect(reduceQuery(s, { type: 'rows', rows: [{ id: 'a', n: 1 }], isOne: false })).toBe(s);
+    expect(reduceQuery(s, { type: 'rows', rows: [{ id: 'b', n: 2 }], isOne: false }).data).toEqual([{ id: 'b', n: 2 }]);
+  });
+
+  it('keeps them through the query saying it is not answered yet', () => {
+    let s = reduceQuery(initialQueryState, { type: 'rows', rows, isOne: false });
+    // What a fresh subscription delivers right after its first rows.
+    expect(reduceQuery(s, { type: 'authority', known: false })).toBe(s);
+    // A flip back (another principal) still takes the latch.
+    s = reduceQuery(s, { type: 'authority', known: true });
+    expect(reduceQuery(s, { type: 'authority', known: false }).hasPainted).toBe(false);
+  });
+
+  it('gives a `.one()` query its row, and treats no rows as nothing painted', () => {
+    expect(reduceQuery(initialQueryState, { type: 'reset', painted: { rows, isOne: true } }).data).toEqual(rows[0]);
+    expect(reduceQuery(initialQueryState, { type: 'reset', painted: { rows: [], isOne: false } })).toBe(initialQueryState);
+    expect(reduceQuery(initialQueryState, { type: 'reset', painted: null })).toBe(initialQueryState);
+  });
+});
+
 describe('reduceQuery', () => {
   const run = (...events: Parameters<typeof reduceQuery>[1][]): QueryState =>
     events.reduce(reduceQuery, initialQueryState);

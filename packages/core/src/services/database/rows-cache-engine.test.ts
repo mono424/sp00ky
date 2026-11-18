@@ -934,6 +934,31 @@ describe('painting from the last session', () => {
     expect(next.peekSelect(whole)).toBeNull();
   });
 
+  it('answers before connect once it is told which bucket is about to open', async () => {
+    const plan: QueryPlan = { table: 'game' };
+    const rows = await engine.select(plan, {}, { paintKey: 'view-1' });
+    flush(engine);
+    await engine.close();
+
+    const next = fresh();
+    // Nothing says whose rows these would be.
+    expect(next.peekSelect(plan, {}, { paintKey: 'view-1' })).toBeNull();
+    next.expectBucket('user_a');
+    expect(next.peekSelect(plan, {}, { paintKey: 'view-1' })).toEqual(rows);
+    // The first word stands until the store is opened.
+    next.expectBucket('user_b');
+    expect(next.peekSelect(plan, {}, { paintKey: 'view-1' })).toEqual(rows);
+    // Opened on another bucket after all: none of the first one's rows are handed out.
+    await next.connect('user_b');
+    expect(next.peekSelect(plan, {}, { paintKey: 'view-1' })).toBeNull();
+    await next.close();
+
+    // With shared tabs no copy is kept, so none is handed out.
+    const shared = new RowsCacheEngine({ store: 'indexeddb' } as any, logger, { useOpfs: true, shared: true });
+    shared.expectBucket('user_a');
+    expect(shared.peekSelect(plan, {}, { paintKey: 'view-1' })).toBeNull();
+  });
+
   it('lets go of a copy the moment its table is written, and takes the next read of the same thing', async () => {
     await engine.selectByIds('game', ids);
     flush(engine);

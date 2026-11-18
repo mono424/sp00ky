@@ -27,6 +27,9 @@ export function mockEngine() {
   const subs = new Map<string, (e: Emission) => void>();
   const statusSubs = new Map<string, (s: string) => void>();
   const authoritySubs = new Map<string, (known: boolean) => void>();
+  // Rows a query already holds when it is subscribed to. The core hands them
+  // to the subscriber at once, before its "not answered yet".
+  const held = new Map<string, Emission>();
   const unsubscribed: string[] = [];
   const deregistered: string[] = [];
   const preloaded: string[] = [];
@@ -40,8 +43,9 @@ export function mockEngine() {
     }),
     subscribe: vi.fn<
       (hash: string, cb: (e: Emission) => void, o?: Immediate) => Promise<() => void>
-    >(async (hash, cb) => {
+    >(async (hash, cb, o) => {
       subs.set(hash, cb);
+      if (o?.immediate && held.has(hash)) cb(held.get(hash)!);
       return () => {
         subs.delete(hash);
         unsubscribed.push(hash);
@@ -61,6 +65,9 @@ export function mockEngine() {
     preload: vi.fn<(q: { hash: string }) => Promise<void>>(async (q) => {
       preloaded.push(q.hash);
     }),
+    // A ready client with nothing to paint from. See `notReady` below.
+    isLocalReady: vi.fn<() => boolean>(() => true),
+    peekQuery: vi.fn<(q: { hash: string }) => Emission | null>(() => null),
   };
   const db = Object.create(SyncedDb.prototype) as SyncedDb<any>;
   (db as any).sp00ky = sp00ky;
@@ -68,6 +75,16 @@ export function mockEngine() {
     db,
     sp00ky,
     emit: (hash: string, e: Emission) => subs.get(hash)?.(e),
+    hold: (hash: string, e: Emission) => held.set(hash, e),
+    /**
+     * Make this the client of an eager `provideSp00ky` before `init()` is
+     * done, whose store kept `painted(hash)` from the last time the app was open.
+     */
+    notReady: (painted: (hash: string) => Emission | null) => {
+      (db as any).eager = true;
+      sp00ky.isLocalReady.mockReturnValue(false);
+      sp00ky.peekQuery.mockImplementation((q) => painted(q.hash));
+    },
     setStatus: (hash: string, s: string) => statusSubs.get(hash)?.(s),
     setAuthority: (hash: string, known: boolean) => authoritySubs.get(hash)?.(known),
     unsubscribed,

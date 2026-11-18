@@ -5,6 +5,7 @@ import { fx } from '../kernel/effects';
 import { encodeRecordId, parseRecordIdString } from '../utils/index';
 import type { QueryEntry } from '../state/client-state';
 import type { Overlay } from '../state/selectors';
+import { viewKeyInput } from './hash';
 import { buildRenderIds, paintsCold, resolveMembership } from './render-set';
 import { buildIdSetPlan, buildIdSetSurql, buildWindowMaterialization } from './window-query';
 
@@ -43,6 +44,21 @@ export function paintEffect(src: MaterializeSource, ids: string[] | null, paintK
   const plan = ids === null ? src.plan : buildIdSetPlan(src.plan, ids.map((id) => parseRecordIdString(id)));
   return fx.local.peekSelect(plan, src.params, paintKey);
 }
+
+/**
+ * The name a query's render read goes by in the store's paint cache. Built
+ * from what a page knows the moment it has the query (its text and its
+ * parameters), not from a digest that takes a turn of the event loop: a
+ * component asks for these rows while it renders, before the client is open.
+ *
+ * A cold scan is kept under a name of its own. Its rows are filtered before
+ * they show (`RenderRead.shows`), by what the client only knows once it is
+ * open; the rows of a membership render show as read. So a caller without
+ * the client's state (`Sp00kyClient.peekQuery`) asks for the membership name
+ * alone, and never paints a row a cold render would have hidden.
+ */
+export const paintKeyOf = (src: Pick<MaterializeSource, 'surql' | 'params'>, ids: string[] | null): string =>
+  viewKeyInput(src) + (ids === null ? '\ncold' : '');
 
 /** What one render of a query reads, and which of the rows it gets back may show. */
 export interface RenderRead {

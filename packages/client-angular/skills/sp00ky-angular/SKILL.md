@@ -47,6 +47,11 @@ export const appConfig: ApplicationConfig = {
 
 The client starts in an app initializer; the app renders once it is ready. Angular CLI apps also need: `src/app/sp00ky-surreal.worker.ts` containing `import '@surrealdb/wasm/worker';` (install `@surrealdb/wasm`), `webWorkerTsConfig`, `assets` copying `ssp_wasm_bg.wasm` (`@spooky-sync/ssp-wasm/pkg`), `index_bg.wasm` (`@surrealdb/wasm-native/dist`), `tabs-broker-worker.js` (`@spooky-sync/core/dist`) and `sqlite3.wasm` + `sqlite3-opfs-async-proxy.js` (`@sqlite.org/sqlite-wasm/dist`) to `/`, and `serve.options.prebundle.exclude` for `@spooky-sync/client-angular`, `@spooky-sync/core`, `@spooky-sync/ssp-wasm`, `@surrealdb/wasm`, `@surrealdb/wasm-native`, `@sqlite.org/sqlite-wasm`. With pnpm, `public-hoist-pattern[]` the wasm packages. Without these, init hangs on a 404 `worker-agent.mjs`.
 
+Options, `provideSp00ky(config, { preload?, eager? })`:
+
+- `preload: (db) => Promise<void>` warms the local cache before the first render. Best-effort.
+- `eager: true` bootstraps and renders at once, before the client is ready. With `localEngine: 'rows'`, `injectQuery` then has on its first read the rows the query showed the last time the app was open, with `isLoading()` false, and replaces them when the query answers. Queries and writes made early wait for the client. Auth, feature flags and sync status report their not-known-yet value until then: gate on `await db.whenReady()` (`db.isReady` is a plain getter, not a signal). Bootstrap no longer waits for `init()` or `preload` and no longer fails with `init()`: the failure is logged and shows in `injectQuery().error()`. Browser only.
+
 ## Queries
 
 ```ts

@@ -4,7 +4,7 @@
 
 The **Angular** binding for sp00ky, built on signals (peer `@angular/core` / `@angular/common` `^21 || ^22`; zoneless and zone.js both work). Same `SyncedDb` and the same function set as `@spooky-sync/client-react` / `client-svelte` / `client-solid2`, written the Angular way:
 
-- `provideSp00ky(config, { preload? })` in the application providers (`app.config.ts`). It provides `SyncedDb` (also the DI token) and starts it in an app initializer, so components render once the client is ready. No wrapper component.
+- `provideSp00ky(config, { preload?, eager? })` in the application providers (`app.config.ts`). It provides `SyncedDb` (also the DI token) and starts it in an app initializer, so components render once the client is ready (with `eager`: at once). No wrapper component.
 - `inject*` functions return **read-only signals**: `posts.data()`, `posts.isLoading()`. Call them in templates, `computed()` and `effect()`.
 - An input that should follow state is a **signal or a function**: `injectQuery(() => this.db.query('post').where({ author: this.authorId() }).build())`, `injectCrdtField('post', this.postId, 'body')` (an `input()` is a signal), `injectDownloadFile('covers', this.path)`. A plain value is fixed.
 - A function with a single value returns that signal: `injectPendingMutations()`, `injectCrdtField(...)`.
@@ -47,6 +47,8 @@ export const appConfig: ApplicationConfig = {
 
 `config` may be a factory run in the injection context. `preload` is awaited before the first render, best-effort. A failed `init()` fails bootstrap (`bootstrapApplication(...).catch(...)`); put a splash inside `<app-root>` in `index.html`. The client is closed when the app is destroyed. Without `provideSp00ky` (tests, a self-made client): `{ provide: SyncedDb, useValue: db }`.
 
+`eager: true` bootstraps and renders the app at once, on a `SyncedDb` that is not initialized yet (`new SyncedDb(config, { eager: true })`: its core client is created on first use, `db.isReady` / `db.whenReady()` say when `init()` is done). The app initializer starts `init()`, then `preload`, and returns without waiting. With `localEngine: 'rows'`, `injectQuery` then has on its first read the rows the query showed the last time the app was open (`db.peekQuery`, the engine's paint cache, which is not kept with `sharedTabs`) with `isLoading()` false, and the query itself, which waits for `init()` like every query and write made early, replaces them when it answers. Everything that reports state (auth, feature flags, sync status) reports its not-known-yet default until the client is ready, so gate what a signed-out visitor must not see on `db.whenReady()`. `db.isReady` is a plain getter, not a signal: a template that follows it needs a signal set from `db.whenReady()`. Bootstrap no longer waits for `init()` or `preload`, and a failed `init()` no longer fails it: it is logged with `console.error`, `db.whenReady()` rejects, and the queries waiting on the client report it in `error()`. Browser only: a server render never starts the client, with or without `eager`, so `db.whenReady()` never settles there. The paint latch (`hasPainted` in `src/query.ts`) is only cleared by authority flipping BACK to false, never by a fresh subscription's first "not answered yet".
+
 ### Angular CLI build settings (required)
 
 The Angular CLI (`@angular/build:application`) does not bundle a `new Worker(new URL(...))` inside a dependency and does not copy `.wasm` files referenced via `new URL(..., import.meta.url)`. So the app:
@@ -61,10 +63,10 @@ Missing any of these shows as a 404 on `worker-agent.mjs` / a `.wasm` file and a
 
 ## Key API
 
-- **`provideSp00ky(config, options?)`**: `EnvironmentProviders`. `options.preload?: (db) => Promise<void>`.
-- **`injectDb<typeof schema>(options?)`**: the `SyncedDb<S>` (same instance as `inject(SyncedDb)`). `create`, `update`, `delete`, `query`, `preload`, `run`, `channel`, `bucket`, `remoteQuery`, `useRemote`, `auth` / `signOut`, `pendingMutationCount`, `syncHealth` / `storageHealth` and their subscribe methods. Throws a readable error without a provider.
+- **`provideSp00ky(config, options?)`**: `EnvironmentProviders`. `options.preload?: (db) => Promise<void>`, `options.eager?: boolean` (render before the client is ready, see "Setup pattern").
+- **`injectDb<typeof schema>(options?)`**: the `SyncedDb<S>` (same instance as `inject(SyncedDb)`). `create`, `update`, `delete`, `query`, `preload`, `run`, `channel`, `bucket`, `remoteQuery`, `useRemote`, `auth` / `signOut`, `pendingMutationCount`, `syncHealth` / `storageHealth` and their subscribe methods, `isReady` / `whenReady()`. Throws a readable error without a provider.
 - **`injectQuery(query, options?)`**: live query. `query` is a function (or signal) returning a BUILT query (`.build()`, `.one().build()`) or `null` / `undefined` to skip; a fixed built query can be passed directly. Re-registration keys on the identity hash (surql + vars), not on rebuilds. Result signals:
-  - `data`: rows, or the row / `null` for `.one()`. `[]` / `null` before the first result. Structurally shared.
+  - `data`: rows, or the row / `null` for `.one()`. `[]` / `null` before the first result (with `eager`, the rows painted from the last session when the store kept them). Structurally shared.
   - `error`: registration / sync failure (e.g. SSP 503 NOT_READY). Never thrown; the scheduler retries.
   - `isLoading`: cold first load only (nothing painted for this identity, server not heard, no error).
   - `isFetching`: a fetch cycle is in flight.
@@ -110,6 +112,7 @@ Track a backend job by querying its outbox row: `injectQuery(() => this.db.query
 - **No suspense / resource mode.** Branch on `isLoading()` / `isEmpty()`.
 - **Angular CLI build settings** (worker entry, assets, prebundle) are required; see above.
 - **SSR**: engine-backed components inside `@defer` or on `RenderMode.Client` routes.
+- **`eager` and auth**: until the client is ready `db.auth.subscribe` answers `null`, also for a signed-in user. Wait for `db.whenReady()` before treating that as signed out.
 - **`track post.id`** works: row ids are `RecordId` instances with stable identity per row under structural sharing.
 
 ## Pointers

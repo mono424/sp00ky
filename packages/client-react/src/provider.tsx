@@ -52,8 +52,23 @@ export interface Sp00kyProviderProps<S extends SchemaStructure> {
    * new `key`.
    */
   config: SyncedDbConfig<S>;
-  /** Rendered until the client is initialized (and `preload` resolved). */
+  /** Rendered until the client is initialized (and `preload` resolved). Not rendered with `eager`. */
   fallback?: ReactNode;
+  /**
+   * Render `children` at once, before the client is initialized. With
+   * `localEngine: 'rows'`, `useQuery` then renders the rows a query showed the
+   * last time the app was open, on the very first render; the query itself
+   * starts as soon as the client is ready and corrects them.
+   *
+   * What changes for the tree: it mounts on a client that is not open yet.
+   * Queries and writes made early wait for it; everything that reports state
+   * (auth, feature flags, sync status) reports "not known yet" until then, so
+   * gate what a signed-out visitor must not see on `useDb().whenReady()` or
+   * `db.isReady`. `preload` no longer holds the UI back, and `fallback` is
+   * never shown. Read once, at mount. In a server render the provider still
+   * renders the fallback: this is for client-rendered trees.
+   */
+  eager?: boolean;
   onError?: (error: Error) => void;
   onReady?: (db: SyncedDb<S>) => void;
   /**
@@ -73,27 +88,36 @@ interface Boot<S extends SchemaStructure> {
   init: Promise<void>;
   /** Handed to the tree: from here on it is never closed (see the cleanup below). */
   revealed: boolean;
+  /** Initialized, `preload` run and `onReady` told: once per client. */
+  ready: boolean;
   disposeTimer?: ReturnType<typeof setTimeout>;
 }
 
 /**
  * Initializes a sp00ky client and provides it to `useDb()` and every hook
- * below. Renders `fallback` until the client is ready.
+ * below. Renders `fallback` until the client is ready, or with `eager` the
+ * children at once.
  *
- * The client is created in an effect, never during render, so a server render
- * only produces the fallback and StrictMode's double render creates nothing.
+ * The client is initialized in an effect, never during render, so a server
+ * render only produces the fallback and StrictMode's double render opens
+ * nothing.
  */
 export function Sp00kyProvider<S extends SchemaStructure>(props: Sp00kyProviderProps<S>) {
-  const [db, setDb] = useState<SyncedDb<S> | null>(null);
+  // Read once, at mount: see the `config` prop docs.
+  const config = useRef(props.config).current;
+  // Eager: the instance the tree mounts on, from the first render. Building it
+  // creates nothing (its core client comes with its first use), so the twin a
+  // StrictMode double render throws away costs nothing either.
+  const [early] = useState<SyncedDb<S> | null>(() =>
+    props.eager && typeof window !== 'undefined' ? new SyncedDb<S>(config, { eager: true }) : null
+  );
+  const [db, setDb] = useState<SyncedDb<S> | null>(early);
   const boot = useRef<Boot<S> | null>(null);
   const callbacks = useLatest({
     onError: props.onError,
     onReady: props.onReady,
     preload: props.preload,
   });
-  // Read once, at mount: see the `config` prop docs.
-  const config = useRef(props.config).current;
-
   useEffect(() => {
     let active = true;
     let current = boot.current;
@@ -103,8 +127,9 @@ export function Sp00kyProvider<S extends SchemaStructure>(props: Sp00kyProviderP
       current.disposeTimer = undefined;
     }
     if (!current) {
-      const instance = new SyncedDb<S>(config);
-      current = boot.current = { instance, init: instance.init(), revealed: false };
+      const instance = early ?? new SyncedDb<S>(config);
+      // An eager instance is in the tree's hands before it is initialized.
+      current = boot.current = { instance, init: instance.init(), revealed: early !== null, ready: false };
     }
     const b = current;
 
@@ -114,7 +139,7 @@ export function Sp00kyProvider<S extends SchemaStructure>(props: Sp00kyProviderP
         // Gate first-load UI on prewarmed data. Best-effort: never let a
         // preload failure keep the app stuck on the fallback.
         const preload = callbacks.current.preload;
-        if (preload && !b.revealed) {
+        if (preload && !b.ready) {
           try {
             await preload(b.instance);
           } catch (e) {
@@ -123,7 +148,8 @@ export function Sp00kyProvider<S extends SchemaStructure>(props: Sp00kyProviderP
           }
         }
         if (!active) return;
-        const first = !b.revealed;
+        const first = !b.ready;
+        b.ready = true;
         b.revealed = true;
         setDb(b.instance);
         if (first) callbacks.current.onReady?.(b.instance);

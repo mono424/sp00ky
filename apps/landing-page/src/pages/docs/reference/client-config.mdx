@@ -148,6 +148,15 @@ A copy is dropped the moment this tab writes to a table it came from and taken a
 query's next render, so it holds what the query last showed. Not used with `sharedTabs`. Set
 `false` to keep nothing in localStorage.
 
+By default a provider renders nothing until the client is open, so those rows reach a component
+when its query registers, a moment after startup. A provider's `eager` option renders the app at
+once, and the same rows are then what the very first render shows, before the local database is
+open at all. Each framework guide has a section on it: [React](/docs/guide/react#rendering-before-the-client-is-ready),
+[Solid](/docs/guide/solid#rendering-before-the-client-is-ready),
+[Solid 2](/docs/guide/solid2#rendering-before-the-client-is-ready),
+[Angular](/docs/guide/angular#rendering-before-the-client-is-ready),
+[Svelte](/docs/guide/svelte#rendering-before-the-client-is-ready).
+
 #### `database.followerReads`
 
 `localEngine: 'rows'` with `sharedTabs` only. `'leader'` (default) or `'direct'`.

@@ -189,7 +189,14 @@ export class BucketHandle {
     remote: RemoteDatabaseService,
     /** Absent on the raw handle the cache itself reads through. */
     private blobs?: BlobCache | null,
-    private settings?: BucketHandleSettings
+    private settings?: BucketHandleSettings,
+    /**
+     * Resolves once the client is open; nothing to wait for when it already
+     * is. Every call below awaits it, so a file asked for by a component that
+     * rendered before the client was ready (a provider's `eager` mode) is
+     * fetched then, where it used to fail for want of a connection.
+     */
+    private opened?: () => Promise<void> | undefined
   ) {
     this.io =
       settings?.backend === 'r2'
@@ -209,6 +216,7 @@ export class BucketHandle {
     content: string | Uint8Array | Blob,
     options?: BucketPutOptions
   ): Promise<BucketPutResult> {
+    await this.opened?.();
     // Start hashing while the upload is in flight; both browser-side costs
     // overlap and the sidecar put only queues once the main put resolved.
     const encodeOptions = this.resolveBlurhash(options?.blurhash);
@@ -247,6 +255,7 @@ export class BucketHandle {
    * serialized remote read per session.
    */
   async blurhash(path: string): Promise<string | null> {
+    await this.opened?.();
     const cacheKey = `${this.bucketName}:${path}`;
     if (missingBlurhash.has(cacheKey)) return null;
     try {
@@ -270,6 +279,7 @@ export class BucketHandle {
   }
 
   async get(path: string): Promise<unknown> {
+    await this.opened?.();
     return this.io.get(path);
   }
 
@@ -279,6 +289,7 @@ export class BucketHandle {
    * file exists in neither place.
    */
   async read(path: string, options?: BlobReadOptions): Promise<Blob | null> {
+    await this.opened?.();
     if (!this.blobs) return bucketContentToBlob(await this.get(path));
     return this.blobs.read({ bucket: this.bucketName, path }, options);
   }
@@ -289,6 +300,7 @@ export class BucketHandle {
    * file does not exist, or when object URLs are unavailable (non-browser).
    */
   async url(path: string, options?: BlobReadOptions): Promise<BlobUrlLease | null> {
+    await this.opened?.();
     if (!this.blobs) return null;
     return this.blobs.acquireUrl({ bucket: this.bucketName, path }, options);
   }
@@ -304,15 +316,18 @@ export class BucketHandle {
 
   /** Drop `path` from the local cache without touching the remote file. */
   async evict(path: string): Promise<void> {
+    await this.opened?.();
     await this.blobs?.invalidate({ bucket: this.bucketName, path });
   }
 
   /** Warm the cache for offline use. Already-cached paths are skipped. */
   async prefetch(paths: string[]): Promise<void> {
+    await this.opened?.();
     await this.blobs?.prefetch(paths.map((path) => ({ bucket: this.bucketName, path })));
   }
 
   async delete(path: string): Promise<void> {
+    await this.opened?.();
     await this.io.delete(path);
     await this.blobs?.invalidate({ bucket: this.bucketName, path });
     // Symmetry with put: an image's blurhash sidecar dies with it. Best-effort,
@@ -330,22 +345,27 @@ export class BucketHandle {
   }
 
   async exists(path: string): Promise<boolean> {
+    await this.opened?.();
     return this.io.exists(path);
   }
 
   async head(path: string): Promise<Record<string, unknown>> {
+    await this.opened?.();
     return this.io.head(path);
   }
 
   async copy(sourcePath: string, targetPath: string): Promise<void> {
+    await this.opened?.();
     await this.io.copy(sourcePath, targetPath);
   }
 
   async rename(sourcePath: string, targetPath: string): Promise<void> {
+    await this.opened?.();
     await this.io.rename(sourcePath, targetPath);
   }
 
   async list(prefix?: string): Promise<string[]> {
+    await this.opened?.();
     return this.io.list(prefix ?? '');
   }
 }

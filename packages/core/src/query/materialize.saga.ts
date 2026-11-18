@@ -7,7 +7,7 @@ import * as R from '../state/reducers';
 import { needed, overlay, vouched } from '../state/selectors';
 import { isAnswered } from '../state/lifecycle';
 import type { Overlay } from '../state/selectors';
-import { materializeEffect, renderRead, rowsEqual, rowsFromResult } from './materialize';
+import { materializeEffect, paintKeyOf, renderRead, rowsEqual, rowsFromResult } from './materialize';
 
 const NONE: ReadonlySet<string> = new Set();
 
@@ -29,9 +29,10 @@ export function* materialize(hash: QueryHash): Saga<void> {
   if (!entry) return;
   const t0 = (yield fx.now()) as number;
   const read = renderRead(entry, ov, known);
-  // Named by the view key, which a reload keeps: the store may keep this
-  // read's answer for the next page load to paint from (see `registerLocal`).
-  const effect = materializeEffect(entry.def, read.ids, entry.def.viewKey);
+  // Named after the query, as a reload will name it again: the store may keep
+  // this read's answer for the next page load to paint from (`registerLocal`,
+  // and before the client is open `Sp00kyClient.peekQuery`).
+  const effect = materializeEffect(entry.def, read.ids, paintKeyOf(entry.def, read.ids));
   let rows: Record<string, unknown>[];
   try {
     rows = read.shows(rowsFromResult(effect, yield effect));

@@ -201,13 +201,27 @@ export class SyncedDb<S extends SchemaStructure> {
   private config: SyncedDbConfig<S>;
   private sp00ky: Sp00kyClient<S> | null = null;
   private _initialized = false;
+  private eager: boolean;
 
-  constructor(config: SyncedDbConfig<S>) {
+  /**
+   * `eager`: the instance may be used before `init()` has run, which is what a
+   * provider that renders its children at once hands them (`<Sp00kyProvider
+   * eager>`). Its core client is then created on first use; queries and writes
+   * asked for early wait for `init()`, and `peekQuery` has rows to render
+   * meanwhile. Without it, using the instance before `init()` throws, as it
+   * always did.
+   */
+  constructor(config: SyncedDbConfig<S>, options: { eager?: boolean } = {}) {
     this.config = config;
+    this.eager = options.eager === true;
   }
 
   public getSp00ky(): Sp00kyClient<S> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
+    if (!this.sp00ky) {
+      if (!this.eager) throw new Error('SyncedDb not initialized');
+      // Creating the client opens nothing: that is `init()`.
+      this.sp00ky = new Sp00kyClient<S>(this.config);
+    }
     return this.sp00ky;
   }
 
@@ -216,9 +230,58 @@ export class SyncedDb<S extends SchemaStructure> {
    */
   async init(): Promise<void> {
     if (this._initialized) return;
-    this.sp00ky = new Sp00kyClient<S>(this.config);
-    await this.sp00ky.init();
+    this.sp00ky ??= new Sp00kyClient<S>(this.config);
+    try {
+      await this.sp00ky.init();
+    } catch (error) {
+      this.ready.reject(error);
+      throw error;
+    }
     this._initialized = true;
+    this.ready.resolve();
+  }
+
+  /** Settled by `init()` (or by `close()`): what `whenReady()` hands out, whether or not a client exists yet. */
+  private ready = SyncedDb.gate();
+
+  private static gate(): { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void } {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    // Unobserved, a failed init must not also be an unhandled rejection.
+    promise.catch(() => {});
+    return { promise, resolve, reject };
+  }
+
+  /** True once `init()` has finished. */
+  get isReady(): boolean {
+    return this._initialized;
+  }
+
+  /**
+   * Resolves once `init()` has finished, and rejects if it fails. In an eager
+   * tree, await it for whatever must not run on a client that is not open yet.
+   */
+  whenReady(): Promise<void> {
+    return this.ready.promise;
+  }
+
+  /**
+   * The rows `finalQuery` rendered the last time this browser had the app
+   * open, at once, for a first read that comes before `init()` is done.
+   * `null` when there are none, when this instance is not eager, and once the
+   * client is ready (a query's own first value carries them from then on).
+   * Needs `localEngine: 'rows'` (its paint cache). `createQuery` calls this;
+   * an app rarely has to.
+   */
+  peekQuery(
+    finalQuery: FinalQuery<S, any, any, any, any, Sp00kyQueryResultPromise>
+  ): Record<string, unknown>[] | null {
+    if (this._initialized || !this.eager) return null;
+    return this.getSp00ky().peekQuery(finalQuery);
   }
 
   /**
@@ -231,6 +294,9 @@ export class SyncedDb<S extends SchemaStructure> {
     const instance = this.sp00ky;
     this.sp00ky = null;
     this._initialized = false;
+    // Whoever still waits for a client that is going away must not wait forever.
+    this.ready.reject(new Error('SyncedDb: closed before it was ready'));
+    this.ready = SyncedDb.gate();
     if (instance) await instance.close();
   }
 
@@ -238,8 +304,7 @@ export class SyncedDb<S extends SchemaStructure> {
    * Create a new record in the database
    */
   async create(id: string, payload: Record<string, unknown>): Promise<void> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    await this.sp00ky.create(id, unproxy(payload) as Record<string, unknown>);
+    await this.getSp00ky().create(id, unproxy(payload) as Record<string, unknown>);
   }
 
   /**
@@ -251,8 +316,7 @@ export class SyncedDb<S extends SchemaStructure> {
     payload: Partial<TableModel<GetTable<S, TName>>>,
     options?: UpdateOptions
   ): Promise<void> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    await this.sp00ky.update(
+    await this.getSp00ky().update(
       tableName as string,
       recordId,
       unproxy(payload) as Record<string, unknown>,
@@ -267,7 +331,7 @@ export class SyncedDb<S extends SchemaStructure> {
     tableName: TName,
     selector: string | RecordId | InnerQuery<GetTable<S, TName>, boolean>
   ): Promise<void> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
+    const sp00ky = this.getSp00ky();
     // Accept a `"table:id"` string OR a RecordId — live-query rows carry their
     // `id` as a RecordId, so callers can pass `db.delete('game', row.id)`
     // directly. Build the canonical string from the raw id part (not
@@ -289,7 +353,7 @@ export class SyncedDb<S extends SchemaStructure> {
     } else {
       throw new Error('Only string ID or RecordId selectors are supported currently with core');
     }
-    await this.sp00ky.delete(tableName as string, id);
+    await sp00ky.delete(tableName as string, id);
   }
 
   /**
@@ -301,8 +365,7 @@ export class SyncedDb<S extends SchemaStructure> {
     finalQuery: FinalQuery<S, any, any, any, any, Sp00kyQueryResultPromise>,
     options?: PreloadOptions
   ): Promise<void> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    await this.sp00ky.preload(finalQuery, options);
+    await this.getSp00ky().preload(finalQuery, options);
   }
 
   /**
@@ -311,8 +374,7 @@ export class SyncedDb<S extends SchemaStructure> {
   public query<TName extends TableNames<S>>(
     table: TName
   ): QueryBuilder<S, TName, Sp00kyQueryResultPromise, {}, false> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.query(table, {});
+    return this.getSp00ky().query(table, {});
   }
 
   /**
@@ -324,8 +386,7 @@ export class SyncedDb<S extends SchemaStructure> {
     query: ChannelQuery<S, T> | ReadonlyArray<ChannelQuery<S, T>>,
     peers: Iterable<ChannelPeer>
   ): Sp00kyChannel<S, T> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.channel(query, peers);
+    return this.getSp00ky().channel(query, peers);
   }
 
   /**
@@ -337,8 +398,7 @@ export class SyncedDb<S extends SchemaStructure> {
     payload: RoutePayload<S, B, R>,
     options?: RunOptions
   ): Promise<void> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    await this.sp00ky.run(backend, path, unproxy(payload), options);
+    await this.getSp00ky().run(backend, path, unproxy(payload), options);
   }
 
   /**
@@ -347,24 +407,21 @@ export class SyncedDb<S extends SchemaStructure> {
    * `useImpersonation({ rendersBanner: true })` hook calls it for you.
    */
   public acknowledgeImpersonationBanner(): void {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    this.sp00ky.acknowledgeImpersonationBanner();
+    this.getSp00ky().acknowledgeImpersonationBanner();
   }
 
   /**
    * Sign out, clear session and local storage
    */
   public async signOut(): Promise<void> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    await this.sp00ky.auth.signOut();
+    await this.getSp00ky().auth.signOut();
   }
 
   /**
    * Execute a function with direct access to the remote database connection
    */
   public async useRemote<T>(fn: (db: Surreal) => T | Promise<T>): Promise<T> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return await this.sp00ky.useRemote(fn);
+    return await this.getSp00ky().useRemote(fn);
   }
 
   /**
@@ -386,8 +443,7 @@ export class SyncedDb<S extends SchemaStructure> {
     sql: string,
     vars?: Record<string, unknown>
   ): Promise<T> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return await this.sp00ky.remoteQuery<T>(
+    return await this.getSp00ky().remoteQuery<T>(
       sql,
       vars ? (unproxy(vars) as Record<string, unknown>) : undefined
     );
@@ -396,46 +452,39 @@ export class SyncedDb<S extends SchemaStructure> {
    * Access the remote database service directly
    */
   get remote(): Sp00kyClient<S>['remoteClient'] {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.remoteClient;
+    return this.getSp00ky().remoteClient;
   }
 
   /**
    * Access the local database service directly
    */
   get local(): Sp00kyClient<S>['localClient'] {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.localClient;
+    return this.getSp00ky().localClient;
   }
 
   /**
    * Access the auth service
    */
   get auth(): AuthService<S> {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.auth;
+    return this.getSp00ky().auth;
   }
 
   get pendingMutationCount(): number {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.pendingMutationCount;
+    return this.getSp00ky().pendingMutationCount;
   }
 
   /** Diagnostic — see `Sp00kyClient.liveRetryCount`. */
   get liveRetryCount(): number {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.liveRetryCount;
+    return this.getSp00ky().liveRetryCount;
   }
 
   subscribeToPendingMutations(cb: (count: number) => void): () => void {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.subscribeToPendingMutations(cb);
+    return this.getSp00ky().subscribeToPendingMutations(cb);
   }
 
   /** Queries mid-fetch right now. See {@link useSyncActivity}. */
   get fetchingQueryCount(): number {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.fetchingQueryCount;
+    return this.getSp00ky().fetchingQueryCount;
   }
 
   /**
@@ -443,14 +492,12 @@ export class SyncedDb<S extends SchemaStructure> {
    * and on every change. Prefer the `useSyncActivity` hook in components.
    */
   subscribeToFetchActivity(cb: (fetching: number) => void): () => void {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.subscribeToFetchActivity(cb);
+    return this.getSp00ky().subscribeToFetchActivity(cb);
   }
 
   /** Current sync-health snapshot. See {@link useSyncStatus}. */
   get syncHealth(): SyncHealth {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.syncHealth;
+    return this.getSp00ky().syncHealth;
   }
 
   /**
@@ -459,14 +506,12 @@ export class SyncedDb<S extends SchemaStructure> {
    * components; this is the imperative escape hatch.
    */
   subscribeToSyncHealth(cb: (health: SyncHealth) => void): () => void {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.subscribeToSyncHealth(cb);
+    return this.getSp00ky().subscribeToSyncHealth(cb);
   }
 
   /** Current local-store durability snapshot. See {@link useStorageStatus}. */
   get storageHealth(): StorageHealth {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.storageHealth;
+    return this.getSp00ky().storageHealth;
   }
 
   /**
@@ -475,8 +520,7 @@ export class SyncedDb<S extends SchemaStructure> {
    * is the imperative escape hatch.
    */
   subscribeToStorageHealth(cb: (health: StorageHealth) => void): () => void {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.subscribeToStorageHealth(cb);
+    return this.getSp00ky().subscribeToStorageHealth(cb);
   }
 
   /**
@@ -485,13 +529,11 @@ export class SyncedDb<S extends SchemaStructure> {
    * service worker. See the push-notifications docs page.
    */
   get webPush(): WebPushModule {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.webPush;
+    return this.getSp00ky().webPush;
   }
 
   bucket<B extends BucketNames<S>>(name: B): BucketHandle {
-    if (!this.sp00ky) throw new Error('SyncedDb not initialized');
-    return this.sp00ky.bucket(name);
+    return this.getSp00ky().bucket(name);
   }
 
   getBucketConfig(name: string): BucketDefinitionSchema | undefined {

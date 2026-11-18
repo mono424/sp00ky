@@ -65,7 +65,8 @@ last load read first, and the IndexedDB connection.
 The fresh-page read is the one a query's first render makes in the client: the rows of its render
 set, by id, as one `select` the client names after the query. The row store seeds a new query with
 what that read answered in the last page load (its paint cache), which is the "first rows on
-screen" line.
+screen" line. A provider's `eager` mode is what puts those rows in a component's very first
+render; without it they arrive when the query registers, once the client is open.
 
 Two more sections follow the three-way comparison: the row store's worker started with and without
 the V8 compile hint (`vite.config.ts` writes a copy of the worker without it), and JSON text

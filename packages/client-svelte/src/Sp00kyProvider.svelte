@@ -1,14 +1,22 @@
 <script lang="ts" generics="S extends SchemaStructure">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { SchemaStructure } from '@spooky-sync/query-builder';
   import { SyncedDb } from './db.js';
   import { setDbContext } from './context.js';
   import type { Sp00kyProviderProps } from './types.js';
 
-  let { config, fallback, onError, onReady, preload, children }: Sp00kyProviderProps<S> =
+  let { config, fallback, eager, onError, onReady, preload, children }: Sp00kyProviderProps<S> =
     $props();
 
-  let db = $state.raw<SyncedDb<S> | undefined>(undefined);
+  // Eager: the instance the tree mounts on, in context before the children
+  // initialise. Building it opens nothing (its core client comes with its first
+  // use, `init()` still runs in `onMount`). Read once, like `config`; never on
+  // the server, where the client cannot run.
+  const early = untrack(() =>
+    eager && typeof window !== 'undefined' ? new SyncedDb<S>(config, { eager: true }) : undefined
+  );
+
+  let db = $state.raw<SyncedDb<S> | undefined>(early);
 
   setDbContext({
     get db() {
@@ -25,14 +33,16 @@
   // its core, so every later write throws "SyncedDb not initialized" while
   // reads keep rendering, i.e. mutations die silently. The provider wraps the
   // whole app and goes with the page, where the browser reclaims it anyway.
+  // An eager instance is in the tree's hands before it is initialized, so it
+  // is never closed either.
   onMount(() => {
     let destroyed = false;
     void (async () => {
       try {
-        const instance = new SyncedDb<S>(config);
+        const instance = early ?? new SyncedDb<S>(config);
         await instance.init();
         if (destroyed) {
-          await instance.close();
+          if (!early) await instance.close();
           return;
         }
         if (preload) {
@@ -44,7 +54,7 @@
           }
         }
         if (destroyed) {
-          await instance.close();
+          if (!early) await instance.close();
           return;
         }
         db = instance;

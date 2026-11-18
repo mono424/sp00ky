@@ -128,6 +128,52 @@ The client starts in an app initializer; the app renders once it is ready, and t
 of `index.html` keeps its content until then (`<app-root>Initializing…</app-root>`). If it cannot
 start, bootstrap fails: handle it on `bootstrapApplication(...).catch(...)`.
 
+### Rendering before the client is ready
+
+With `eager` the app bootstraps and renders at once, before the client has opened its local
+database:
+
+```ts
+provideSp00ky(dbConfig, { eager: true }),
+```
+
+With `localEngine: 'rows'`, `injectQuery` then returns, on its very first read, the rows the query
+showed the last time the app was open, with `isLoading()` false. The query starts as soon as the
+client is ready and replaces them when its answer differs. Until then `isAuthoritative()` is
+`false`, as for any query still loading.
+
+What changes for your app is that it starts on a client that is not open yet:
+
+- Queries and writes made early wait for the client. Nothing has to be reordered.
+- Functions that report state (`injectSyncStatus`, `injectFeatureFlag`) and `db.auth.subscribe`
+  report their not-known-yet value until the client is ready: signed out, the flag's fallback.
+  Gate what a signed-out visitor must not see on `await db.whenReady()`, or on `db.isReady`.
+- Bootstrap no longer waits for the client, and no longer fails when it cannot start. The failure
+  is logged, `db.whenReady()` rejects, and the queries waiting on the client report it in `error()`.
+- `preload` still runs once the client is ready, but no longer holds the first render back.
+- It is for the browser. A server render never starts the client, with or without `eager`, so
+  `db.whenReady()` never settles there.
+
+`db.isReady` is a plain getter, not a signal. To show something only once the client is ready,
+keep that in a signal:
+
+```ts
+private readonly db = injectDb<typeof schema>();
+protected readonly ready = signal(this.db.isReady);
+
+constructor() {
+  // Rejects if the client fails to start: provideSp00ky logs that.
+  this.db.whenReady().then(
+    () => this.ready.set(true),
+    () => {}
+  );
+}
+```
+
+Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
+same browser, and only while no write has touched their tables since. With `sharedTabs` none are
+kept.
+
 ## 6. Query
 
 ```ts

@@ -139,7 +139,9 @@ export interface QueryState<TData> {
   /**
    * The result. `[]` / `null` before the first emission, then each live
    * emission with structural sharing: unchanged rows keep their object
-   * identity, so a keyed `{#each}` only updates the rows that changed.
+   * identity, so a keyed `{#each}` only updates the rows that changed. Under
+   * an `eager` provider it starts as the rows the query showed the last time
+   * the app was open, when the local store kept them.
    */
   readonly data: TData;
   /** Registration or sync error (e.g. SSP 503 during bootstrap). Never thrown. */
@@ -246,9 +248,10 @@ export function useQuery(
   let error = $state.raw<Error | undefined>(undefined);
   // Server membership known and painted for the current identity (core authority).
   let isAuthoritative = $state(false);
-  // An emission WITH data was applied for the current identity. With
-  // `isAuthoritative` this ends the cold load: a cached paint ends it without
-  // the server, a server answer ends it without rows.
+  // An emission WITH data was applied for the current identity, or the rows
+  // it showed last time were painted (`paint` below). With `isAuthoritative`
+  // this ends the cold load: a cached paint ends it without the server, a
+  // server answer ends it without rows.
   let hasPainted = $state(false);
   let isFetching = $state(false);
   // Registered hash of the attached query, for opt-in deregistration.
@@ -264,19 +267,40 @@ export function useQuery(
   const identity = $derived(resolved ? String(resolved.hash) : null);
   const isOne = $derived(resolved?.isOne);
 
+  // On a client that is not open yet (an eager provider) the query cannot
+  // answer for a while: the rows it showed the last time the app was open
+  // become `data` meanwhile. Returns whether there were any, for the paint
+  // latch. Once the client is ready the query's own first emission carries
+  // those rows, so there is nothing to peek.
+  const paint = (query: AnyFinalQuery | null): boolean => {
+    if (!query) return false;
+    let rows: Record<string, unknown>[] | null = null;
+    try {
+      if (!sp00ky.isLocalReady()) rows = db.peekQuery(query);
+    } catch {
+      // Painting early is a bonus: a peek that fails paints nothing.
+    }
+    if (!rows || rows.length === 0) return false;
+    data = share(data, query.isOne ? rows[0] : rows);
+    return true;
+  };
+  // Seeded here, not in the effect below, so the very first read has the rows.
+  hasPainted = paint(untrack(() => resolved));
+
   $effect(() => {
     const id = identity;
+    const query = untrack(() => resolved);
     // A new identity starts clean: authority, the paint latch and a previous
     // identity's error reset. `data` stays until the new identity emits, so
-    // growing a `.limit()` does not flash an empty list.
+    // growing a `.limit()` does not flash an empty list. The exception is a
+    // client that is not open yet, where the new identity paints as above.
     untrack(() => {
       isAuthoritative = false;
-      hasPainted = false;
+      hasPainted = paint(query);
       isFetching = false;
       error = undefined;
     });
     if (id === null) return;
-    const query = untrack(() => resolved);
     if (!query) return;
 
     let disposed = false;
@@ -340,14 +364,16 @@ export function useQuery(
         // core's order: authority flips only after the rows it covers. This is
         // the channel that ends a cold load whose honest answer is zero rows.
         // A flip back to false is a bucket switch (another principal): what is
-        // painted is the previous one's, so the paint latch goes with it.
+        // painted is the previous one's, so the paint latch goes with it. Only
+        // a flip BACK: the "not answered yet" a query says as soon as it is
+        // subscribed to takes nothing from rows that are already on screen.
         addCleanup(
           sp00ky.subscribeQueryAuthority(
             hash,
             (known) => {
               if (disposed) return;
+              if (!known && untrack(() => isAuthoritative)) hasPainted = false;
               isAuthoritative = known;
-              if (!known) hasPainted = false;
             },
             { immediate: true }
           )

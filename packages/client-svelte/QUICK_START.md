@@ -88,8 +88,37 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
 ```
 
 `config` is read once at mount (wrap the provider in `{#key}` to switch databases). `preload` is
-awaited before the children render. The client is created in `onMount`, so a server render only
+awaited before the children render. The client is initialized in `onMount`, so a server render only
 shows the fallback.
+
+### Rendering before the client is ready
+
+By default nothing below the provider renders until the client has opened its local database. With
+`eager` the children render at once:
+
+```svelte
+<Sp00kyProvider config={dbConfig} eager>
+  {@render children()}
+</Sp00kyProvider>
+```
+
+With `localEngine: 'rows'`, `useQuery` then holds, on its very first read, the rows the query showed
+the last time the app was open, with `isLoading` false. The query starts as soon as the client is
+ready and replaces them when its answer differs. Until then `isAuthoritative` is `false`, as for any
+query still loading.
+
+What changes for your tree is that it mounts on a client that is not open yet:
+
+- Queries and writes made early wait for the client. Nothing has to be reordered.
+- Hooks that report state (`useSyncStatus`, `useFeatureFlag`) and `db.auth.subscribe` report their
+  not-known-yet value until the client is ready: signed out, the flag's fallback. Gate what a
+  signed-out visitor must not see on `await db.whenReady()`, or on `db.isReady` in a handler (it is
+  a plain getter, not reactive state).
+- `fallback` is never rendered, and `preload` no longer holds the UI back.
+- It is for client-rendered trees. A server render still produces the fallback.
+
+Rows only come back for queries that rendered in the first seconds of an earlier visit, on the same
+browser, and not with `sharedTabs`.
 
 ## 5. Query
 

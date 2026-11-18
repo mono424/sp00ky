@@ -133,6 +133,11 @@ export class PaintCache {
     }
   }
 
+  /** The bucket about to be opened: peeks answer from it until `start` says which one it is. */
+  expect(bucket: string): void {
+    if (!this.bucket) this.bucket = bucket;
+  }
+
   /** A new session on `bucket`: reads from now on are startup reads for a while. */
   start(bucket: string): void {
     if (bucket !== this.bucket) {
@@ -722,6 +727,14 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     // A named read needs no payload to find its copy.
     const payload = opts?.paintKey === undefined ? this.selectPayload(plan, params) : null;
     return this.paint.get(this.selectKey(payload, opts), fromBase64);
+  }
+
+  /**
+   * See `LocalStore.expectBucket`. Not with shared tabs: the paint cache is
+   * not kept there (other tabs write to the store unseen by this one).
+   */
+  expectBucket(bucketId: string): void {
+    if (!this.shared) this.paint?.expect(bucketId);
   }
 
   /** {@link peekSelect} for `selectByIds`. */

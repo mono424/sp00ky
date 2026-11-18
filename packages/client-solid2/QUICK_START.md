@@ -34,7 +34,36 @@ function App() {
 }
 ```
 
-Same props as client-solid's provider (`config`, `fallback`, `preload`, `onReady`, `onError`). A live mounted client is deliberately not closed on unmount (see source comment).
+Same props as client-solid's provider (`config`, `fallback`, `preload`, `onReady`, `onError`, `eager`). A live mounted client is deliberately not closed on unmount (see source comment).
+
+### Rendering before the client is ready
+
+By default nothing below the provider renders until the client has opened its local database. With `eager` the children render at once:
+
+```tsx
+<Sp00kyProvider config={dbConfig} eager>
+  <MyApp />
+</Sp00kyProvider>
+```
+
+With `localEngine: 'rows'`, `createQuery` then has, the first time `data()` is read, the rows the query showed the last time the app was open, and `isLoading()` is `false`. The query starts as soon as the client is ready and replaces them when its answer differs. Until then `isAuthoritative()` is `false`, as for any query still loading.
+
+What changes for your tree is that it mounts on a client that is not open yet:
+
+- Queries and writes made early wait for the client. Nothing has to be reordered.
+- Hooks that report state (`useSyncStatus`, `useFeatureFlag`, auth) report their not-known-yet value until the client is ready. Gate what a signed-out visitor must not see on `await db.whenReady()`, or on `db.isReady`.
+- `fallback` is never rendered, and `preload` no longer holds the UI back.
+- It is for client-rendered trees. A server render still produces the fallback.
+
+`db.isReady` is a plain getter, not a signal, and `db.whenReady()` rejects if the client fails to start. To show something only once the client is ready, keep that in a signal:
+
+```tsx
+const db = useDb<typeof schema>();
+const [ready, setReady] = createSignal(db.isReady);
+db.whenReady().then(() => setReady(true), () => {});
+```
+
+Rows only come back for queries that rendered in the first seconds of an earlier visit, on the same browser, and only while no write has touched their tables since.
 
 ## createQuery
 

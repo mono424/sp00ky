@@ -2153,6 +2153,10 @@ impl ClusterBoot {
     }
 }
 
+/// How long a starting SSP waits for the index records before it falls back
+/// to the local file (see [`held_index_plan`]).
+const INDEX_RECORD_READ: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a starting SSP rebuilds of the indexes the SSPs before it held, and
 /// where that came from.
 struct HeldIndexPlan {
@@ -2183,10 +2187,18 @@ async fn held_index_plan(
     let records = if limits.time.is_zero() {
         Vec::new()
     } else {
-        match index_memory::read_records(db).await {
-            Ok(records) => records,
-            Err(e) => {
+        // Bounded: a standby reads this before it reports Ready.
+        match tokio::time::timeout(INDEX_RECORD_READ, index_memory::read_records(db)).await {
+            Ok(Ok(records)) => records,
+            Ok(Err(e)) => {
                 warn!(error = %e, "Could not read which indexes the SSPs before this one held");
+                Vec::new()
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = INDEX_RECORD_READ.as_secs(),
+                    "Reading which indexes the SSPs before this one held timed out"
+                );
                 Vec::new()
             }
         }
@@ -2602,6 +2614,26 @@ mod background_prebuild_tests {
         let took = started.elapsed();
         assert!(took >= SHUTDOWN_INDEX_RECORD && took < SHUTDOWN_INDEX_RECORD + Duration::from_secs(1), "{took:?}");
         assert!(background.current.lock().unwrap().is_none(), "the background prebuild was stopped too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A standby reads the records before it reports Ready: a database that
+    /// never answers costs it the read's bound, then the local file is used.
+    #[tokio::test(start_paused = true)]
+    async fn a_standby_gives_up_on_a_stalled_record_read() {
+        let dir = std::env::temp_dir().join(format!("ssp-stalled-read-{}-{}", std::process::id(), ssp_node::now_epoch_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("indexes.json"), r#"{"game":["game_n"]}"#).unwrap();
+        let rows = warm::RowCheckpoints::at(
+            dir.clone(),
+            ssp::circuit::checkpoint::BodyVerify::AtLoad,
+            ssp::circuit::arena::ArenaBacking::Heap,
+        );
+        let processor = circuit();
+        let started = tokio::time::Instant::now();
+        prebuild_held_indexes(&FakeDb(None), &processor, Some(&rows), &ssp_node::index_memory::Lineage::new("ssp-0", None)).await;
+        assert_eq!(started.elapsed(), INDEX_RECORD_READ, "waited the bound, no longer");
+        assert_eq!(rows_held(&processor), ROWS, "then built from the local file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

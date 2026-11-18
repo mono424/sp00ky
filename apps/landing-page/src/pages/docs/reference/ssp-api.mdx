@@ -984,10 +984,11 @@ Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.
   every minute, written when that changed (and at least every ten minutes),
   and once more on graceful shutdown. A standby or retired SSP writes nothing,
   and a record not written for seven days is deleted. After its bootstrap a
-  starting SSP reads every such record and builds the indexes the mirrored
+  starting SSP reads every such record (giving up after five seconds) and builds the indexes the mirrored
   schema still defines with the same fields and that were read within
   `SPKY_SSP_INDEX_IDLE_RELEASE_SECS`, until `SPKY_SSP_INDEX_PREBUILD_SECS`
-  (default 60) runs out and within `SPKY_SSP_INDEX_PREBUILD_MAX_MB` (default:
+  (default 60, a soft limit checked before each index: the build under way
+  finishes) runs out and within `SPKY_SSP_INDEX_PREBUILD_MAX_MB` (default:
   as much as the largest earlier SSP held). Its own line goes first (records
   written by itself, by the SSP it replaces, or by an SSP of the same `ssp-N`
   slot), most recently read first; other SSPs' records only fill what is

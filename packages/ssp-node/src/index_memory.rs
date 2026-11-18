@@ -79,6 +79,11 @@ impl SspIndexRecord {
     }
 }
 
+/// Every SSP's record and nothing else of `_00_sync_evidence`: the ids
+/// `⟨ssp_indexes:…⟩` (`;` sorts right after `:`), so neither the read nor the
+/// prune walks the rest of the table.
+const RECORD_RANGE: &str = "_00_sync_evidence:⟨ssp_indexes:⟩..⟨ssp_indexes;⟩";
+
 /// The record id one SSP writes. Ids are `ssp-0`, `ssp-0-g<hex>` and the
 /// like; anything else is folded to `_` so the id needs no escaping.
 pub fn record_id(ssp_id: &str) -> String {
@@ -102,7 +107,7 @@ pub async fn write_record(db: &dyn Db, record: &SspIndexRecord) -> Result<(), Db
     let sql = format!(
         "DEFINE TABLE IF NOT EXISTS _00_sync_evidence SCHEMALESS PERMISSIONS NONE; \
          UPSERT {} CONTENT $record RETURN NONE; \
-         DELETE _00_sync_evidence WHERE kind = '{RECORD_KIND}' AND at_ms < $cutoff;",
+         DELETE {RECORD_RANGE} WHERE at_ms < $cutoff;",
         record_id(&record.ssp_id)
     );
     crate::db_retry::query_retrying(db, &sql, &[("record", content), ("cutoff", Value::from(cutoff))])
@@ -114,7 +119,7 @@ pub async fn write_record(db: &dyn Db, record: &SspIndexRecord) -> Result<(), Db
 /// `_00_sync_evidence` table yet) has none; a record of another format, or
 /// one that does not read, is left out.
 pub async fn read_records(db: &dyn Db) -> Result<Vec<SspIndexRecord>, DbError> {
-    let sql = format!("SELECT format, ssp_id, at_ms, indexes FROM _00_sync_evidence WHERE kind = '{RECORD_KIND}';");
+    let sql = format!("SELECT format, ssp_id, at_ms, indexes FROM {RECORD_RANGE};");
     let rows = match db.query(&sql, &[]).await {
         Ok(rows) => rows,
         Err(e) if e.to_string().contains("does not exist") => return Ok(Vec::new()),

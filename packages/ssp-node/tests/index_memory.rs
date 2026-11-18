@@ -179,6 +179,10 @@ async fn a_replacement_ssp_builds_what_the_one_before_it_held_before_it_serves()
     let mut ids: Vec<String> = read_records(&db).await.unwrap().into_iter().map(|r| r.ssp_id).collect();
     ids.sort();
     assert_eq!(ids, vec!["ssp-0", "ssp-0-g1"], "the ancient record was pruned");
+    // Records of other kinds in the same table are neither read nor pruned:
+    // the reads and deletes go by id range.
+    db.query("UPSERT _00_sync_evidence:⟨ssp_indexes⟩ SET kind = 'ssp_indexes', format = 1, ssp_id = 'stray', at_ms = 0, indexes = []", &[]).await.unwrap();
+    db.query("UPSERT _00_sync_evidence:zzz SET kind = 'ssp_indexes', format = 1, ssp_id = 'other', at_ms = 0, indexes = []", &[]).await.unwrap();
     // The slow-operation samples in the same table are untouched by either.
     db.query("UPSERT _00_sync_evidence:slow_operations SET samples = [1]", &[]).await.unwrap();
     write_record(&db, &SspIndexRecord { format: RECORD_FORMAT, ssp_id: "ssp-0-g1".into(), at_ms: now, indexes: Vec::new() })
@@ -186,6 +190,11 @@ async fn a_replacement_ssp_builds_what_the_one_before_it_held_before_it_serves()
         .unwrap();
     let samples = db.query("SELECT samples FROM ONLY _00_sync_evidence:slow_operations", &[]).await.unwrap();
     assert_eq!(samples[0]["samples"], json!([1]));
+    let mut ids: Vec<String> = read_records(&db).await.unwrap().into_iter().map(|r| r.ssp_id).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["ssp-0", "ssp-0-g1"], "outside the range: not read");
+    let strays = db.query("SELECT VALUE ssp_id FROM _00_sync_evidence WHERE ssp_id IN ['stray', 'other']", &[]).await.unwrap();
+    assert_eq!(strays[0].as_array().map(Vec::len), Some(2), "outside the range: not pruned either");
 }
 
 #[tokio::test]

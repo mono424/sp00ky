@@ -788,7 +788,11 @@ impl Circuit {
                     table: table.clone(),
                     name: state.def.name,
                     fields: state.def.fields,
-                    idle_ms: if used { 0 } else { state.idle.map_or(0, |idle| idle.as_millis() as u64) },
+                    idle_ms: if used {
+                        0
+                    } else {
+                        state.idle.map_or(0, |idle| u64::try_from(idle.as_millis()).unwrap_or(u64::MAX))
+                    },
                     rows: state.rows,
                     bytes: state.bytes,
                 });
@@ -6553,6 +6557,31 @@ mod index_tests {
         assert!((600_000..900_000).contains(&c.held_indexes()[0].idle_ms));
         c.carry_index_idle("game", "game_database_sort", Duration::from_secs(60));
         assert!((60_000..600_000).contains(&c.held_indexes()[0].idle_ms));
+    }
+
+    /// A host up for less time than the age it carries cannot set its
+    /// monotonic clock back that far: the age is kept all the same, so the
+    /// index goes when its grace runs out, not a whole grace later.
+    #[test]
+    fn an_idle_age_older_than_the_clock_is_kept() {
+        use std::time::Duration;
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        c.store.apply_change(&Change::create("game", "g1", json!({ "database": "game_database:d1", "sort_index": 1 })));
+        let fields = vec!["database".to_string(), "sort_index".to_string()];
+        // Past the range of every platform's monotonic clock (on Unix it may
+        // go below zero; Windows and a browser's cannot).
+        let ages = Duration::from_secs(u64::MAX / 2 + u64::MAX / 4);
+        assert!(Instant::now().checked_sub(ages).is_none(), "older than any monotonic clock");
+        c.prebuild_held_index("game", "game_database_sort", &fields, ages);
+        assert_eq!(c.held_indexes()[0].idle_ms, u64::MAX, "reported, saturated");
+        c.set_index_idle_release(ages + Duration::from_secs(86_400));
+        c.release_unused_indexes();
+        assert!(!c.built_indexes().is_empty(), "within its grace");
+        c.set_index_idle_release(ages / 2);
+        c.release_unused_indexes();
+        assert!(c.built_indexes().is_empty(), "past its grace");
     }
 
     #[test]

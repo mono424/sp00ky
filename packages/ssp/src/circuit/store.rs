@@ -243,7 +243,7 @@ impl Collection {
             fresh.pending = Some(self.rows.keys().map(SmolStr::new).collect());
             fresh
         });
-        index.idle_since = None;
+        index.clear_idle();
         let mut stats = IndexBuildStats::default();
         if index.is_complete() {
             return (true, stats);
@@ -343,14 +343,16 @@ impl Collection {
     ) {
         self.indexes.get_mut().retain(|name, index| {
             if used.contains(name) {
-                index.idle_since = None;
+                index.clear_idle();
                 return true;
             }
             if !defined.contains(name) {
                 return false;
             }
-            let since = *index.idle_since.get_or_insert(now);
-            now.duration_since(since) < grace
+            if index.idle_since.is_none() {
+                index.set_idle(now, std::time::Duration::ZERO);
+            }
+            index.idle_for(now).unwrap_or_default() < grace
         });
     }
 
@@ -375,7 +377,7 @@ impl Collection {
             .values()
             .map(|index| IndexState {
                 def: index.def.clone(),
-                idle: index.idle_since.map(|since| now.saturating_duration_since(since)),
+                idle: index.idle_for(now),
                 rows: index.len(),
                 bytes: index.bytes(),
             })
@@ -396,11 +398,10 @@ impl Collection {
     /// not running.
     pub fn set_index_idle_for(&self, name: &str, idle: std::time::Duration, now: Instant) {
         if let Some(index) = self.indexes.lock().get_mut(name) {
-            let running = index.idle_since.map(|since| now.saturating_duration_since(since));
-            if running.is_some_and(|running| running <= idle || idle.is_zero()) {
+            if index.idle_for(now).is_some_and(|running| running <= idle || idle.is_zero()) {
                 return;
             }
-            index.idle_since = Some(now.checked_sub(idle).unwrap_or(now));
+            index.set_idle(now, idle);
         }
     }
 

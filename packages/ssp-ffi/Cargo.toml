@@ -1,6 +1,6 @@
 [package]
 name = "ssp-ffi"
-version = "1.0.0-beta.6"
+version = "1.0.0-beta.7"
 edition = "2021"
 description = "C ABI (Dart FFI) bindings for ssp"
 license = "MIT"

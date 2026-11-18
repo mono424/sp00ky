@@ -5,7 +5,7 @@ import { executeSelect, type SelectDb } from './sqlite-select';
 import { fromBase64, renderOrderSql, renderWhereSql, reviveRow, serializeMergeRow, serializeRow } from './sqlite-plan-sql';
 import type { OrderBy, Row } from './cache-engine';
 import { MemoryFile, RowStore } from './rows-store';
-import { RowsExec, parseRowBytes, type WireOp } from './rows-exec';
+import { RowsExec, parseRowBytes, visibleTables, type WireOp } from './rows-exec';
 
 /**
  * The row store has to answer a query the way the SQLite engine does, since an
@@ -499,5 +499,91 @@ describe('row store: version reset and blobs', () => {
     expect(exec.count('_00_circuit_snapshot', [{ field: 'a', op: '=', value: 1 }])).toBe(0);
     exec.deleteBlob('_00_circuit_snapshot', 'circuit');
     expect(exec.getBlob('_00_circuit_snapshot', 'circuit')).toEqual({ bytes: null, meta: null });
+  });
+});
+
+describe('row store vs SQLite: indexes', () => {
+  const hidden = (): string[] => store.tableNames().filter((t) => t.startsWith('\u0001i'));
+
+  it('indexes record links as rows are written, and filtered fields on first use', async () => {
+    // `white`, `black` and the comments' links were found while seeding.
+    expect(hidden()).toEqual(expect.arrayContaining(['\u0001i\u0001game\u0001white', '\u0001i\u0001comment\u0001game', '\u0001i\u0001comment\u0001author']));
+    // `title` got one when a query filtered on it; nothing ever filtered on `blob`.
+    expect(hidden()).toContain('\u0001i\u0001game\u0001title');
+    expect(hidden()).not.toContain('\u0001i\u0001game\u0001blob');
+    // A URL is not a link.
+    const { ops, buf } = pack('site', [{ id: 'site:1', url: 'https://example.com/a', owner: 'user:1' }], 'put');
+    exec.write(ops, buf, false);
+    expect(hidden()).toContain('\u0001i\u0001site\u0001owner');
+    expect(hidden()).not.toContain('\u0001i\u0001site\u0001url');
+    // The client's own tables are read whole.
+    const internal = pack('_00_view', [{ id: '_00_view:1', owner: 'user:1' }], 'put');
+    exec.write(internal.ops, internal.buf, false);
+    expect(hidden().some((t) => t.includes('_00_view'))).toBe(false);
+  });
+
+  it('stays right through inserts, updates, deletes and clears, and across a reopen', async () => {
+    let seedValue = 4242;
+    const rnd = (n: number): number => {
+      seedValue = (Math.imul(seedValue, 1103515245) + 12345) & 0x7fffffff;
+      return seedValue % n;
+    };
+    db.exec({ sql: `CREATE TABLE IF NOT EXISTS "churn" (id TEXT PRIMARY KEY, data TEXT NOT NULL)` });
+    selectDb.knownTables.add('churn');
+    const owners = Array.from({ length: 12 }, (_, i) => `user:${i}`);
+    const kinds = Array.from({ length: 20 }, (_, i) => `kind-${i}`);
+    const check = async (): Promise<void> => {
+      for (const owner of [owners[rnd(12)], owners[rnd(12)], 'user:none']) {
+        await same({ table: 'churn', where: [{ field: 'owner', op: '=', value: owner }] });
+        await same({ table: 'churn', where: [{ field: 'owner', op: '=', value: owner }, { field: 'n', op: '>', value: 40 }], orderBy: [['n', 'desc'], ['id', 'asc']], limit: 5 });
+      }
+      await same({ table: 'churn', where: [{ field: 'kind', op: '=', value: kinds[rnd(20)] }] });
+      await same({ table: 'churn', where: [{ field: 'flag', op: '=', value: true }], limit: 7 });
+      await same({ table: 'churn', where: [{ field: 'n', op: '=', value: rnd(100) }] });
+      await same({ table: 'churn', where: [{ field: 'id', op: '=', value: `churn:${rnd(150)}` }] });
+      await same({ table: 'churn', where: [{ field: 'owner', op: '=', value: null }] });
+      const keys = [owners[rnd(12)], owners[rnd(12)], owners[rnd(12)]];
+      const mine = parseRowBytes<Row[]>(exec.relation({ table: 'churn', matchField: 'owner', keys, orderBy: [['id', 'asc']] }), fromBase64);
+      const bind = keys.map(() => '?').join(', ');
+      const theirs = selectDb.exec(`SELECT data FROM "churn" WHERE json_extract(data, '$.owner') IN (${bind}) ORDER BY id`, keys).map((r) => reviveRow(r.data));
+      expect(mine).toEqual(theirs);
+    };
+    for (let step = 0; step < 500; step++) {
+      const id = `churn:${rnd(150)}`;
+      const roll = rnd(100);
+      if (roll < 2) {
+        db.exec({ sql: `DELETE FROM "churn"` });
+        exec.write([['clear', 'churn']], null, false);
+      } else if (roll < 20) {
+        db.exec({ sql: `DELETE FROM "churn" WHERE id = ?`, bind: [id] });
+        exec.write([['del', 'churn', id]], null, false);
+      } else {
+        const row: Row = { id, n: rnd(100) };
+        if (rnd(4) !== 0) row.owner = rnd(10) === 0 ? null : owners[rnd(12)];
+        if (rnd(3) !== 0) row.kind = kinds[rnd(20)];
+        if (rnd(3) === 0) row.flag = rnd(2) === 0;
+        const { insert, patch } = serializeMergeRow(row);
+        db.exec({
+          sql: `INSERT INTO "churn"(id, data) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET data = json_patch(data, ?)`,
+          bind: [id, insert, patch],
+        });
+        const packed = pack('churn', [row], rnd(5) === 0 ? 'put' : 'merge');
+        if (packed.ops[0][0] === 'put') db.exec({ sql: `UPDATE "churn" SET data = ? WHERE id = ?`, bind: [insert, id] });
+        exec.write(packed.ops, packed.buf, false);
+      }
+      if (step % 50 === 49) await check();
+      if (step === 250) {
+        store.checkpoint();
+        exec = new RowsExec(store);
+      }
+    }
+    await check();
+    // `owner` (links) and `kind` (20 values) are indexed; `flag` (2 values) is left to scans.
+    expect(hidden()).toEqual(expect.arrayContaining(['\u0001i\u0001churn\u0001owner', '\u0001i\u0001churn\u0001kind']));
+  });
+
+  it('hands out only the tables a client wrote', () => {
+    expect(visibleTables(store).some((t) => t.startsWith('\u0001'))).toBe(false);
+    expect(visibleTables(store)).toContain('game');
   });
 });

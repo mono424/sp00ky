@@ -144,6 +144,32 @@ describe('RowStore', () => {
     expect(again.stats().rebuilt).toBe(false);
   });
 
+  it('replays a tail larger than one read, batches of every size', async () => {
+    const disk = new Disk();
+    const store = await RowStore.open(disk);
+    store.write([put('game', 'game:kept', { n: 0 })]);
+    store.checkpoint();
+    // A few megabytes of tail: many small batches, some that straddle the
+    // edge of a read, and one that is larger than a read on its own.
+    const want = new Map<string, unknown>([['game:kept', { n: 0 }]]);
+    for (let i = 0; i < 400; i++) {
+      const value = { i, pad: 'x'.repeat((i * 7919) % 9000) };
+      store.write([put('game', `game:${i}`, value, i)]);
+      want.set(`game:${i}`, value);
+    }
+    const big = { pad: 'y'.repeat(1_500_000) };
+    store.write([put('game', 'game:big', big), del('game', 'game:3')]);
+    want.set('game:big', big);
+    want.delete('game:3');
+    store.write([put('game', 'game:last', { n: 1 })]);
+    want.set('game:last', { n: 1 });
+    expect(store.stats().tailBytes).toBeGreaterThan(3 << 20);
+
+    const reopened = await RowStore.open(disk.crashed());
+    expect(new Map(dump(reopened, 'game'))).toEqual(want);
+    expect(reopened.stats().tailOps).toBe(403);
+  });
+
   it('keeps every whole batch and no part of a torn one, wherever the file is cut', async () => {
     const disk = new Disk();
     const store = await RowStore.open(disk);
@@ -435,6 +461,44 @@ describe('RowStore', () => {
       for (const [id, row] of rows) expect(store.find(table, id)?.rv).toBe(row.rv);
       expect(store.count(table)).toBe(rows.size);
     }
+  });
+});
+
+describe('RowStore as an index', () => {
+  it('walks the ids under a prefix, in order, across folded and pending writes', async () => {
+    const disk = new Disk();
+    const store = await RowStore.open(disk);
+    const entry = (id: string): StoreOp => ({ t: 'put', table: 'idx', id, rv: 0, flags: 2, body: new Uint8Array(0) });
+    store.write(['sa\u0000game:2', 'sa\u0000game:1', 'sab\u0000game:9', 'sb\u0000game:3', 'n1\u0000game:4'].map(entry));
+    expect(store.prefix('idx', 'sa\u0000')).toEqual(['game:1', 'game:2']);
+    expect(store.prefix('idx', 'sab\u0000')).toEqual(['game:9']);
+    expect(store.prefix('idx', 'sc\u0000')).toEqual([]);
+    expect(store.prefix('none', 'sa\u0000')).toEqual([]);
+    store.checkpoint();
+    store.write([entry('sa\u0000game:0'), { t: 'del', table: 'idx', id: 'sa\u0000game:2' }]);
+    expect(store.prefix('idx', 'sa\u0000')).toEqual(['game:0', 'game:1']);
+    store.close();
+    expect((await RowStore.open(disk)).prefix('idx', 's')).toEqual(['a\u0000game:0', 'a\u0000game:1', 'ab\u0000game:9', 'b\u0000game:3']);
+  });
+
+  it('folds a few writes into a large table without losing a row on either side of them', async () => {
+    const store = await RowStore.open(new Disk());
+    const id = (i: number): string => `t:${String(i).padStart(6, '0')}`;
+    store.write(Array.from({ length: 5000 }, (_, i) => put('t', id(i * 2), i)));
+    expect(store.count('t')).toBe(5000);
+    // Before the first row, between rows, replacing one, removing one, after the last.
+    store.write([put('t', 't:', 'first'), put('t', id(4001), 'between'), put('t', id(6000), 'replaced'), del('t', id(8000)), put('t', 't:z', 'last')]);
+    const rows = dump(store, 't');
+    expect(rows.length).toBe(5002);
+    expect(rows[0]).toEqual(['t:', 'first']);
+    expect(rows.at(-1)).toEqual(['t:z', 'last']);
+    expect(read(store, 't', id(4000))).toBe(2000);
+    expect(read(store, 't', id(4001))).toBe('between');
+    expect(read(store, 't', id(4002))).toBe(2001);
+    expect(read(store, 't', id(6000))).toBe('replaced');
+    expect(read(store, 't', id(8000))).toBeNull();
+    expect(read(store, 't', id(9998))).toBe(4999);
+    for (let i = 1; i < rows.length; i++) expect(rows[i - 1][0] < rows[i][0]).toBe(true);
   });
 });
 

@@ -51,7 +51,7 @@ export const appConfig: ApplicationConfig = {
 
 The Angular CLI (`@angular/build:application`) does not bundle a `new Worker(new URL(...))` inside a dependency and does not copy `.wasm` files referenced via `new URL(..., import.meta.url)`. So the app:
 
-1. Installs `@surrealdb/wasm` directly and adds `src/app/sp00ky-surreal.worker.ts` = `import '@surrealdb/wasm/worker';` (and, for `localEngine: 'sqlite'`, `sp00ky-sqlite.worker.ts` = `import '@spooky-sync/core/sqlite-worker';` plus `workers.sqlite`).
+1. Installs `@surrealdb/wasm` directly and adds `src/app/sp00ky-surreal.worker.ts` = `import '@surrealdb/wasm/worker';` (and, for `localEngine: 'sqlite'`, `sp00ky-sqlite.worker.ts` = `import '@spooky-sync/core/sqlite-worker';` plus `workers.sqlite`; for `localEngine: 'rows'`, `sp00ky-rows.worker.ts` = `import '@spooky-sync/core/rows-worker';` plus `workers.rows`).
 2. Sets `"webWorkerTsConfig": "tsconfig.worker.json"` (lib `webworker`, includes `src/**/*.worker.ts`; exclude those from `tsconfig.app.json`).
 3. Copies to the output root with `assets`: `@spooky-sync/ssp-wasm/pkg/ssp_wasm_bg.wasm`, `@surrealdb/wasm-native/dist/index_bg.wasm`, `@spooky-sync/core/dist/tabs-broker-worker.js`, `@sqlite.org/sqlite-wasm/dist/{sqlite3.wasm,sqlite3-opfs-async-proxy.js}`. With pnpm, hoist the first, second and fourth package via `public-hoist-pattern[]` in `.npmrc`.
 4. Excludes `@spooky-sync/client-angular`, `@spooky-sync/core`, `@spooky-sync/ssp-wasm`, `@surrealdb/wasm`, `@surrealdb/wasm-native`, `@sqlite.org/sqlite-wasm` from the dev server's `prebundle`.

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sp00ky storage benchmark</title>
+    <!--
+      Both stores that can be started ahead of the app are: the row store's worker (the client's
+      own ROWS_PREWARM_SNIPPET, which vite.config.ts puts at the top of this head) and the
+      IndexedDB connection, as a careful app would open it. Each only acts when its backend has
+      data from an earlier load.
+    -->
+    <script>
+      (function(){try{if(localStorage.getItem("bench:idb-preopen")!=="1")return;globalThis.__benchIdb=new Promise(function(resolve,reject){var r=indexedDB.open("sp00ky-storage-bench",1);r.onsuccess=function(){resolve(r.result)};r.onerror=function(){reject(r.error)}})}catch(e){}})();
+    </script>
+    <style>
+      :root { color-scheme: light dark; --line: color-mix(in srgb, currentColor 16%, transparent); --dim: color-mix(in srgb, currentColor 60%, transparent); --best: #1a7f4b; }
+      body { font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; margin: 24px auto; max-width: 1040px; padding: 0 16px; }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      p { margin: 4px 0 12px; color: var(--dim); }
+      .bar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 16px 0; }
+      button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+      button.primary { background: #2f6feb; border-color: #2f6feb; color: #fff; }
+      label { display: inline-flex; gap: 6px; align-items: center; }
+      input[type='number'] { width: 90px; font: inherit; padding: 4px 6px; }
+      #status { font-variant-numeric: tabular-nums; color: var(--dim); min-height: 1.4em; }
+      table { border-collapse: collapse; width: 100%; margin: 12px 0 24px; font-variant-numeric: tabular-nums; }
+      th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+      th:first-child, td:first-child { text-align: left; white-space: normal; }
+      td small { color: var(--dim); }
+      td.best { color: var(--best); font-weight: 600; }
+      textarea { width: 100%; height: 160px; font: 12px ui-monospace, monospace; }
+    </style>
+  </head>
+  <body>
+    <h1>sp00ky storage benchmark</h1>
+    <p>IndexedDB vs the SQLite engine vs the row store, on the reads and writes the client makes. Run it from a production build (<code>pnpm build &amp;&amp; pnpm preview</code>): the cold-open numbers mean nothing against a dev server.</p>
+    <div class="bar">
+      <label>games <input id="games" type="number" min="1000" step="1000" /></label>
+      <label>comments <input id="comments" type="number" min="1000" step="1000" /></label>
+      <label>script download ms <input id="idle" type="number" min="0" step="10" /></label>
+      <label>app startup ms <input id="boot" type="number" min="0" step="10" /></label>
+      <button class="primary" id="run">Run</button>
+      <button id="reset">Reset</button>
+      <span id="status"></span>
+    </div>
+    <div id="results"></div>
+    <textarea id="json" readonly></textarea>
+    <script type="module" src="/src/bench.ts"></script>
+  </body>
+</html>

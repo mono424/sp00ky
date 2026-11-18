@@ -17,6 +17,18 @@
  *   two bodies in the buffer (whitespace, one comma) and parses each range in
  *   one call. No per-row decode, no copy.
  *
+ * # Indexes are tables
+ *
+ * A secondary index over `field` of `table` is a hidden table in the same
+ * store whose ids are `value\0rowId` and whose bodies are empty. Ids are kept
+ * sorted, so "every row whose field is X" is one search and a short walk, and
+ * the index is written in the same atomic batch as the rows it describes: it
+ * cannot disagree with them, and it is on disk for the next session. Two ways
+ * a field gets one: it holds record links (found as rows are written, so a
+ * `.related()` never waits for a build), or a query filters on it with `=`
+ * (built by one scan the first time, kept up from then on). A field with a
+ * handful of distinct values is left alone: a scan reads its matches faster.
+ *
  * # Same answers as the SQLite engine
  *
  * Filters, ordering and merges follow what that engine's SQL does, so a query
@@ -63,24 +75,39 @@ export type WireOp =
   | ['del', table: string, id: string]
   | ['clear', table: string];
 
-/** A foreign-key index: which rows of a table hold which value in one field. */
-interface FkIndex {
-  byKey: Map<string, Set<string>>;
-  keyOf: Map<string, string>;
-  /** Ids written since the index last looked at them. */
-  stale: Set<string>;
-}
-
 const MAX_GAP = 4096;
 const MAX_RANGE = 4 << 20;
-/** Past this many unseen writes an index is rebuilt on next use instead of patched. */
-const MAX_STALE = 4096;
+/** Tables the store keeps for itself start with this; no client table can. */
+const HIDDEN = '\u0001';
+const META_TABLE = `${HIDDEN}meta`;
+const INDEXES_ROW = 'indexes';
+const SEP = '\u0000';
+const MAX_KEY_CHARS = 200;
+/** An index build writes its entries in batches of this many. */
+const INDEX_BATCH = 20_000;
+/** A value that addresses a record: `table:id`, and not a URL. */
+const LINK = /^[A-Za-z_][A-Za-z0-9_]*:(?!\/\/).{1,80}$/s;
+const NO_ENTRY = new Uint8Array(0);
+
+const indexTable = (table: string, field: string): string => `${HIDDEN}i${HIDDEN}${table}${HIDDEN}${field}`;
+/** Tables that get indexes: the app's own. The client's `_00_` tables are small and read whole. */
+const isUserTable = (table: string): boolean => !table.startsWith('_00_') && !table.startsWith(HIDDEN);
+
+/** The tables a client may see: everything but the store's own. */
+export const visibleTables = (store: RowStore): string[] => store.tableNames().filter((t) => !t.startsWith(HIDDEN));
+
+/** A value as an index key, or `null` when it is not indexed (NULL, very long, or holding the separator). */
+function indexKey(value: SqlValue): string | null {
+  if (value === null) return null;
+  const key = typeof value === 'number' ? `n${value}` : `s${value}`;
+  return key.length > MAX_KEY_CHARS || key.includes(SEP) ? null : key;
+}
 const U8_TAG = '"__u8"';
 
 // ---- SQLite value semantics --------------------------------------------------
 
 function walk(row: unknown, field: string): unknown {
-  if (field.indexOf('.') === -1 && field.indexOf('[') === -1) {
+  if (!field.includes('.') && !field.includes('[')) {
     return row !== null && typeof row === 'object' ? (row as Row)[field] : undefined;
   }
   let cur: unknown = row;
@@ -128,10 +155,15 @@ function sqlCompare(a: number | string, b: number | string): number {
   return cmpText(a as string, b as string);
 }
 
-function compileComparison(c: WhereComparison, params: Record<string, unknown>): (row: Row) => boolean {
+/** The value a comparison binds: the query's own param when it has one, else the baked literal. */
+function rhsOf(c: WhereComparison, params: Record<string, unknown>): SqlValue {
   const useParam =
     c.paramRef !== undefined && (c.value === undefined || Object.prototype.hasOwnProperty.call(params, c.paramRef));
-  const rhs = bound(useParam ? params[c.paramRef!] : c.value, c.field === 'id');
+  return bound(useParam ? params[c.paramRef!] : c.value, c.field === 'id');
+}
+
+function compileComparison(c: WhereComparison, params: Record<string, unknown>): (row: Row) => boolean {
+  const rhs = rhsOf(c, params);
   const field = c.field;
   const sign = c.swap ? -1 : 1;
   let test: (cmp: number) => boolean;
@@ -215,7 +247,7 @@ export function mergePatch(target: unknown, patch: unknown): unknown {
 function toBytes(rows: unknown): RowBytes {
   const text = JSON.stringify(rows);
   const bytes = encoder.encode(text);
-  return { buf: bytes.buffer as ArrayBuffer, u8: text.indexOf(U8_TAG) !== -1 };
+  return { buf: bytes.buffer as ArrayBuffer, u8: text.includes(U8_TAG) };
 }
 
 /** The page's side of {@link RowBytes}: one parse for the whole answer. */
@@ -229,12 +261,24 @@ export function parseRowBytes<T = Row[]>(res: { buf: ArrayBuffer | null; u8?: bo
 }
 
 export class RowsExec {
-  private fk = new Map<string, Map<string, FkIndex>>();
+  /** table -> field -> `true` indexed, `false` looked at and left to scans. */
+  private indexes = new Map<string, Map<string, boolean>>();
+  /** table -> fields seen holding something that is not a link. Not persisted: a guess that saves a regex per row. */
+  private plain = new Map<string, Set<string>>();
   private scratch = new Uint8Array(256 << 10);
   /** Relation fetches of the request in flight, for the engine's stats. */
   private relationFetches = 0;
 
-  constructor(private store: RowStore) {}
+  constructor(private store: RowStore) {
+    const saved = store.get(META_TABLE, INDEXES_ROW);
+    if (!saved) return;
+    try {
+      const parsed = JSON.parse(decoder.decode(saved.body)) as Record<string, Record<string, boolean>>;
+      for (const [table, fields] of Object.entries(parsed)) this.indexes.set(table, new Map(Object.entries(fields)));
+    } catch {
+      // An unreadable registry only costs the indexes: they are rebuilt on use.
+    }
+  }
 
   // ---- reading bodies ------------------------------------------------------
 
@@ -320,7 +364,128 @@ export class RowsExec {
     if (this.scratch.length > MAX_RANGE * 2) this.scratch = new Uint8Array(256 << 10);
   }
 
+  // ---- indexes -------------------------------------------------------------
+
+  private fieldsOf(table: string): string[] {
+    const fields = this.indexes.get(table);
+    if (!fields) return [];
+    const out: string[] = [];
+    for (const [field, on] of fields) if (on) out.push(field);
+    return out;
+  }
+
+  private keysOf(fields: string[], row: Row | null): (string | null)[] {
+    return fields.map((field) => (row ? indexKey(extract(row, field)) : null));
+  }
+
+  /** Move a row's index entries from its old keys to its new ones. */
+  private reindex(
+    table: string,
+    id: string,
+    fields: string[],
+    before: (string | null)[],
+    after: (string | null)[],
+    out: StoreOp[]
+  ): void {
+    for (let i = 0; i < fields.length; i++) {
+      if (before[i] === after[i]) continue;
+      const index = indexTable(table, fields[i]);
+      if (before[i] !== null) out.push({ t: 'del', table: index, id: before[i] + SEP + id });
+      if (after[i] !== null) out.push({ t: 'put', table: index, id: after[i] + SEP + id, rv: 0, flags: FLAG_RAW, body: NO_ENTRY });
+    }
+  }
+
+  private registryOp(): StoreOp {
+    const all: Record<string, Record<string, boolean>> = {};
+    for (const [table, fields] of this.indexes) all[table] = Object.fromEntries(fields);
+    return { t: 'put', table: META_TABLE, id: INDEXES_ROW, rv: 0, flags: FLAG_RAW, body: encoder.encode(JSON.stringify(all)) };
+  }
+
+  private mark(table: string, field: string, on: boolean): void {
+    let fields = this.indexes.get(table);
+    if (!fields) this.indexes.set(table, (fields = new Map()));
+    fields.set(field, on);
+  }
+
+  /** Fields of `row` that hold a record link and have no index yet: they get one now. */
+  private discover(table: string, row: Row, added: [string, string][]): void {
+    const fields = this.indexes.get(table);
+    let plain = this.plain.get(table);
+    for (const field in row) {
+      const value = row[field];
+      if (typeof value !== 'string' || field === 'id' || fields?.has(field) || plain?.has(field)) continue;
+      if (LINK.test(value)) {
+        this.mark(table, field, true);
+        added.push([table, field]);
+      } else {
+        if (!plain) this.plain.set(table, (plain = new Set()));
+        plain.add(field);
+      }
+    }
+  }
+
+  /**
+   * Whether `field` of `table` has an index, building it if it has none yet:
+   * one scan, written to the store, kept up by every write after. Without
+   * `force`, a field with too few distinct values to be worth one is turned
+   * down, and that answer is remembered too.
+   */
+  private ensureIndex(table: string, field: string, force: boolean): boolean {
+    const known = this.indexes.get(table)?.get(field);
+    if (known === true) return true;
+    if (known === false && !force) return false;
+    const index = indexTable(table, field);
+    const puts: StoreOp[] = [];
+    const distinct = new Set<string>();
+    let rows = 0;
+    this.scan(table, (row) => {
+      rows++;
+      const key = indexKey(extract(row, field));
+      if (key === null) return;
+      distinct.add(key);
+      puts.push({ t: 'put', table: index, id: key + SEP + String(row.id), rv: 0, flags: FLAG_RAW, body: NO_ENTRY });
+    });
+    // With fewer than 8 values each one matches an eighth of the table or more.
+    const worth = force || rows < 64 || distinct.size >= 8;
+    this.mark(table, field, worth);
+    if (!worth) {
+      this.store.write([this.registryOp()]);
+      return false;
+    }
+    for (let i = 0; i < puts.length; i += INDEX_BATCH) this.store.write(puts.slice(i, i + INDEX_BATCH));
+    this.store.write([this.registryOp()]);
+    return true;
+  }
+
+  private lookup(table: string, field: string, key: string): string[] {
+    return this.store.prefix(indexTable(table, field), key + SEP);
+  }
+
   // ---- select --------------------------------------------------------------
+
+  /**
+   * The rows a filter can possibly match, when an index can say so without
+   * reading the table: an `id = …`, or an `=` on an indexed field. In id
+   * order. `null` means read the table.
+   */
+  private narrow(table: string, where: WhereNode[] | undefined, params: Record<string, unknown>): Entry[] | null {
+    if (!where) return null;
+    for (const node of where) {
+      if ('or' in node || node.op !== '=') continue;
+      const value = rhsOf(node, params);
+      // `= NULL` is never true, and it is ANDed with the rest.
+      if (value === null) return [];
+      if (node.field === 'id') return this.findAll(table, [String(value)]);
+      if (!isUserTable(table)) continue;
+      const key = indexKey(value);
+      if (key === null || !this.ensureIndex(table, node.field, false)) continue;
+      const ids = this.lookup(table, node.field, key);
+      // Past a third of the table a scan reads the matches faster than this many point reads.
+      if (ids.length > Math.max(256, this.store.count(table) / 3)) continue;
+      return this.findAll(table, ids);
+    }
+    return null;
+  }
 
   /** Rows matching `where`, as (row, entry) in the order SQL would give them. */
   private filtered(
@@ -335,31 +500,39 @@ export class RowsExec {
     const ordered = orderBy !== undefined && orderBy.length > 0;
     const from = offset ?? 0;
     const to = limit === undefined ? undefined : from + limit;
-    if (!ordered && to !== undefined) return this.firstInIdOrder(table, test, from, to);
-    const hits: { row: Row; at: number }[] = [];
-    let run: Run | null = null;
-    this.scan(table, (row, at, r) => {
-      run = r;
-      if (!test || test(row)) hits.push({ row, at });
-    });
-    let picked: { row: Row; at: number }[];
-    if (ordered) {
-      const position = new Map(hits.map((h) => [h.row, h.at]));
-      picked = sortSql(
-        hits.map((h) => h.row),
-        orderBy!
-      )
-        .slice(from, to)
-        .map((row) => ({ row, at: position.get(row)! }));
+    const narrowed = this.narrow(table, where, params);
+    if (!narrowed && !ordered && to !== undefined) return this.firstInIdOrder(table, test, from, to);
+
+    // Every match, in id order.
+    let rows: Row[] = [];
+    let entries: Entry[] = [];
+    if (narrowed) {
+      const parsed = this.parse(narrowed);
+      for (let i = 0; i < parsed.length; i++) {
+        if (test && !test(parsed[i])) continue;
+        rows.push(parsed[i]);
+        entries.push(narrowed[i]);
+      }
     } else {
-      // The scan walks the file; the answer is in id order, which is run order.
-      picked = hits.sort((a, b) => a.at - b.at).slice(from, to);
+      const hits: { row: Row; at: number }[] = [];
+      let seen: Run | null = null;
+      this.scan(table, (row, at, run) => {
+        seen = run;
+        if (!test || test(row)) hits.push({ row, at });
+      });
+      // The scan walks the file; run order is id order.
+      hits.sort((a, b) => a.at - b.at);
+      const run = seen as Run | null;
+      rows = hits.map((h) => h.row);
+      entries = run ? hits.map((h) => ({ off: run.off[h.at], len: run.len[h.at], rv: run.rv[h.at], flags: run.flags[h.at] })) : [];
     }
-    const r = run as Run | null;
-    return {
-      rows: picked.map((h) => h.row),
-      entries: r ? picked.map((h) => ({ off: r.off[h.at], len: r.len[h.at], rv: r.rv[h.at], flags: r.flags[h.at] })) : [],
-    };
+    if (ordered) {
+      const entryOf = new Map<Row, Entry>();
+      for (let i = 0; i < rows.length; i++) entryOf.set(rows[i], entries[i]);
+      rows = sortSql(rows, orderBy!).slice(from, to);
+      return { rows, entries: rows.map((row) => entryOf.get(row)!) };
+    }
+    return { rows: rows.slice(from, to), entries: entries.slice(from, to) };
   }
 
   /**
@@ -447,13 +620,8 @@ export class RowsExec {
   }
 
   count(table: string, where: WhereNode[] | undefined): number {
-    const test = compileWhere(where, {});
-    if (!test) return this.store.count(table);
-    let n = 0;
-    this.scan(table, (row) => {
-      if (test(row)) n++;
-    });
-    return n;
+    if (!where || where.length === 0) return this.store.count(table);
+    return this.filtered(table, where, {}, undefined, undefined, undefined).rows.length;
   }
 
   // ---- relations -----------------------------------------------------------
@@ -464,70 +632,32 @@ export class RowsExec {
 
   private relationRows(req: RelationFetch): Row[] {
     const keys = [...new Set(req.keys.map(stableKey))];
-    let ids: string[];
-    if (req.matchField === 'id') ids = keys;
-    else {
-      const index = this.fkIndex(req.table, req.matchField);
-      ids = [];
-      for (const key of keys) {
-        const set = index.byKey.get(key);
-        if (set) for (const id of set) ids.push(id);
+    let rows: Row[];
+    if (req.matchField === 'id') {
+      // Probed in id order, as an index lookup would return them.
+      rows = this.parse(this.findAll(req.table, keys.sort(cmpText)));
+    } else {
+      const indexKeys = keys.map((key) => indexKey(key));
+      if (isUserTable(req.table) && indexKeys.every((k) => k !== null) && this.ensureIndex(req.table, req.matchField, true)) {
+        const ids: string[] = [];
+        for (const key of indexKeys) for (const id of this.lookup(req.table, req.matchField, key!)) ids.push(id);
+        rows = this.parse(this.findAll(req.table, ids.sort(cmpText)));
+      } else {
+        // Only string values match: the keys are record ids, and SQL's `IN`
+        // over text keys never matches a number either.
+        const wanted = new Set(keys);
+        const hits: { row: Row; at: number }[] = [];
+        this.scan(req.table, (row, at) => {
+          const value = walk(row, req.matchField);
+          if (typeof value === 'string' && wanted.has(value)) hits.push({ row, at });
+        });
+        rows = hits.sort((a, b) => a.at - b.at).map((h) => h.row);
       }
     }
-    // Probed in id order, as an index lookup would return them.
-    ids.sort(cmpText);
-    let rows = this.parse(this.findAll(req.table, ids));
     const test = compileWhere(req.where, {});
     if (test) rows = rows.filter(test);
     if (req.orderBy && req.orderBy.length > 0) rows = sortSql(rows, req.orderBy);
     return req.select ? rows.map((row) => project(row, req.select!)) : rows;
-  }
-
-  /**
-   * The index over `field` of `table`, built by one scan on first use and
-   * brought up to date from the ids written since. Only string values are
-   * indexed: the keys of a relation are record ids, and SQL's `IN` over text
-   * keys never matches a number either.
-   */
-  private fkIndex(table: string, field: string): FkIndex {
-    let perTable = this.fk.get(table);
-    if (!perTable) this.fk.set(table, (perTable = new Map()));
-    let index = perTable.get(field);
-    if (!index) {
-      index = { byKey: new Map(), keyOf: new Map(), stale: new Set() };
-      perTable.set(field, index);
-      const built = index;
-      this.scan(table, (row) => indexRow(built, String(row.id), walk(row, field)));
-      return index;
-    }
-    if (index.stale.size > 0) {
-      const ids = [...index.stale];
-      index.stale.clear();
-      const fresh = new Map<string, unknown>();
-      for (const row of this.parse(this.findAll(table, ids))) fresh.set(String(row.id), walk(row, field));
-      for (const id of ids) {
-        const old = index.keyOf.get(id);
-        if (old !== undefined) {
-          index.byKey.get(old)?.delete(id);
-          index.keyOf.delete(id);
-        }
-        indexRow(index, id, fresh.get(id));
-      }
-    }
-    return index;
-  }
-
-  private touched(table: string, id: string | null): void {
-    const perTable = this.fk.get(table);
-    if (!perTable) return;
-    if (id === null) {
-      this.fk.delete(table);
-      return;
-    }
-    for (const [field, index] of perTable) {
-      index.stale.add(id);
-      if (index.stale.size > MAX_STALE) perTable.delete(field);
-    }
   }
 
   // ---- writes --------------------------------------------------------------
@@ -535,7 +665,8 @@ export class RowsExec {
   /**
    * Apply one batch from the page. A merge reads the stored row, folds the
    * patch in and writes the result; a row that is not there yet takes the
-   * patch's insert text as it came, without a parse.
+   * patch's insert text as it came. Index entries of the app's tables move in
+   * the same batch as the rows they point at.
    */
   write(ops: WireOp[], buf: ArrayBuffer | null, sync: boolean): void {
     const bytes = buf ? new Uint8Array(buf) : new Uint8Array(0);
@@ -543,50 +674,94 @@ export class RowsExec {
     // What this batch has already done to a row, for a later op on the same row.
     const pending = new Map<string, Uint8Array | null>();
     const cleared = new Set<string>();
+    // The app's rows as this batch leaves them, for an index that appears partway through it.
+    const touched = new Map<string, Map<string, Row | null>>();
+    const added: [string, string][] = [];
+    const note = (table: string, id: string, row: Row | null): void => {
+      let rows = touched.get(table);
+      if (!rows) touched.set(table, (rows = new Map()));
+      rows.set(id, row);
+    };
     for (const op of ops) {
       const table = op[1];
+      const user = isUserTable(table);
       if (op[0] === 'clear') {
         out.push({ t: 'clear', table });
+        if (user) for (const field of this.fieldsOf(table)) out.push({ t: 'clear', table: indexTable(table, field) });
         cleared.add(table);
         for (const key of [...pending.keys()]) if (key.startsWith(table + '\n')) pending.delete(key);
-        this.touched(table, null);
+        touched.get(table)?.clear();
         continue;
       }
       const id = op[2];
       const key = table + '\n' + id;
-      this.touched(table, id);
+      const stored = (): Uint8Array | null => {
+        const earlier = pending.get(key);
+        if (earlier !== undefined) return earlier;
+        return cleared.has(table) ? null : (this.store.get(table, id)?.body ?? null);
+      };
       if (op[0] === 'del') {
+        const fields = user ? this.fieldsOf(table) : [];
+        if (fields.length > 0) {
+          const old = stored();
+          if (old) this.reindex(table, id, fields, this.keysOf(fields, JSON.parse(decoder.decode(old)) as Row), this.keysOf(fields, null), out);
+        }
         out.push({ t: 'del', table, id });
         pending.set(key, null);
+        if (user) note(table, id, null);
         continue;
       }
       const insert = bytes.subarray(op[5], op[5] + op[6]);
-      if (op[0] === 'put') {
-        out.push({ t: 'put', table, id, rv: op[3], flags: op[4], body: insert });
-        pending.set(key, insert);
-        continue;
+      let body = insert;
+      let rv = op[3];
+      let flags = op[4];
+      let next: Row | null = null;
+      let fields = user ? this.fieldsOf(table) : [];
+      const old = op[0] === 'merge' || fields.length > 0 ? stored() : null;
+      const previous = old ? (JSON.parse(decoder.decode(old)) as Row) : null;
+      // Read before the merge below reuses the object.
+      const before = this.keysOf(fields, previous);
+      if (op[0] === 'merge' && previous) {
+        const patch = op[8] > 0 ? bytes.subarray(op[7], op[7] + op[8]) : insert;
+        next = mergePatch(previous, JSON.parse(decoder.decode(patch))) as Row;
+        const text = JSON.stringify(next);
+        body = encoder.encode(text);
+        rv = Number(next?._00_rv) || 0;
+        flags = text.includes(U8_TAG) ? FLAG_U8 : 0;
+      } else if (user) {
+        next = JSON.parse(decoder.decode(insert)) as Row;
       }
-      let existing: Uint8Array | null | undefined = pending.get(key);
-      if (existing === undefined) existing = cleared.has(table) ? null : (this.store.get(table, id)?.body ?? null);
-      if (existing === null) {
-        out.push({ t: 'put', table, id, rv: op[3], flags: op[4], body: insert });
-        pending.set(key, insert);
-        continue;
+      if (user && next) {
+        const known = added.length;
+        this.discover(table, next, added);
+        if (added.length > known) {
+          // An index born on this row comes after the ones there were, and has no old entry for it.
+          fields = this.fieldsOf(table);
+          while (before.length < fields.length) before.push(null);
+        }
+        this.reindex(table, id, fields, before, this.keysOf(fields, next), out);
+        note(table, id, next);
       }
-      const patch = op[8] > 0 ? bytes.subarray(op[7], op[7] + op[8]) : insert;
-      const merged = mergePatch(JSON.parse(decoder.decode(existing)), JSON.parse(decoder.decode(patch))) as Row;
-      const text = JSON.stringify(merged);
-      const body = encoder.encode(text);
-      out.push({
-        t: 'put',
-        table,
-        id,
-        rv: Number(merged?._00_rv) || 0,
-        flags: text.indexOf(U8_TAG) !== -1 ? FLAG_U8 : 0,
-        body,
-      });
+      out.push({ t: 'put', table, id, rv, flags, body });
       pending.set(key, body);
     }
+    // An index that appeared in this batch still lacks the rows that were there before it.
+    for (const [table, field] of added) {
+      const index = indexTable(table, field);
+      const mine = touched.get(table);
+      const put = (id: string, row: Row): void => {
+        const k = indexKey(extract(row, field));
+        if (k !== null) out.push({ t: 'put', table: index, id: k + SEP + id, rv: 0, flags: FLAG_RAW, body: NO_ENTRY });
+      };
+      if (!cleared.has(table)) {
+        this.scan(table, (row) => {
+          const id = String(row.id);
+          if (!mine?.has(id)) put(id, row);
+        });
+      }
+      if (mine) for (const [id, row] of mine) if (row) put(id, row);
+    }
+    if (added.length > 0) out.push(this.registryOp());
     this.store.write(out, sync);
   }
 
@@ -602,16 +777,22 @@ export class RowsExec {
   resetVersions(tables: string[], keep: string[]): number {
     const kept = new Set(keep);
     const out: StoreOp[] = [];
+    let rewritten = 0;
     for (const table of tables) {
+      const fields = isUserTable(table) ? this.fieldsOf(table) : [];
       this.scan(table, (row, at, run) => {
         const rv = extract(row, '_00_rv');
         if (rv === null || rv === 0 || kept.has(String(row.id))) return;
+        const id = runId(run, at);
+        const before = this.keysOf(fields, row);
         row._00_rv = 0;
-        out.push({ t: 'put', table, id: runId(run, at), rv: 0, flags: run.flags[at], body: encoder.encode(JSON.stringify(row)) });
+        this.reindex(table, id, fields, before, this.keysOf(fields, row), out);
+        out.push({ t: 'put', table, id, rv: 0, flags: run.flags[at], body: encoder.encode(JSON.stringify(row)) });
+        rewritten++;
       });
     }
     this.store.write(out);
-    return out.length;
+    return rewritten;
   }
 
   /** A raw blob and the JSON row beside it: the circuit snapshot's two halves. */
@@ -637,6 +818,21 @@ export class RowsExec {
       { t: 'del', table, id: `${key}:meta` },
     ]);
   }
+
+  /**
+   * The tables to read ahead, in the order worth reading them: the app's own
+   * first (its first query is by id or over a window of one of them), then the
+   * indexes over them.
+   */
+  warmOrder(): string[] {
+    const names = this.store.tableNames();
+    return [...names.filter((name) => !name.startsWith(HIDDEN)), ...names.filter((name) => name.startsWith(HIDDEN))];
+  }
+
+  /** Read every table's index into memory, so the first query does not wait for it. */
+  warm(): void {
+    for (const table of this.warmOrder()) this.store.ordered(table);
+  }
 }
 
 /**
@@ -647,14 +843,6 @@ function windowOrder(keys: string[]): string[] {
   const position = new Map(keys.map((key, i) => [key, i]));
   if (position.size === keys.length) return keys;
   return [...position.keys()].sort((a, b) => position.get(a)! - position.get(b)!);
-}
-
-function indexRow(index: FkIndex, id: string, value: unknown): void {
-  if (typeof value !== 'string') return;
-  let set = index.byKey.get(value);
-  if (!set) index.byKey.set(value, (set = new Set()));
-  set.add(id);
-  index.keyOf.set(id, value);
 }
 
 /** Row positions of a run ordered by where their bodies lie, skipping raw blobs. */
@@ -675,6 +863,14 @@ function byOffset(run: Run): Uint32Array {
   if (!ascending) order.sort((a, b) => run.off[a] - run.off[b]);
   return order;
 }
+
+/**
+ * Version of what the page and the worker say to each other. A worker that
+ * answers `open` with another number was built from another release (a
+ * prewarmed worker started from a URL remembered across a deploy) and is
+ * replaced by a fresh one.
+ */
+export const ROWS_PROTOCOL = 1;
 
 /** Data ops a follower tab may send over its port; the rest belong to the owner. */
 export const ROWS_CLIENT_OPS: ReadonlySet<string> = new Set([
@@ -733,7 +929,7 @@ export async function handleRowsOp(exec: RowsExec, store: RowStore, type: string
     case 'reset-versions':
       return { result: { rows: exec.resetVersions(payload.tables, payload.keep ?? []) } };
     case 'tables':
-      return { result: { tables: store.tableNames() } };
+      return { result: { tables: visibleTables(store) } };
     case 'blob-get': {
       const blob = exec.getBlob(payload.table, payload.key);
       return { result: blob, transfer: blob.bytes ? [blob.bytes] : undefined };
@@ -763,6 +959,7 @@ export const CHECKPOINT_TAIL_OPS = 20_000;
  */
 export function maintenance(stats: StoreStats): 'checkpoint' | 'compact' | null {
   if (stats.tailBytes > 0) return 'checkpoint';
-  if (stats.garbageBytes > Math.max(4 << 20, stats.liveBytes)) return 'compact';
+  // Dead bytes may reach half the live ones: the file is at most 1.5 times its rows.
+  if (stats.garbageBytes > Math.max(4 << 20, stats.liveBytes / 2)) return 'compact';
   return null;
 }

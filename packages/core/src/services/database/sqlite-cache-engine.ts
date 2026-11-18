@@ -145,7 +145,7 @@ export class SqliteCacheEngine implements LocalStore {
 
   /** Shared-tabs mode: the engine's transport is swapped at runtime by the
    *  TabsCoordinator (owner worker as leader, leader's port as follower). */
-  private shared: boolean;
+  protected shared: boolean;
   /** Leaderless parking (shared mode): ops entering the opQueue await this
    *  gate until a new role lands or the timeout rejects them. */
   private roleGate: { promise: Promise<void>; release: () => void } | null = null;

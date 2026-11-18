@@ -25,7 +25,17 @@
  */
 import { verifyLockStillHeld as verifyLockStillHeldBounded } from './sqlite-lock-verify';
 import { MemoryFile, RowStore, bucketDirName, type StoreIo, type SyncFile } from './rows-store';
-import { CHECKPOINT_TAIL_BYTES, CHECKPOINT_TAIL_OPS, ROWS_CLIENT_OPS, RowsExec, handleRowsOp, maintenance } from './rows-exec';
+import {
+  CHECKPOINT_TAIL_BYTES,
+  CHECKPOINT_TAIL_OPS,
+  ROWS_CLIENT_OPS,
+  ROWS_PROTOCOL,
+  RowsExec,
+  handleRowsOp,
+  maintenance,
+  visibleTables,
+} from './rows-exec';
+import { ROWS_AHEAD_ID, ROWS_AHEAD_OPS } from './rows-prewarm';
 
 type PostTarget = Pick<MessagePort, 'postMessage'>;
 
@@ -35,38 +45,51 @@ interface OpenOptions {
   disallowMemoryFallback?: boolean;
 }
 
+/**
+ * Retry schedule for an open that finds the files held. The usual holder is
+ * this tab's previous worker, whose handles the browser releases a moment
+ * after a reload, so the first retries come within milliseconds: a reload
+ * should not wait a quarter second for a file that is free after five. The
+ * whole ramp still gives another tab about as long as the SQLite worker does
+ * (750 ms) before falling back to memory.
+ */
+const DEFAULT_BACKOFF_MS = [4, 8, 16, 32, 64, 128, 250, 250];
+const DEFAULT_MAX_ATTEMPTS = DEFAULT_BACKOFF_MS.length + 1;
+
 /** How long a write may sit with the operating system before it is flushed. */
 const FLUSH_LAG_MS = 100;
 /** Quiet time after which the index is persisted and the store tidied. */
 const IDLE_MS = 500;
 
 class OpfsFile implements SyncFile {
-  constructor(private handle: FileSystemSyncAccessHandle) {}
+  constructor(private access: FileSystemSyncAccessHandle) {}
   read(buffer: Uint8Array, at: number): number {
-    return this.handle.read(buffer, { at });
+    return this.access.read(buffer, { at });
   }
   write(buffer: Uint8Array, at: number): number {
-    const written = this.handle.write(buffer, { at });
+    const written = this.access.write(buffer, { at });
     // A short write is a full disk: fail the batch rather than store part of it.
     if (written !== buffer.length) throw new Error(`rows: wrote ${written} of ${buffer.length} bytes (storage full?)`);
     return written;
   }
   size(): number {
-    return this.handle.getSize();
+    return this.access.getSize();
   }
   truncate(size: number): void {
-    this.handle.truncate(size);
+    this.access.truncate(size);
   }
   flush(): void {
-    this.handle.flush();
+    this.access.flush();
   }
   close(): void {
-    this.handle.close();
+    this.access.close();
   }
 }
 
 let store: RowStore | null = null;
 let exec: RowsExec | null = null;
+/** What the open store was opened as, so a second `open` for the same thing is a no-op. */
+let opened: { dbName: string; useOpfs: boolean; result: { persisted: boolean; opfsError?: string } } | null = null;
 /** Handles held for the open store, closed with it. */
 let openFiles: SyncFile[] = [];
 
@@ -75,8 +98,8 @@ async function opfsIo(bucketId: string): Promise<StoreIo> {
   const dir = await root.getDirectoryHandle(bucketDirName(bucketId), { create: true });
   return {
     open: async (name) => {
-      const handle = await (await dir.getFileHandle(name, { create: true })).createSyncAccessHandle();
-      const file = new OpfsFile(handle);
+      const access = await (await dir.getFileHandle(name, { create: true })).createSyncAccessHandle();
+      const file = new OpfsFile(access);
       openFiles.push(file);
       return file;
     },
@@ -119,8 +142,8 @@ async function openStore(
     exec = new RowsExec(store);
     return { persisted: false };
   }
-  const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
-  const backoffMs = opts.backoffMs ?? [250, 500];
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
+  const backoffMs = opts.backoffMs ?? DEFAULT_BACKOFF_MS;
   let lastError = 'unknown error';
   let attempts = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -167,6 +190,8 @@ function closeStore(): void {
   }
   store = null;
   exec = null;
+  opened = null;
+  warmQueue = null;
   closeFiles();
 }
 
@@ -205,7 +230,10 @@ function afterOp(wrote: boolean): void {
 async function tidy(): Promise<void> {
   if (!store) return;
   store.flush();
-  for (let step = maintenance(store.stats()); step && store; step = maintenance(store.stats())) {
+  // A checkpoint, then at most a compaction and the checkpoint after it.
+  for (let round = 0; round < 3 && store; round++) {
+    const step = maintenance(store.stats());
+    if (!step) break;
     if (step === 'checkpoint') store.checkpoint();
     else await store.compact();
   }
@@ -284,6 +312,7 @@ function fence(reason: string): void {
   // No checkpoint: the new leader owns the file now.
   store = null;
   exec = null;
+  opened = null;
   closeFiles();
   try {
     (self as unknown as Worker).postMessage({ type: 'lock-lost', reason });
@@ -328,13 +357,59 @@ const clients = new Map<string, MessagePort>();
 /** One chain for every op from every channel, housekeeping included. */
 let opChain: Promise<unknown> = Promise.resolve();
 
+/** Ops queued or running, and when the last one finished. */
+let pendingOps = 0;
+let lastOpAt = 0;
+
 function enqueue<T>(fn: () => T | Promise<T>): Promise<T> {
+  pendingOps++;
   const result = opChain.then(fn, fn);
+  const settle = (): void => {
+    pendingOps--;
+    lastOpAt = performance.now();
+  };
   opChain = result.then(
-    () => undefined,
-    () => undefined
+    () => settle(),
+    () => settle()
   );
   return result;
+}
+
+// ---- warming ----
+// Reading every index at once took 15 to 20 ms on an 80,000 row store, and a
+// request that arrived meanwhile waited for all of it: the page's first read
+// came back slower than with no warming at all. So a table is read per turn,
+// and only once the worker has been left alone for a moment. A request never
+// waits for more than the one table being read.
+
+const WARM_QUIET_MS = 15;
+/** Tables whose index is still to be read; null when there is nothing to warm. */
+let warmQueue: string[] | null = null;
+let warmTimer: ReturnType<typeof setTimeout> | null = null;
+
+function warmSoon(delay: number): void {
+  if (warmTimer === null) warmTimer = setTimeout(warmStep, delay);
+}
+
+function warmStep(): void {
+  warmTimer = null;
+  if (!warmQueue || !store || fenced) {
+    warmQueue = null;
+    return;
+  }
+  if (pendingOps > 0 || performance.now() - lastOpAt < WARM_QUIET_MS) return warmSoon(WARM_QUIET_MS);
+  const table = warmQueue.shift();
+  if (table === undefined) {
+    warmQueue = null;
+    return;
+  }
+  try {
+    // No op is running (the count is zero), so this reads beside none.
+    store.ordered(table);
+  } catch {
+    /* whatever is wrong with this index, the read that needs it reports */
+  }
+  warmSoon(0);
 }
 
 // oxlint-disable-next-line typescript/no-explicit-any
@@ -351,9 +426,23 @@ async function handle(type: string, payload: any, source: 'owner' | 'client'): P
         releaseHeldLock();
         currentLock = lock;
       }
-      closeStore();
-      return { result: await openStore(payload.dbName, payload.useOpfs, payload.openOptions) };
+      // The page may have started this worker and its store ahead of itself
+      // (`prewarmRows`): the store it asks for is then already open.
+      const same = store !== null && opened !== null && opened.dbName === payload.dbName && opened.useOpfs === payload.useOpfs;
+      if (!same) {
+        closeStore();
+        const result = await openStore(payload.dbName, payload.useOpfs, payload.openOptions);
+        opened = { dbName: payload.dbName, useOpfs: payload.useOpfs, result };
+      }
+      return { result: { ...opened!.result, proto: ROWS_PROTOCOL, workerUrl: self.location.href } };
     }
+    case 'warm':
+      // Read the tables' indexes ahead of the page, so its first query finds
+      // them in memory. One table at a time and only while nothing is asked
+      // for: see `warmStep`.
+      warmQueue = exec ? exec.warmOrder() : null;
+      warmSoon(WARM_QUIET_MS);
+      return { result: {} };
     case 'relock': {
       const lock = await acquireWorkerLock(payload.workerLockName);
       if (!lock) throw new Error('worker-lock-unavailable');
@@ -381,7 +470,7 @@ async function handle(type: string, payload: any, source: 'owner' | 'client'): P
       if (!store) throw new Error('rows: store not open');
       const stats = store.stats();
       const tableCounts = payload?.tableCounts
-        ? store.tableNames().map((table) => ({ table, rows: store!.count(table) }))
+        ? visibleTables(store).map((table) => ({ table, rows: store!.count(table) }))
         : undefined;
       return { result: { stats, tableCounts } };
     }
@@ -399,6 +488,11 @@ async function handle(type: string, payload: any, source: 'owner' | 'client'): P
 function dispatch(target: PostTarget, data: any, source: 'owner' | 'client'): void {
   const { id, type, payload } = data ?? {};
   noteTick();
+  // What a page head replays from localStorage (`prewarmRows`) is a read, whatever the storage says.
+  if (typeof id === 'number' && id <= ROWS_AHEAD_ID && !ROWS_AHEAD_OPS.has(type)) {
+    target.postMessage({ id, ok: false, error: 'rows worker: only reads may be asked ahead' });
+    return;
+  }
   void enqueue(async () => {
     const t0 = performance.now();
     try {

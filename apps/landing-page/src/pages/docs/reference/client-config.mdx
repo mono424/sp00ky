@@ -5,6 +5,7 @@ description: "SyncedDbConfig, the object you hand to new SyncedDb(): connection,
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
 
 `SyncedDbConfig` is the client-side counterpart to [`sp00ky.yml`](/docs/reference/config). It is passed to `new SyncedDb(...)` in your app and controls the database connection, where data is cached locally, and how aggressively sync batches its work. Older docs sometimes call it `Sp00kyConfig`.
 
@@ -55,8 +56,8 @@ next to `@surrealdb/wasm`, or the dev server serves `index.html` where the
 
 If a store cannot be opened even after the client drops and recreates it, the
 session runs in memory and logs `falling back to in-memory` at error level;
-the next load tries IndexedDB again. Under `localEngine: 'sqlite'`,
-`'indexeddb'` selects the OPFS-backed SQLite store instead.
+the next load tries IndexedDB again. Under `localEngine: 'sqlite'` or
+`'rows'`, `'indexeddb'` selects that engine's OPFS-backed store instead.
 
 #### `database.workers`
 
@@ -69,11 +70,73 @@ imports the module the engine expects, and the app's build bundles that entry:
 |---|---|---|
 | `surreal` | default (`localEngine: 'surrealdb'`) | `@surrealdb/wasm/worker` |
 | `sqlite` | `localEngine: 'sqlite'` | `@spooky-sync/core/sqlite-worker` |
+| `rows` | `localEngine: 'rows'` | `@spooky-sync/core/rows-worker` |
 
 <CodeBlock code={workersCode} lang="typescript" fileName="src/app/db.ts" />
 
 A factory left out falls back to the built-in worker. The full Angular CLI setup, including the
 `.wasm` files to copy, is in the [Angular guide](/docs/guide/angular#setup).
+
+#### `localEngine`
+
+Which engine holds the local cache. All three keep the same rows and answer the same queries; they
+differ in what runs underneath.
+
+| Value | What it is | Durable store (`database.store: 'indexeddb'`) |
+|---|---|---|
+| `'surrealdb'` (default) | SurrealDB compiled to WebAssembly | IndexedDB |
+| `'sqlite'` | SQLite compiled to WebAssembly, in a worker | OPFS |
+| `'rows'` | sp00ky's own row store, in a worker | OPFS |
+
+<Experimental>
+  `'rows'` is experimental. It stores each bucket in one append-only file with a flat index, built
+  for this client's reads and writes and nothing else: no SQL engine and no WebAssembly to load (its
+  worker is about 30 kB, where SQLite's is over 1 MB with its `.wasm`). It answers every query the
+  way `'sqlite'` does, with two differences where SQL leaves the order open: rows that tie on an
+  `orderBy`, and the children of a `.related()` without one, come back in id order.
+</Experimental>
+
+Under `'rows'`, a write to a table that holds a user's unsent work (the outbox, debounced patches,
+failed writes, unsent CRDT edits) is flushed to disk before it resolves. Rows that are a copy of
+server state are flushed within about 100 ms instead: a power cut in that window costs a refetch,
+never a user's work.
+
+`'rows'` keeps its own indexes, in the same file as the rows and written with them. A field that
+holds record links gets one as rows arrive, so a `.related()` never waits for a build; a field a
+query filters on with `=` gets one the first time, by one read of the table. A field with only a
+handful of distinct values (a boolean, a status) is left to a scan, which reads its matches faster.
+
+A worker takes about 10 ms to start. To have the store open before the app has even loaded, start
+it from the page itself: paste `ROWS_PREWARM_SNIPPET` (exported by `@spooky-sync/core`) into an
+inline script in `<head>`, ahead of the app's bundle, or call `prewarmRows()` as the first thing
+the app's entry does. On a first visit it does nothing; after that it starts the worker and opens
+the last user's store while the bundle downloads and parses, and the client adopts it when it
+connects. A worker it cannot use (a new release, another user, a failed start) is replaced by a
+fresh one.
+
+The same script reads ahead: it asks the worker again for the reads the app made in its first
+seconds last time (up to 24 of them), and their answers wait in the page. When the client then
+makes one of those reads, it has the answer without a trip to the worker. These are answers from
+the store itself, read after it was opened, so they are what the client would have got by asking.
+Whatever is left of them is dropped the moment the tab writes, and nothing is read ahead with
+`sharedTabs`, where other tabs write to the same store.
+
+<CodeBlock code={prewarmCode} lang="typescript" fileName="vite.config.ts" />
+
+The browser only starts a worker when the page's main thread is free, so this helps while the
+bundle is on the network or being compiled, and not while a long script runs.
+
+#### `database.paintCache`
+
+`localEngine: 'rows'` only, default `true` for a durable store. The engine keeps a copy of the rows
+the app reads in its first seconds (up to about 1 MB, in localStorage), and
+`peekSelect(plan, params)` / `peekByIds(table, ids)` on the engine hand that copy back
+synchronously, before the store is open: something to paint from in a fraction of a millisecond.
+The copy is dropped the moment this tab writes to a table it came from and taken again from the
+next read of the same thing. It is still a copy: run the real read after a peek, and render that
+when it differs. Set `false` to keep nothing in localStorage.
+
+`sharedTabs: true` (one durable store for all tabs of the origin) works with `'sqlite'` and `'rows'`.
 
 #### `logLevel`
 
@@ -182,8 +245,8 @@ hold registrations or one-shot reads behind it.
 Persist the in-browser stream processor's store as a snapshot in the local
 store, so a reload restores it and only steps in what changed since instead
 of re-downloading the working set. Defaults to `true` under
-`localEngine: 'sqlite'` (the OPFS-backed store holds the bytes) and `false`
-otherwise. Snapshots are written on `circuitCheckpointMs` (default `30000`)
+`localEngine: 'sqlite'` and `'rows'` (the OPFS-backed stores hold the bytes)
+and `false` otherwise. Snapshots are written on `circuitCheckpointMs` (default `30000`)
 and when the page goes hidden, never per ingest. Without a snapshot the
 circuit is primed by reading the cached rows back out of the local store.
 
@@ -259,8 +322,18 @@ export const code2 = `interface SyncedDbConfig<Schema> {
     workers?: {
       surreal?: () => Worker;
       sqlite?: () => Worker;
+      rows?: () => Worker;
     };
+
+    /** Rows engine: keep startup reads in localStorage for synchronous peeks (default: true) */
+    paintCache?: boolean;
   };
+
+  /** Local cache engine: 'surrealdb' (default), 'sqlite', or 'rows' (experimental) */
+  localEngine?: 'surrealdb' | 'sqlite' | 'rows';
+
+  /** One durable store for all tabs of the origin; needs the sqlite or rows engine (default: false) */
+  sharedTabs?: boolean;
 
   /** Persistence client: 'surrealdb' (default), 'localstorage', or custom */
   persistenceClient?: 'surrealdb' | 'localstorage' | PersistenceClient;
@@ -290,7 +363,7 @@ export const code2 = `interface SyncedDbConfig<Schema> {
    */
   refSyncIntervalMs?: number;
 
-  /** Snapshot the in-browser circuit's store for reloads (default: true on the sqlite engine) */
+  /** Snapshot the in-browser circuit's store for reloads (default: true on the sqlite and rows engines) */
   persistCircuit?: boolean;
 
   /** Snapshot checkpoint interval in ms (default: 30000) */
@@ -340,6 +413,17 @@ export const viteExcludeCode = `export default defineConfig({
     include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch'],
   },
   build: { target: 'esnext' },
+});`;
+
+export const prewarmCode = `import { ROWS_PREWARM_SNIPPET } from '@spooky-sync/core';
+
+export default defineConfig({
+  plugins: [
+    {
+      name: 'sp00ky-prewarm',
+      transformIndexHtml: () => [{ tag: 'script', children: ROWS_PREWARM_SNIPPET, injectTo: 'head-prepend' }],
+    },
+  ],
 });`;
 
 export const workersCode = `// src/app/sp00ky-surreal.worker.ts contains one line:

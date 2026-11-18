@@ -1,9 +1,18 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { RecordId } from 'surrealdb';
 import type { QueryPlan } from '@spooky-sync/query-builder';
-import { RowsCacheEngine, ROWS_DURABLE_TABLES, packWrites } from './rows-cache-engine';
+import {
+  RowsCacheEngine,
+  ROWS_DURABLE_TABLES,
+  ROWS_PREWARM_KEY,
+  ROWS_PREWARM_SNIPPET,
+  packWrites,
+  prewarmRows,
+} from './rows-cache-engine';
 import { createLocalEngine } from './engine-factory';
-import { inProcessRows, type RowsDisks, type RowsHost } from './rows-transport.fixture';
+import { FakeRowsWorker, inProcessRows, type RowsDisks, type RowsHost } from './rows-transport.fixture';
+import { ROWS_CLIENT_OPS, maintenance } from './rows-exec';
+import type { StoreStats } from './rows-store';
 import { columnFingerprints } from './sqlite-column-reset';
 import { surql } from '../../utils/surql';
 import type { Row } from './cache-engine';
@@ -369,5 +378,422 @@ describe('packWrites', () => {
     expect(packWrites([{ kind: 'clear', table: '_00_crdt_local' }]).sync).toBe(true);
     expect(packWrites([{ kind: 'delete', table: 'game', key: 'x' }])).toEqual({ wire: [['del', 'game', 'x']], buf: null, sync: false });
     expect(packWrites([])).toEqual({ wire: [], buf: null, sync: false });
+  });
+});
+
+describe('row store housekeeping', () => {
+  const stats = (over: Partial<StoreStats>): StoreStats => ({
+    file: 'a',
+    fileBytes: 0,
+    liveBytes: 0,
+    indexBytes: 0,
+    garbageBytes: 0,
+    tailBytes: 0,
+    tailOps: 0,
+    tables: 0,
+    rebuilt: false,
+    ...over,
+  });
+
+  it('persists the index first, then compacts once dead bytes pass half the live ones', () => {
+    expect(maintenance(stats({}))).toBeNull();
+    expect(maintenance(stats({ tailBytes: 1, garbageBytes: 1 << 30 }))).toBe('checkpoint');
+    // Small stores are left alone however fragmented.
+    expect(maintenance(stats({ liveBytes: 1 << 20, garbageBytes: 3 << 20 }))).toBeNull();
+    expect(maintenance(stats({ liveBytes: 40 << 20, garbageBytes: 19 << 20 }))).toBeNull();
+    expect(maintenance(stats({ liveBytes: 40 << 20, garbageBytes: 21 << 20 }))).toBe('compact');
+  });
+
+  it('compacts a rewritten store down to its rows and keeps serving it', async () => {
+    const row = (i: number, round: number): Row => ({ n: i, round, pad: 'x'.repeat(2000) });
+    for (let round = 0; round < 6; round++) {
+      const vars: Record<string, unknown> = {};
+      const statements: string[] = [];
+      for (let i = 0; i < 500; i++) {
+        vars[`i${i}`] = `game:${i}`;
+        vars[`d${i}`] = row(i, round);
+        statements.push(surql.upsertMerge(`i${i}`, `d${i}`));
+      }
+      await engine.execute(surql.seal(surql.tx(statements)), vars);
+    }
+    const store = host.store()!;
+    store.checkpoint();
+    const before = store.stats();
+    expect(maintenance(before)).toBe('compact');
+    await store.compact();
+    const after = store.stats();
+    expect(maintenance(after)).toBeNull();
+    expect(after.fileBytes).toBeLessThan(before.fileBytes / 4);
+    expect(await engine.getById('game', 'game:499')).toEqual({ id: 'game:499', ...row(499, 5) });
+    expect((await engine.getStorageDiagnostics()).freelistBytes).toBeLessThan(64 << 10);
+  });
+
+  it('lets a follower tab read and write, and nothing else', () => {
+    for (const op of ['select', 'by-ids', 'get', 'relation', 'write', 'versions']) expect(ROWS_CLIENT_OPS.has(op)).toBe(true);
+    for (const op of ['open', 'close', 'shutdown', 'relock', 'diag']) expect(ROWS_CLIENT_OPS.has(op)).toBe(false);
+  });
+});
+
+describe('prewarming the row worker', () => {
+  const g = globalThis as Record<string, unknown>;
+  let stored: Map<string, string>;
+  let disks: RowsDisks;
+  /** Workers started through `new Worker(url)`, i.e. by the prewarm. */
+  let started: { url: string; worker: FakeRowsWorker }[];
+  /** Workers the engine started itself. */
+  let own: FakeRowsWorker[];
+  let prewarmedProto: number | undefined;
+
+  const makeEngine = (): RowsCacheEngine =>
+    new RowsCacheEngine(
+      {
+        store: 'indexeddb',
+        workers: {
+          rows: () => {
+            const worker = new FakeRowsWorker(disks);
+            own.push(worker);
+            return worker as unknown as Worker;
+          },
+        },
+      } as any,
+      logger,
+      { useOpfs: true }
+    );
+
+  beforeEach(() => {
+    stored = new Map();
+    disks = new Map();
+    started = [];
+    own = [];
+    prewarmedProto = undefined;
+    g.localStorage = {
+      getItem: (k: string) => stored.get(k) ?? null,
+      setItem: (k: string, v: string) => void stored.set(k, v),
+      removeItem: (k: string) => void stored.delete(k),
+    };
+    g.Worker = class {
+      constructor(url: string) {
+        const worker = new FakeRowsWorker(disks, prewarmedProto);
+        started.push({ url, worker });
+        return worker as unknown as object;
+      }
+    };
+  });
+
+  afterEach(() => {
+    delete g.localStorage;
+    delete g.Worker;
+    delete g.__sp00kyRowsPrewarm;
+  });
+
+  it('does nothing on a first visit, and learns the worker from the first open', async () => {
+    prewarmRows();
+    expect(started).toEqual([]);
+    const first = makeEngine();
+    await first.connect('user_a');
+    expect(own.length).toBe(1);
+    expect(JSON.parse(stored.get(ROWS_PREWARM_KEY)!)).toEqual({ url: 'https://app.test/assets/rows-worker.js', bucket: 'user_a' });
+    await first.upsert('game', 'game:a', { n: 1 }, 'replace');
+    await first.close();
+  });
+
+  it('hands the engine a worker that already has the store open', async () => {
+    const first = makeEngine();
+    await first.connect('user_a');
+    await first.upsert('game', 'game:a', { n: 1 }, 'replace');
+    await first.close();
+    own.length = 0;
+
+    prewarmRows();
+    prewarmRows();
+    expect(started.map((s) => s.url)).toEqual(['https://app.test/assets/rows-worker.js']);
+    expect(started[0].worker.posted.map((m) => m.type)).toEqual(['open', 'warm']);
+    const second = makeEngine();
+    await second.connect('user_a');
+    // The engine started no worker of its own, and nothing is left for a later engine to take.
+    expect(own).toEqual([]);
+    expect(g.__sp00kyRowsPrewarm).toBeUndefined();
+    expect(await second.getById('game', 'game:a')).toEqual({ id: 'game:a', n: 1 });
+    expect(second.storageHealth.status).toBe('persistent');
+  });
+
+  it('does not ask an adopted worker to open what it has already answered for', async () => {
+    const first = makeEngine();
+    await first.connect('user_a');
+    await first.upsert('game', 'game:a', { n: 1 }, 'replace');
+    await first.close();
+    own.length = 0;
+
+    prewarmRows();
+    // The worker answers while the bundle loads, long before the client connects.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = makeEngine();
+    await second.connect('user_a');
+    expect(own).toEqual([]);
+    expect(started[0].worker.posted.map((m) => m.type)).toEqual(['open', 'warm']);
+    expect(second.storageHealth.status).toBe('persistent');
+    expect(await second.getById('game', 'game:a')).toEqual({ id: 'game:a', n: 1 });
+    expect(started[0].worker.posted.map((m) => m.type)).toEqual(['open', 'warm', 'get']);
+  });
+
+  it('asks a worker prewarmed on another store to open the one it wants', async () => {
+    const first = makeEngine();
+    await first.connect('user_a');
+    await first.upsert('game', 'game:a', { n: 1 }, 'replace');
+    await first.close();
+
+    prewarmRows();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = makeEngine();
+    await second.connect('user_b');
+    expect(started[0].worker.posted.map((m) => m.type)).toEqual(['open', 'warm', 'open']);
+    expect(await second.getById('game', 'game:a')).toBeNull();
+  });
+
+  describe('reading ahead', () => {
+    const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    const save = (e: RowsCacheEngine): void => (e as unknown as { saveStartupReads(): void }).saveStartupReads();
+    const types = (): string[] => started[0].worker.posted.map((m) => m.type);
+
+    /** A session that reads two games at startup, and what it leaves for the next page load. */
+    const firstSession = async (): Promise<void> => {
+      const first = makeEngine();
+      await first.connect('user_a');
+      await first.upsert('game', 'game:a', { n: 1 }, 'replace');
+      await first.upsert('game', 'game:b', { n: 2 }, 'replace');
+      expect(await first.selectByIds('game', ['game:a', 'game:b'])).toEqual([
+        { id: 'game:a', n: 1 },
+        { id: 'game:b', n: 2 },
+      ]);
+      save(first);
+      await first.close();
+      own.length = 0;
+    };
+
+    it('saves the reads of a session start and asks them again from the page head', async () => {
+      await firstSession();
+      expect(JSON.parse(stored.get(ROWS_PREWARM_KEY)!).reads).toEqual([['by-ids', { table: 'game', ids: ['game:a', 'game:b'] }]]);
+      prewarmRows();
+      expect(started[0].worker.posted).toEqual([
+        { type: 'open', id: -1 },
+        { type: 'by-ids', id: -10 },
+        { type: 'warm', id: -2 },
+      ]);
+    });
+
+    it('answers the first read from what the worker already sent, without a trip', async () => {
+      await firstSession();
+      prewarmRows();
+      await tick();
+      const second = makeEngine();
+      await second.connect('user_a');
+      expect(await second.selectByIds('game', ['game:a', 'game:b'])).toEqual([
+        { id: 'game:a', n: 1 },
+        { id: 'game:b', n: 2 },
+      ]);
+      expect(types()).toEqual(['open', 'by-ids', 'warm']);
+      // An answer is used once: the same read again is asked of the worker.
+      expect((await second.selectByIds('game', ['game:a', 'game:b'])).length).toBe(2);
+      expect(types()).toEqual(['open', 'by-ids', 'warm', 'by-ids']);
+      // And another read never matches.
+      expect(await second.selectByIds('game', ['game:a'])).toEqual([{ id: 'game:a', n: 1 }]);
+      expect(types()).toEqual(['open', 'by-ids', 'warm', 'by-ids', 'by-ids']);
+    });
+
+    it('waits for an answer that is still on its way, and does not ask twice', async () => {
+      await firstSession();
+      prewarmRows();
+      const second = makeEngine();
+      await second.connect('user_a');
+      expect((await second.selectByIds('game', ['game:a', 'game:b'])).map((r) => r.n)).toEqual([1, 2]);
+      // The open had not been answered yet, so that one was asked; the read was not.
+      expect(types()).toEqual(['open', 'by-ids', 'warm', 'open']);
+    });
+
+    it('forgets what was read ahead the moment the session writes', async () => {
+      await firstSession();
+      prewarmRows();
+      await tick();
+      const second = makeEngine();
+      await second.connect('user_a');
+      await second.upsert('game', 'game:a', { n: 9 }, 'replace');
+      expect((await second.selectByIds('game', ['game:a', 'game:b'])).map((r) => r.n)).toEqual([9, 2]);
+      expect(types()).toEqual(['open', 'by-ids', 'warm', 'write', 'by-ids']);
+    });
+
+    it('asks nothing ahead for another bucket, and keeps no reads across a change of bucket', async () => {
+      await firstSession();
+      prewarmRows();
+      await tick();
+      const second = makeEngine();
+      await second.connect('user_b');
+      expect(await second.selectByIds('game', ['game:a', 'game:b'])).toEqual([]);
+      expect(types()).toEqual(['open', 'by-ids', 'warm', 'open', 'by-ids']);
+      expect(JSON.parse(stored.get(ROWS_PREWARM_KEY)!)).toEqual({ url: 'https://app.test/assets/rows-worker.js', bucket: 'user_b' });
+    });
+
+    it('does not save a read whose payload JSON would change', async () => {
+      const first = makeEngine();
+      await first.connect('user_a');
+      await first.upsert('game', 'game:a', { n: 1 }, 'replace');
+      const byParam: QueryPlan = { table: 'game', where: [{ field: 'n', op: '=', value: undefined, paramRef: 'n' }] };
+      await first.select(byParam, { n: 1 });
+      await first.select(byParam, { n: new Date(0) });
+      save(first);
+      const reads = JSON.parse(stored.get(ROWS_PREWARM_KEY)!).reads as [string, { params: unknown }][];
+      expect(reads.map((r) => r[1].params)).toEqual([{ n: 1 }]);
+      await first.close();
+    });
+  });
+
+  it('starts its own worker when the prewarmed one is another release', async () => {
+    stored.set(ROWS_PREWARM_KEY, JSON.stringify({ url: 'https://app.test/assets/rows-worker-OLD.js', bucket: 'user_a' }));
+    prewarmedProto = 0;
+    prewarmRows();
+    const engine = makeEngine();
+    await engine.connect('user_a');
+    expect(started[0].worker.terminated).toBe(true);
+    expect(own.length).toBe(1);
+    await engine.upsert('game', 'game:a', { n: 2 }, 'replace');
+    expect(await engine.getById('game', 'game:a')).toEqual({ id: 'game:a', n: 2 });
+    // The next load prewarms the worker that works.
+    expect(JSON.parse(stored.get(ROWS_PREWARM_KEY)!).url).toBe('https://app.test/assets/rows-worker.js');
+  });
+
+  it('drops a prewarmed worker that failed to start', async () => {
+    stored.set(ROWS_PREWARM_KEY, JSON.stringify({ url: 'https://app.test/gone.js', bucket: 'user_a' }));
+    prewarmRows();
+    started[0].worker.onerror?.({ message: '404' });
+    const engine = makeEngine();
+    await engine.connect('user_a');
+    expect(started[0].worker.terminated).toBe(true);
+    expect(own.length).toBe(1);
+  });
+
+  it('ships the same thing as a script for the page head', () => {
+    stored.set(ROWS_PREWARM_KEY, JSON.stringify({ url: 'https://app.test/assets/rows-worker.js', bucket: 'user_b' }));
+    new Function(ROWS_PREWARM_SNIPPET)();
+    expect(started.map((s) => s.url)).toEqual(['https://app.test/assets/rows-worker.js']);
+    expect((g.__sp00kyRowsPrewarm as { bucket: string }).bucket).toBe('user_b');
+    expect(started[0].worker.posted).toEqual([
+      { type: 'open', id: -1 },
+      { type: 'warm', id: -2 },
+    ]);
+  });
+
+  it('keeps the answer to its open in the head script too', async () => {
+    stored.set(ROWS_PREWARM_KEY, JSON.stringify({ url: 'https://app.test/assets/rows-worker.js', bucket: 'user_b' }));
+    new Function(ROWS_PREWARM_SNIPPET)();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const engine = makeEngine();
+    await engine.connect('user_b');
+    expect(started[0].worker.posted.map((m) => m.type)).toEqual(['open', 'warm']);
+    expect(engine.storageHealth.status).toBe('persistent');
+  });
+});
+
+describe('painting from the last session', () => {
+  const g = globalThis as Record<string, unknown>;
+  let stored: Map<string, string>;
+  let disks: RowsDisks;
+  const flush = (e: RowsCacheEngine): void => (e as unknown as { paint: { flush(): void } }).paint.flush();
+  const fresh = (config: Record<string, unknown> = {}, useOpfs = true): RowsCacheEngine => {
+    const next = new RowsCacheEngine({ store: 'indexeddb', ...config } as any, logger, { useOpfs });
+    inProcessRows(next, disks);
+    return next;
+  };
+  const ids = ['game:b', 'game:a'];
+
+  beforeEach(async () => {
+    stored = new Map();
+    disks = new Map();
+    g.localStorage = {
+      getItem: (k: string) => stored.get(k) ?? null,
+      setItem: (k: string, v: string) => void stored.set(k, v),
+      removeItem: (k: string) => void stored.delete(k),
+      key: (i: number) => [...stored.keys()][i] ?? null,
+      get length() {
+        return stored.size;
+      },
+    };
+    engine = fresh();
+    await engine.connect('user_a');
+    await engine.upsert('game', 'game:a', { n: 1, white: 'user:1' }, 'replace');
+    await engine.upsert('game', 'game:b', { n: 2, blob: new Uint8Array([1, 2]) }, 'replace');
+    await engine.upsert('user', 'user:1', { name: 'Ada' }, 'replace');
+  });
+
+  afterEach(() => {
+    delete g.localStorage;
+  });
+
+  it('hands back a startup read before the store is open', async () => {
+    expect(engine.peekByIds('game', ids)).toBeNull();
+    const rows = await engine.selectByIds('game', ids);
+    flush(engine);
+    await engine.close();
+
+    const next = fresh();
+    const opening = next.connect('user_a');
+    // Nothing has been awaited: the worker has not answered, the peek has.
+    expect(next.peekByIds('game', ids)).toEqual(rows);
+    expect(next.peekByIds('game', ids)![0].blob).toEqual(new Uint8Array([1, 2]));
+    expect(next.peekByIds('game', ['game:a'])).toBeNull();
+    expect(next.peekByIds('game', ids, { select: ['n'] })).toBeNull();
+    await opening;
+    expect(await next.selectByIds('game', ids)).toEqual(rows);
+  });
+
+  it('lets go of a copy the moment its table is written, and takes the next read of the same thing', async () => {
+    await engine.selectByIds('game', ids);
+    flush(engine);
+    expect([...stored.keys()].some((k) => k.startsWith('sp00ky.paint.user_a.'))).toBe(true);
+    await engine.upsert('game', 'game:a', { n: 10 }, 'merge');
+    expect(engine.peekByIds('game', ids)).toBeNull();
+    expect([...stored.keys()].filter((k) => k.startsWith('sp00ky.paint.user_a.'))).toEqual([]);
+    // A write to another table leaves it alone.
+    const again = await engine.selectByIds('game', ids);
+    await engine.upsert('user', 'user:1', { name: 'Ada L.' }, 'merge');
+    flush(engine);
+    expect(engine.peekByIds('game', ids)).toEqual(again);
+    expect(again[1].n).toBe(10);
+  });
+
+  it('never keeps a read that a write overtook', async () => {
+    const reading = engine.selectByIds('game', ids);
+    const writing = engine.upsert('game', 'game:a', { n: 99 }, 'merge');
+    await Promise.all([reading, writing]);
+    flush(engine);
+    expect(engine.peekByIds('game', ids)).toBeNull();
+  });
+
+  it('keeps a select with relations, and drops it when any table it read is written', async () => {
+    const plan: QueryPlan = {
+      table: 'game',
+      ids: ['game:a'],
+      relations: [{ alias: 'white', table: 'user', cardinality: 'one', foreignKeyField: 'white' }],
+    };
+    const rows = await engine.select(plan);
+    flush(engine);
+    expect(engine.peekSelect(plan)).toEqual(rows);
+    expect((engine.peekSelect(plan)![0].white as Row).name).toBe('Ada');
+    await engine.upsert('user', 'user:1', { name: 'Grace' }, 'merge');
+    expect(engine.peekSelect(plan)).toBeNull();
+  });
+
+  it('keeps each bucket apart and forgets a dropped one', async () => {
+    await engine.selectByIds('game', ids);
+    await engine.switchBucket('user_b');
+    expect(engine.peekByIds('game', ids)).toBeNull();
+    await engine.dropBucket('user_a');
+    expect([...stored.keys()].filter((k) => k.startsWith('sp00ky.paint.user_a'))).toEqual([]);
+  });
+
+  it('is off for a memory store and when configured off', async () => {
+    for (const quiet of [fresh({}, false), fresh({ paintCache: false })]) {
+      await quiet.connect('user_a');
+      await quiet.selectByIds('game', ids);
+      expect(quiet.peekByIds('game', ids)).toBeNull();
+    }
   });
 });

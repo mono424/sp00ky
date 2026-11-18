@@ -126,6 +126,8 @@ const SB_SIZE = 256;
 const SB_USED = 64;
 const HEADER_END = 4096;
 const XH = 16;
+/** How much of the tail a replay reads at once. */
+const REPLAY_CHUNK = 1 << 20;
 const X_BATCH = 1;
 const X_BLOCK = 2;
 const X_DIR = 3;
@@ -274,7 +276,23 @@ function runFind(run: Run, id: string): number {
   return -1;
 }
 
-/** `base` with `delta` applied: overrides replace, `null` removes. */
+/** First row of `run`, at or after `from`, whose id is not below `key`. */
+function lowerBound(run: Run, from: number, key: Uint8Array, keyLen: number): number {
+  let lo = from;
+  let hi = run.n;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (cmpBytes(run.heap, idStart(run, mid), run.idEnd[mid], key, 0, keyLen) < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * `base` with `delta` applied: overrides replace, `null` removes. The rows
+ * between two changed ids are copied as one block, so folding a handful of
+ * writes into a large table costs a few searches and a memcpy, not a walk.
+ */
 function mergeRun(base: Run, delta: Map<string, Entry | null>): Run {
   const keys = [...delta.keys()];
   let ascii = true;
@@ -295,46 +313,45 @@ function mergeRun(base: Run, delta: Map<string, Entry | null>): Run {
   const heap = new Uint8Array(base.heap.length + chars * 3);
   let n = 0;
   let h = 0;
-  let live = 0;
+  let live = base.live;
   let i = 0;
-  let j = 0;
-  let keyLen = keys.length > 0 ? encodeProbe(keys[0]) : 0;
-  while (i < base.n || j < keys.length) {
-    let c: number;
-    if (i >= base.n) c = 1;
-    else if (j >= keys.length) c = -1;
-    else c = cmpBytes(base.heap, idStart(base, i), base.idEnd[i], probe, 0, keyLen);
-    if (c < 0) {
-      const s = idStart(base, i);
-      const e = base.idEnd[i];
-      heap.set(base.heap.subarray(s, e), h);
-      h += e - s;
-      off[n] = base.off[i];
-      rv[n] = base.rv[i];
-      len[n] = base.len[i];
-      flags[n] = base.flags[i];
-      idEnd[n] = h;
-      live += base.len[i];
-      n++;
+  /** Copy base rows `[i, to)` to the output. */
+  const copy = (to: number): void => {
+    if (to <= i) return;
+    const count = to - i;
+    const s = idStart(base, i);
+    const e = base.idEnd[to - 1];
+    off.set(base.off.subarray(i, to), n);
+    rv.set(base.rv.subarray(i, to), n);
+    len.set(base.len.subarray(i, to), n);
+    flags.set(base.flags.subarray(i, to), n);
+    heap.set(base.heap.subarray(s, e), h);
+    const shift = h - s;
+    for (let k = 0; k < count; k++) idEnd[n + k] = base.idEnd[i + k] + shift;
+    n += count;
+    h += e - s;
+    i = to;
+  };
+  for (const key of keys) {
+    const keyLen = encodeProbe(key);
+    copy(lowerBound(base, i, probe, keyLen));
+    if (i < base.n && cmpBytes(base.heap, idStart(base, i), base.idEnd[i], probe, 0, keyLen) === 0) {
+      live -= base.len[i];
       i++;
-      continue;
     }
-    if (c === 0) i++;
-    const entry = delta.get(keys[j]);
-    if (entry) {
-      heap.set(probe.subarray(0, keyLen), h);
-      h += keyLen;
-      off[n] = entry.off;
-      rv[n] = entry.rv;
-      len[n] = entry.len;
-      flags[n] = entry.flags;
-      idEnd[n] = h;
-      live += entry.len;
-      n++;
-    }
-    j++;
-    if (j < keys.length) keyLen = encodeProbe(keys[j]);
+    const entry = delta.get(key);
+    if (!entry) continue;
+    heap.set(probe.subarray(0, keyLen), h);
+    h += keyLen;
+    off[n] = entry.off;
+    rv[n] = entry.rv;
+    len[n] = entry.len;
+    flags[n] = entry.flags;
+    idEnd[n] = h;
+    live += entry.len;
+    n++;
   }
+  copy(base.n);
 
   const buf = new Uint8Array(new ArrayBuffer(ROW_BYTES * n + h));
   const run = runFromBuffer(buf, n, h, live);
@@ -541,17 +558,33 @@ export class RowStore {
   private replay(from: number): void {
     const size = this.file.size();
     let pos = from;
-    const head = new Uint8Array(XH);
-    const headView = new DataView(head.buffer);
+    // The tail is read in large pieces, not a header and a payload at a time:
+    // a tail of a few hundred small batches is then a handful of reads, where
+    // two reads per batch made it most of what an open cost.
+    let chunk = new Uint8Array(0);
+    let base = 0;
+    let have = 0;
+    /** Bytes `[at, at + len)` of the file, from the piece in hand when it covers them. */
+    const bytes = (at: number, len: number): Uint8Array => {
+      if (at < base || at + len > base + have) {
+        const want = Math.min(size - at, Math.max(len, REPLAY_CHUNK));
+        if (chunk.length < want) chunk = new Uint8Array(new ArrayBuffer(want));
+        this.file.read(chunk.subarray(0, want), at);
+        base = at;
+        have = want;
+      }
+      return chunk.subarray(at - base, at - base + len);
+    };
     while (pos + XH <= size) {
-      this.file.read(head, pos);
+      const head = bytes(pos, XH);
+      const headView = new DataView(head.buffer, head.byteOffset, XH);
       const type = headView.getUint32(0, true);
       const len = headView.getUint32(4, true);
+      const sum = headView.getUint32(8, true);
       if (type < X_BATCH || type > X_DIR || pos + XH + len > size) break;
       if (type === X_BATCH) {
-        const payload = len <= this.scratch.length ? this.scratch.subarray(0, len) : new Uint8Array(len);
-        this.file.read(payload, pos + XH);
-        if (hash32(payload) !== headView.getUint32(8, true)) break;
+        const payload = bytes(pos + XH, len);
+        if (hash32(payload) !== sum) break;
         this.applyBatch(payload, pos + XH);
       }
       pos = align8(pos + XH + len);
@@ -685,11 +718,30 @@ export class RowStore {
     return this.ordered(name).n;
   }
 
+  /**
+   * The ids of a table that start with `prefix`, in order, with the prefix cut
+   * off. Ids are sorted, so this is one search and a walk over the matches:
+   * what makes a table of `value\0id` keys work as a secondary index.
+   */
+  prefix(name: string, prefix: string): string[] {
+    const run = this.ordered(name);
+    const len = encodeProbe(prefix);
+    const key = probe.slice(0, len);
+    const out: string[] = [];
+    for (let i = lowerBound(run, 0, key, len); i < run.n; i++) {
+      const s = idStart(run, i);
+      const e = run.idEnd[i];
+      if (e - s < len || cmpBytes(run.heap, s, s + len, key, 0, len) !== 0) break;
+      out.push(decoder.decode(run.heap.subarray(s + len, e)));
+    }
+    return out;
+  }
+
   /** `(id, version)` of every row, from the index alone. */
   versions(name: string): [string, number][] {
     const run = this.ordered(name);
-    const out: [string, number][] = new Array(run.n);
-    for (let i = 0; i < run.n; i++) out[i] = [runId(run, i), run.rv[i]];
+    const out: [string, number][] = [];
+    for (let i = 0; i < run.n; i++) out.push([runId(run, i), run.rv[i]]);
     return out;
   }
 

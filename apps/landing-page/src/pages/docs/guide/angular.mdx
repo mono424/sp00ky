@@ -64,7 +64,9 @@ zoneless and zone.js apps alike.
 
     `pino` is the client's logger; `allowedCommonJsDependencies` only silences the CommonJS
     warning about it. With `localEngine: 'sqlite'`, add a second worker entry containing
-    `import '@spooky-sync/core/sqlite-worker';` and pass it as `database.workers.sqlite`.
+    `import '@spooky-sync/core/sqlite-worker';` and pass it as `database.workers.sqlite`; with
+    `localEngine: 'rows'`, the entry is `import '@spooky-sync/core/rows-worker';`, passed as
+    `database.workers.rows`.
   </Step>
 
   <Step title="Generate types">

@@ -171,6 +171,13 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
      */
     queryTimeoutMs?: number;
     /**
+     * `localEngine: 'rows'` only. Keep a copy of the rows the app reads at
+     * startup in localStorage (up to about 1 MB), so `peekSelect` / `peekByIds`
+     * can hand a screen what it showed last time before the store is open.
+     * Default `true` for a durable store; `false` turns it off.
+     */
+    paintCache?: boolean;
+    /**
      * Deadline (ms) for every LOCAL store operation (a SQLite worker round trip,
      * or a query on the in-process surrealdb engine). Local ops are serialized
      * too, and one that never answered - a worker starved behind a long select,

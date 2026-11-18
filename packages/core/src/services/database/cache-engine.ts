@@ -167,6 +167,14 @@ export interface LocalStore extends LocalCacheEngine {
    * readable by follower tabs over the port transport. OPTIONAL: an engine
    * without it primes from `scanVersions` alone.
    */
+  /**
+   * What `select(plan, params)` / `selectByIds` answered the last time the app
+   * asked at startup, SYNCHRONOUSLY and before the store is open, or `null`.
+   * Something to paint from; the read itself stays the answer and must follow.
+   * OPTIONAL: only an engine that keeps such a copy (`'rows'`) has them.
+   */
+  peekSelect?(plan: QueryPlan, params?: Record<string, unknown>): Row[] | null;
+  peekByIds?(table: string, ids: Id[], opts?: { select?: string[]; orderBy?: OrderBy }): Row[] | null;
   getSnapshot?(key: string): Promise<StoredSnapshot | null>;
   putSnapshot?(key: string, bytes: Uint8Array, meta: SnapshotMeta): Promise<void>;
   deleteSnapshot?(key: string): Promise<void>;

@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use ssp::circuit::index::IndexDef;
 use ssp::circuit::{Circuit, OutputFormat, Record, TableMeta};
 use ssp_node::index_memory::{
-    prebuild, read_records, select, write_record, IndexRecorder, PrebuildLimits, SkipReason, SspIndexRecord,
-    RECORD_FORMAT, RECORD_KEEP,
+    prebuild, prebuild_in_background, read_records, select, write_record, IndexRecorder, PrebuildLimits, SkipReason,
+    SspIndexRecord, RECORD_FORMAT, RECORD_KEEP,
 };
 use ssp_node::ports::{Db, DbError};
 use surrealdb::engine::local::{Db as MemEngine, Mem};
@@ -60,9 +60,13 @@ fn game_indexes() -> Vec<IndexDef> {
 /// One SSP's circuit after its bootstrap: the same rows and mirrored schema
 /// every SSP of the project has.
 fn bootstrapped(indexes: Vec<IndexDef>) -> Arc<RwLock<Circuit>> {
+    bootstrapped_rows(indexes, 400)
+}
+
+fn bootstrapped_rows(indexes: Vec<IndexDef>, rows: usize) -> Arc<RwLock<Circuit>> {
     let mut circuit = Circuit::new();
     circuit.set_table_meta("game", TableMeta { permission: "true".into(), indexes, ..Default::default() });
-    for i in 0..400 {
+    for i in 0..rows {
         circuit.load([Record::new("game", &format!("g{i:04}"), json!({
             "white": format!("user:{}", i % 7),
             "black": format!("user:{}", i % 5),
@@ -225,4 +229,117 @@ async fn a_replacement_skips_what_the_schema_dropped_or_redefined_and_what_aged_
     assert_eq!(report.skipped.len(), 3);
     assert!(report.skipped.iter().all(|(_, reason)| *reason == SkipReason::TimeBudget));
     assert!(built(&*rushed.read().await).is_empty());
+}
+
+/// Blue's record (game_white read by a view, game_black idle), for a table
+/// of `rows` games.
+async fn blue_record(db: &MemDb, rows: usize) -> Vec<SspIndexRecord> {
+    let blue = bootstrapped_rows(game_indexes(), rows);
+    {
+        let mut c = blue.write().await;
+        register(&mut c, "white", WHITE);
+        let (black, _) = register(&mut c, "black", BLACK);
+        c.remove_query(&black);
+    }
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    IndexRecorder::new("ssp-0").record(db, &blue, false).await.unwrap();
+    read_records(db).await.unwrap()
+}
+
+fn limits() -> PrebuildLimits {
+    PrebuildLimits { time: Duration::from_secs(60), max_bytes: None, idle_grace: Duration::from_secs(3600) }
+}
+
+/// What `SspNode`'s registration does before it takes the circuit's write
+/// lock: build the view's indexes a step at a time under the read lock, then
+/// install the view. Returns the rows its steps read and whether the steps
+/// or the install reported building an index.
+async fn register_like_a_client(circuit: &RwLock<Circuit>, id: &str, surql: &str) -> (usize, usize) {
+    let data = {
+        let c = circuit.read().await;
+        ssp::service::view::prepare_registration_dbsp(registration(id, surql), c.permissions(), c.link_targets(), c.opaque_fields())
+            .expect("registration prepares")
+    };
+    let (mut rows, mut builds) = (0, 0);
+    loop {
+        let (done, stats) = circuit.read().await.prewarm_query_indexes_step(&data.plan, data.safe_params.as_ref(), Duration::ZERO);
+        rows += stats.rows_indexed;
+        builds += stats.indexes_built;
+        if done {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let (_, timings) = circuit.write().await.add_query_with_auth_timed(
+        data.plan,
+        data.safe_params,
+        Some(OutputFormat::Streaming),
+        "user:1".into(),
+    );
+    (rows, builds + timings.indexes_built)
+}
+
+/// A serving SSP prebuilds in the background while a client registers a view
+/// over the index it is building: they advance one part-built index, so every
+/// row is read once and the index is built once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_background_prebuild_and_a_registration_of_the_same_index_build_it_once() {
+    const ROWS: usize = 6_000;
+    let db = mem_db().await;
+    let records = blue_record(&db, ROWS).await;
+    let green = bootstrapped_rows(game_indexes(), ROWS);
+    let selection = select(&records, ssp_node::now_epoch_ms(), &limits());
+    assert_eq!(selection.build[0].name, "game_white", "the index the client needs goes first");
+
+    // One 512-row step each, taking turns (both yield after every step).
+    let background = prebuild_in_background(&green, selection, Duration::from_secs(60), Duration::ZERO, || false);
+    let client = register_like_a_client(&green, "white", WHITE);
+    let (report, (client_rows, client_builds)) = tokio::join!(background, client);
+
+    assert!(client_rows > 0, "the registration took turns building game_white");
+    assert!(client_rows < ROWS, "...and did not build it alone");
+    assert_eq!(report.stats.rows_indexed + client_rows, 2 * ROWS, "game_white once between them, game_black once");
+    let built: Vec<&str> = report.built.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(built, vec!["game.game_white", "game.game_black"], "{}", report.skipped_summary());
+    assert!(client_builds <= 1);
+    let held = green.read().await.held_indexes();
+    assert!(held.iter().all(|index| index.rows == ROWS), "{held:?}");
+    assert_eq!(held.iter().find(|i| i.name == "game_white").unwrap().idle_ms, 0, "read by the client's view");
+    assert!(held.iter().find(|i| i.name == "game_black").unwrap().idle_ms > 0, "unread: idle age carried over");
+}
+
+/// A background prebuild stops between two steps when asked (shutdown, the
+/// SSP leaving Ready): the rest is reported, the part-built index stays, and
+/// the next registration that needs it finishes it without reading a row
+/// twice.
+#[tokio::test(flavor = "current_thread")]
+async fn a_background_prebuild_stops_between_steps_and_leaves_the_rest_to_the_next_reader() {
+    const ROWS: usize = 6_000;
+    let db = mem_db().await;
+    let records = blue_record(&db, ROWS).await;
+    let green = bootstrapped_rows(game_indexes(), ROWS);
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let report = prebuild_in_background(
+        &green,
+        select(&records, ssp_node::now_epoch_ms(), &limits()),
+        Duration::from_secs(60),
+        Duration::ZERO,
+        || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3,
+    )
+    .await;
+    assert!(report.built.is_empty());
+    assert_eq!(report.skipped, vec![
+        ("game.game_white".to_string(), SkipReason::Stopped),
+        ("game.game_black".to_string(), SkipReason::Stopped),
+    ]);
+    let partial = report.stats.rows_indexed;
+    assert!(partial > 0 && partial < ROWS, "stopped part way: {partial}");
+    let held = green.read().await.held_indexes();
+    assert_eq!(held.len(), 1);
+    assert_eq!((held[0].name.as_str(), held[0].rows), ("game_white", partial));
+
+    let (client_rows, client_builds) = register_like_a_client(&green, "white", WHITE).await;
+    assert_eq!(partial + client_rows, ROWS, "finished from where it stopped");
+    assert_eq!(client_builds, 1, "the registration's step completed it");
+    assert_eq!(green.read().await.held_indexes()[0].rows, ROWS);
 }

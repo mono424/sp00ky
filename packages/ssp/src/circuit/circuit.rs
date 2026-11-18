@@ -263,6 +263,9 @@ pub enum PrebuildOutcome {
     NotDefined,
     /// The schema defines an index of that name over other fields now.
     Redefined,
+    /// A step of [`Circuit::prebuild_held_index_step`] that left the index
+    /// part built: the work it did.
+    InProgress(IndexBuildStats),
 }
 
 /// One table's schema as the circuit uses it, read from upstream DDL: the
@@ -764,6 +767,11 @@ impl Circuit {
         self.index_idle_release
     }
 
+    /// The mirrored definition of `table`'s index `name`, if the schema has one.
+    pub fn index_def(&self, table: &str, name: &str) -> Option<&crate::circuit::index::IndexDef> {
+        self.index_defs.get(table)?.iter().find(|def| def.name == name)
+    }
+
     /// Every index this circuit holds, with how long it has gone unread
     /// (zero while a graph reads it) and its size: what the SSP records in
     /// the database so the SSP that replaces it can rebuild the same ones
@@ -815,16 +823,65 @@ impl Circuit {
             return PrebuildOutcome::NotDefined;
         };
         let stats = collection.prewarm_index(def);
-        let read_here = self.graphs.values().any(|graph| {
-            graph.index_uses().iter().any(|(t, n)| t == table && n == name)
-        });
-        if !read_here && !idle.is_zero() {
-            collection.set_index_idle_for(name, idle, Instant::now());
-        }
+        self.carry_index_idle(table, name, idle);
         if stats.indexes_built == 0 {
             PrebuildOutcome::AlreadyBuilt
         } else {
             PrebuildOutcome::Built(stats)
+        }
+    }
+
+    /// [`Self::prebuild_held_index`] for about `budget` at a time, through
+    /// the same stepped build a registration runs
+    /// ([`Collection::build_index_step`]): a host that serves already calls
+    /// it in a loop, holding its read lock for one step, so writes and
+    /// registrations get in between. Both advance the one part-built index
+    /// in the collection, so a registration that needs the index meanwhile
+    /// finishes it rather than building it again, and whichever step reads
+    /// the last row reports the build. `InProgress` until the index is
+    /// complete; the idle age is carried over once it is.
+    pub fn prebuild_held_index_step(
+        &self,
+        table: &str,
+        name: &str,
+        fields: &[String],
+        idle: std::time::Duration,
+        budget: std::time::Duration,
+    ) -> PrebuildOutcome {
+        let Some(def) = self.index_defs.get(table).and_then(|defs| defs.iter().find(|def| def.name == name)) else {
+            return PrebuildOutcome::NotDefined;
+        };
+        if def.fields != fields {
+            return PrebuildOutcome::Redefined;
+        }
+        let Some(collection) = self.store.get_collection(table) else {
+            return PrebuildOutcome::NotDefined;
+        };
+        let (done, stats) = collection.build_index_step(def, budget);
+        if !done {
+            return PrebuildOutcome::InProgress(stats);
+        }
+        self.carry_index_idle(table, name, idle);
+        if stats.indexes_built == 0 && stats.rows_indexed == 0 {
+            PrebuildOutcome::AlreadyBuilt
+        } else {
+            PrebuildOutcome::Built(stats)
+        }
+    }
+
+    /// Start a rebuilt index's idle clock `idle` back, unless a graph here
+    /// reads it.
+    fn carry_index_idle(&self, table: &str, name: &str, idle: std::time::Duration) {
+        if idle.is_zero() {
+            return;
+        }
+        let read_here = self.graphs.values().any(|graph| {
+            graph.index_uses().iter().any(|(t, n)| t == table && n == name)
+        });
+        if !read_here {
+            if let Some(collection) = self.store.get_collection(table) {
+                collection.set_index_idle_for(name, idle, Instant::now());
+            }
         }
     }
 
@@ -6455,5 +6512,55 @@ mod index_tests {
         third.set_index_idle_release(Duration::from_secs(300));
         third.remove_query(id);
         assert_eq!(third.built_indexes()["game"], vec!["game_database_sort".to_string()], "idle from now");
+    }
+
+    #[test]
+    fn a_stepped_prebuild_and_a_registration_share_one_build() {
+        use std::time::Duration;
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        for i in 0..3_000 {
+            c.store.apply_change(&Change::create(
+                "game",
+                &format!("g{i:05}"),
+                json!({ "database": "game_database:d1", "sort_index": i }),
+            ));
+        }
+        let (id, plan, params, _) = views().into_iter().next().unwrap();
+        let plan = QueryPlan { id: id.into(), root: plan };
+        let fields = vec!["database".to_string(), "sort_index".to_string()];
+        let idle = Duration::from_secs(60);
+
+        // A background prebuild and a registration's prewarm take turns on
+        // the same index, one 512-row step each.
+        let (mut background, mut registration) = (IndexBuildStats::default(), IndexBuildStats::default());
+        let mut finished_by = None;
+        for turn in 0.. {
+            if turn % 2 == 0 {
+                match c.prebuild_held_index_step("game", "game_database_sort", &fields, idle, Duration::ZERO) {
+                    PrebuildOutcome::InProgress(stats) => background += stats,
+                    PrebuildOutcome::Built(stats) => { background += stats; finished_by = Some("background"); break }
+                    other => panic!("{other:?}"),
+                }
+            } else {
+                let (done, stats) = c.prewarm_query_indexes_step(&plan, Some(&params), Duration::ZERO);
+                registration += stats;
+                if done { finished_by = Some("registration"); break }
+            }
+        }
+        assert!(background.rows_indexed > 0 && registration.rows_indexed > 0, "both took turns");
+        assert_eq!(background.rows_indexed + registration.rows_indexed, 3_000, "every row read once between them");
+        assert_eq!(background.indexes_built + registration.indexes_built, 1, "one build, by {finished_by:?}");
+        // The loser of the race sees it done; the view registers without a build.
+        assert_eq!(
+            c.prebuild_held_index_step("game", "game_database_sort", &fields, idle, Duration::ZERO),
+            PrebuildOutcome::AlreadyBuilt
+        );
+        assert!(c.held_indexes()[0].idle_ms >= 60_000, "unread here: the idle age carried over");
+        let (_, timings) = c.add_query_with_auth_timed(plan, Some(params), None, String::new());
+        assert_eq!(timings.indexes_built, 0);
+        assert_eq!(c.held_indexes()[0].rows, 3_000);
+        assert_eq!(c.held_indexes()[0].idle_ms, 0, "read now");
     }
 }

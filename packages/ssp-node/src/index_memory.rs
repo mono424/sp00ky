@@ -1,5 +1,5 @@
 //! Which secondary indexes an SSP holds, kept in the database, so the SSP
-//! that replaces it builds the same ones before it serves.
+//! that replaces it builds the same ones before its clients need them.
 //!
 //! An SSP builds a mirrored index the first time a view plans over it, and
 //! that first build is a pass over the whole table that the registration
@@ -13,9 +13,11 @@
 //! Here the serving SSP writes what it holds (each index, how long it has
 //! gone unread, its size) to one record of the private `_00_sync_evidence`
 //! table, every [`RECORD_EVERY`] when that changed and on graceful shutdown.
-//! A new SSP reads every such record after its bootstrap and before it
-//! reports Ready ([`select`] then [`prebuild`]): a blue/green standby does
-//! this while its predecessor still serves. It rebuilds what the mirrored
+//! A new SSP reads every such record after its bootstrap ([`select`]). A
+//! blue/green standby builds before it reports Ready ([`prebuild`]), while
+//! its predecessor still serves; any other SSP goes Ready first and builds
+//! in the background a short step at a time ([`prebuild_in_background`]),
+//! so no restart waits for it. It rebuilds what the mirrored
 //! schema still defines and was read within the idle grace, most recently
 //! read first, within a time and a memory budget ([`PrebuildLimits`]), and
 //! carries each index's idle age over, so a deploy does not keep an index
@@ -49,6 +51,10 @@ pub const RECORD_REFRESH: Duration = Duration::from_secs(600);
 /// Records older than this are deleted by the next write (an SSP id that
 /// is gone: every blue/green successor gets a new one).
 pub const RECORD_KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// How long one step of a background prebuild holds the circuit; the same
+/// step a registration takes when it builds an index itself.
+pub const BACKGROUND_STEP: Duration = Duration::from_millis(25);
 
 /// Default for `SPKY_SSP_INDEX_PREBUILD_SECS`.
 pub const DEFAULT_PREBUILD_TIME: Duration = Duration::from_secs(60);
@@ -205,7 +211,7 @@ impl IndexRecorder {
     }
 }
 
-/// How much a new SSP rebuilds before it serves.
+/// How much a new SSP rebuilds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrebuildLimits {
     /// No build starts after this long (one already running finishes).
@@ -271,6 +277,8 @@ pub enum SkipReason {
     MemoryBudget,
     /// [`PrebuildLimits::time`] ran out first.
     TimeBudget,
+    /// The SSP stopped serving (shutdown, a re-bootstrap) before it got to it.
+    Stopped,
     /// The schema does not define it (or its table) any more.
     NotDefined,
     /// The schema defines it over other fields now.
@@ -336,6 +344,30 @@ pub fn select(records: &[SspIndexRecord], now_ms: u64, limits: &PrebuildLimits) 
     selection
 }
 
+/// The indexes a warm restart's local file names (`indexes.json`, no idle
+/// age or size), as a [`Selection`]: each with the fields the circuit's
+/// schema defines for it now, those it does not define skipped.
+pub fn local_selection(circuit: &Circuit, wanted: &BTreeMap<String, Vec<String>>) -> Selection {
+    let mut selection = Selection::default();
+    for (table, names) in wanted {
+        for name in names {
+            let fields = circuit.index_def(table, name).map(|def| def.fields.clone());
+            let index = Wanted {
+                table: table.clone(),
+                name: name.clone(),
+                fields: fields.clone().unwrap_or_default(),
+                idle: Duration::ZERO,
+                bytes: 0,
+            };
+            match fields {
+                Some(_) => selection.build.push(index),
+                None => selection.skipped.push((index, SkipReason::NotDefined)),
+            }
+        }
+    }
+    selection
+}
+
 /// What [`prebuild`] did.
 #[derive(Debug, Clone, Default)]
 pub struct PrebuildReport {
@@ -384,9 +416,89 @@ pub async fn prebuild(processor: &RwLock<Circuit>, selection: Selection, time_bu
             PrebuildOutcome::AlreadyBuilt => report.already_built += 1,
             PrebuildOutcome::NotDefined => report.skipped.push((index.label(), SkipReason::NotDefined)),
             PrebuildOutcome::Redefined => report.skipped.push((index.label(), SkipReason::Redefined)),
+            // The one-pass build never leaves an index part built.
+            PrebuildOutcome::InProgress(stats) => report.stats += stats,
         }
         crate::node::yield_now().await;
     }
+    report.elapsed = started.elapsed();
+    report
+}
+
+/// [`prebuild`] for an SSP that already serves: each index is built `step`
+/// at a time, the circuit's read lock held for one step and freed in
+/// between, so ingest and registrations keep flowing. A registration that
+/// needs an index this is building advances the same part-built index (see
+/// [`Circuit::prebuild_held_index_step`]); between them every row is read
+/// once. Past `time_budget` no new index starts (the one under way
+/// finishes). `should_stop` is asked before every step: once it says so the
+/// rest is reported [`SkipReason::Stopped`] and a part-built index is left
+/// for whoever needs it next to finish.
+pub async fn prebuild_in_background(
+    processor: &RwLock<Circuit>,
+    selection: Selection,
+    time_budget: Duration,
+    step: Duration,
+    should_stop: impl Fn() -> bool,
+) -> PrebuildReport {
+    let started = Instant::now();
+    let mut report = PrebuildReport::default();
+    report.skipped = selection.skipped.iter().map(|(index, reason)| (index.label(), *reason)).collect();
+    let mut stopped = false;
+    for index in selection.build {
+        if stopped || should_stop() {
+            stopped = true;
+            report.skipped.push((index.label(), SkipReason::Stopped));
+            continue;
+        }
+        if started.elapsed() >= time_budget {
+            report.skipped.push((index.label(), SkipReason::TimeBudget));
+            continue;
+        }
+        let mut mine = IndexBuildStats::default();
+        loop {
+            let outcome = processor
+                .read()
+                .await
+                .prebuild_held_index_step(&index.table, &index.name, &index.fields, index.idle, step);
+            match outcome {
+                PrebuildOutcome::InProgress(stats) => mine += stats,
+                PrebuildOutcome::Built(stats) => {
+                    mine += stats;
+                    report.built.push((index.label(), mine.index_build_ms));
+                    break;
+                }
+                // Finished by a registration that needed it meanwhile, or
+                // built before this started.
+                PrebuildOutcome::AlreadyBuilt if mine.rows_indexed > 0 => {
+                    report.built.push((index.label(), mine.index_build_ms));
+                    break;
+                }
+                PrebuildOutcome::AlreadyBuilt => {
+                    report.already_built += 1;
+                    break;
+                }
+                PrebuildOutcome::NotDefined => {
+                    report.skipped.push((index.label(), SkipReason::NotDefined));
+                    break;
+                }
+                PrebuildOutcome::Redefined => {
+                    report.skipped.push((index.label(), SkipReason::Redefined));
+                    break;
+                }
+            }
+            crate::node::yield_now().await;
+            if should_stop() {
+                stopped = true;
+                report.skipped.push((index.label(), SkipReason::Stopped));
+                break;
+            }
+        }
+        report.stats.index_build_ms += mine.index_build_ms;
+        report.stats.rows_indexed += mine.rows_indexed;
+        crate::node::yield_now().await;
+    }
+    report.stats.indexes_built = report.built.len();
     report.elapsed = started.elapsed();
     report
 }

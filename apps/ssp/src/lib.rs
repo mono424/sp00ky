@@ -1392,6 +1392,7 @@ pub async fn run_server() -> anyhow::Result<()> {
 
     info!(addr = %config.listen_addr, "Listening for requests");
 
+    let background_prebuild = Arc::new(BackgroundPrebuild::default());
     let boot = Arc::new(ClusterBoot {
         db: db.clone(),
         processor: processor_arc.clone(),
@@ -1407,6 +1408,7 @@ pub async fn run_server() -> anyhow::Result<()> {
         row_checkpoints: row_checkpoints.clone(),
         replaces: ReplacesClaim::new(std::env::var("SPKY_SSP_REPLACES").ok()),
         rebootstrap: tokio::sync::Mutex::new(()),
+        background_prebuild: Arc::clone(&background_prebuild),
     });
 
     // Spawn self-bootstrap task (runs while server is already accepting /health requests)
@@ -1610,7 +1612,7 @@ pub async fn run_server() -> anyhow::Result<()> {
             meter_provider,
             Arc::clone(&clean_requested),
             row_checkpoints.map(|rows| (rows, processor_arc.clone(), status.clone())),
-            (index_recorder, Arc::clone(&node)),
+            (index_recorder, Arc::clone(&node), background_prebuild),
         ))
         .await
         .context("Server error")?;
@@ -1665,7 +1667,7 @@ async fn shutdown_signal(
     meter_provider: opentelemetry_sdk::metrics::SdkMeterProvider,
     clean_requested: Arc<AtomicBool>,
     rows: Option<ShutdownRows>,
-    indexes: (Arc<ssp_node::index_memory::IndexRecorder>, Arc<ssp_node::SspNode>),
+    indexes: (Arc<ssp_node::index_memory::IndexRecorder>, Arc<ssp_node::SspNode>, Arc<BackgroundPrebuild>),
 ) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1691,10 +1693,12 @@ async fn shutdown_signal(
 
     info!("Signal received, starting graceful shutdown");
 
-    // What this SSP holds, for the one that replaces it, while it still
-    // serves (before `Stopping` below). Bounded: a stalled database must not
-    // eat the SIGTERM grace the row checkpoint needs.
-    let (recorder, node) = indexes;
+    // A background index prebuild stops first (it leaves the circuit within
+    // a step). Then what this SSP holds, for the one that replaces it, while
+    // it still serves (before `Stopping` below). Bounded: a stalled database
+    // must not eat the SIGTERM grace the row checkpoint needs.
+    let (recorder, node, background_prebuild) = indexes;
+    background_prebuild.stop().await;
     if !node.is_standby() && *node.status.read().await == SspStatus::Ready {
         let write = recorder.record(node.platform.db.as_ref(), &node.processor, true);
         match tokio::time::timeout(std::time::Duration::from_secs(5), write).await {
@@ -1751,6 +1755,8 @@ struct ClusterBoot {
     replaces: ReplacesClaim,
     /// Serializes in-process re-bootstraps (see `rebootstrap_in_process`).
     rebootstrap: tokio::sync::Mutex<()>,
+    /// The index prebuild of an SSP that serves while it runs.
+    background_prebuild: Arc<BackgroundPrebuild>,
 }
 
 /// What an SSP claims to replace when it registers (`SPKY_SSP_REPLACES`):
@@ -2071,12 +2077,16 @@ impl ClusterBoot {
                     // refreshes the allowlist): its predecessor's edges stand
                     // until `POST /handover/promote` compares digests.
                     let standby = node.is_standby();
-                    // Rebuild the indexes the SSPs before this one held before
-                    // serving: a list opened before the restart would
-                    // otherwise pay the build, a pass over its whole table
-                    // that its registration waits for, on its first window
-                    // after. A standby does this while its predecessor serves.
-                    prebuild_held_indexes(node.platform.db.as_ref(), processor, row_checkpoints.as_deref()).await;
+                    // Rebuild the indexes the SSPs before this one held: a
+                    // list opened before the restart would otherwise pay the
+                    // build, a pass over its whole table that its
+                    // registration waits for, on its first window after. A
+                    // standby does it now, while its predecessor serves; any
+                    // other SSP goes Ready first and does it in the
+                    // background (below), so no restart waits for it.
+                    if standby {
+                        prebuild_held_indexes(node.platform.db.as_ref(), processor, row_checkpoints.as_deref()).await;
+                    }
                     let republish_started = std::time::Instant::now();
                     if let Err(e) = node.republish_restored_views().await {
                         error!(error = %e, "Bootstrap membership repair failed");
@@ -2089,6 +2099,14 @@ impl ClusterBoot {
                         republish_ms = republish_started.elapsed().as_millis() as u64,
                         "SSP ready"
                     );
+                    if !standby {
+                        self.background_prebuild.start(
+                            Arc::clone(&node.platform.db),
+                            Arc::clone(processor),
+                            Arc::clone(status),
+                            row_checkpoints.clone(),
+                        );
+                    }
                     if standby {
                         info!("Standby ready: following ingest, publishing nothing until promoted");
                     } else if let Some(rows) = row_checkpoints {
@@ -2111,18 +2129,29 @@ impl ClusterBoot {
     }
 }
 
-/// Rebuild the indexes the SSPs before this one held (their records in
-/// `_00_sync_evidence`, see [`ssp_node::index_memory`]), within
-/// `SPKY_SSP_INDEX_PREBUILD_SECS` and `SPKY_SSP_INDEX_PREBUILD_MAX_MB`. With
-/// no record to go by (none written yet, the read failed, or the prebuild
-/// turned off) it falls back to what the row checkpoint directory says the
-/// previous process held. Never fails the bootstrap: whatever is not built
-/// here is built by the first registration that needs it.
-async fn prebuild_held_indexes(
+/// What a starting SSP rebuilds of the indexes the SSPs before it held, and
+/// where that came from.
+struct HeldIndexPlan {
+    selection: ssp_node::index_memory::Selection,
+    /// No new build starts past it.
+    time: std::time::Duration,
+    /// `database` (the records in `_00_sync_evidence`) or `local` (the warm
+    /// restart's `indexes.json`).
+    source: &'static str,
+    records: usize,
+}
+
+/// Read what to rebuild: every SSP's record in `_00_sync_evidence` (see
+/// [`ssp_node::index_memory`]), within `SPKY_SSP_INDEX_PREBUILD_SECS` and
+/// `SPKY_SSP_INDEX_PREBUILD_MAX_MB`. With no record to go by (none written
+/// yet, the read failed, or that prebuild turned off) what the row
+/// checkpoint directory says the previous process held, with no time limit,
+/// as before. `None` when there is nothing to rebuild.
+async fn held_index_plan(
     db: &dyn ssp_node::ports::Db,
-    processor: &Arc<RwLock<Circuit>>,
+    processor: &RwLock<Circuit>,
     rows: Option<&warm::RowCheckpoints>,
-) {
+) -> Option<HeldIndexPlan> {
     use ssp_node::index_memory;
     let grace = processor.read().await.index_idle_release();
     let limits = index_memory::PrebuildLimits::from_env(grace);
@@ -2138,35 +2167,132 @@ async fn prebuild_held_indexes(
         }
     };
     if !records.is_empty() {
-        let selection = index_memory::select(&records, ssp_node::now_epoch_ms(), &limits);
-        let byte_budget = selection.byte_budget;
-        let report = index_memory::prebuild(processor, selection, limits.time).await;
-        info!(
-            records = records.len(),
-            built = report.built.len(),
-            already_built = report.already_built,
-            skipped = report.skipped.len(),
-            rows_indexed = report.stats.rows_indexed,
-            ms = report.elapsed.as_millis() as u64,
-            budget_ms = limits.time.as_millis() as u64,
-            budget_mb = byte_budget / (1024 * 1024),
-            built_indexes = %report.built_summary(),
-            "Rebuilt the indexes the SSPs before this one held"
-        );
-        if !report.skipped.is_empty() {
-            info!(
-                skipped = %report.skipped_summary(),
-                "Left indexes to build on first use"
-            );
-        }
-        return;
+        return Some(HeldIndexPlan {
+            selection: index_memory::select(&records, ssp_node::now_epoch_ms(), &limits),
+            time: limits.time,
+            source: "database",
+            records: records.len(),
+        });
     }
-    if let Some(rows) = rows {
-        let wanted = rows.read_built_indexes();
-        if !wanted.is_empty() {
-            let started = std::time::Instant::now();
-            let built = processor.read().await.prebuild_indexes(&wanted).indexes_built;
-            info!(built, ms = started.elapsed().as_millis() as u64, "Rebuilt the indexes the previous process held");
+    let wanted = rows?.read_built_indexes();
+    if wanted.is_empty() {
+        return None;
+    }
+    let selection = index_memory::local_selection(&*processor.read().await, &wanted);
+    Some(HeldIndexPlan { selection, time: std::time::Duration::MAX, source: "local", records: 0 })
+}
+
+fn log_index_prebuild(plan: &HeldIndexPlan, budget_mb: u64, report: &ssp_node::index_memory::PrebuildReport, mode: &'static str) {
+    info!(
+        mode,
+        source = plan.source,
+        records = plan.records,
+        built = report.built.len(),
+        already_built = report.already_built,
+        skipped = report.skipped.len(),
+        rows_indexed = report.stats.rows_indexed,
+        ms = report.elapsed.as_millis() as u64,
+        budget_mb,
+        built_indexes = %report.built_summary(),
+        "Rebuilt the indexes the SSPs before this one held"
+    );
+    if !report.skipped.is_empty() {
+        info!(mode, skipped = %report.skipped_summary(), "Left indexes to build on first use");
+    }
+}
+
+/// A blue/green standby rebuilds the indexes the SSPs before it held before
+/// it reports Ready, one pass and one circuit read lock per index, while its
+/// predecessor still serves. Never fails the bootstrap: whatever is not built
+/// here is built by the first registration that needs it.
+async fn prebuild_held_indexes(
+    db: &dyn ssp_node::ports::Db,
+    processor: &RwLock<Circuit>,
+    rows: Option<&warm::RowCheckpoints>,
+) {
+    let Some(mut plan) = held_index_plan(db, processor, rows).await else { return };
+    let selection = std::mem::take(&mut plan.selection);
+    let budget_mb = selection.byte_budget / (1024 * 1024);
+    let report = ssp_node::index_memory::prebuild(processor, selection, plan.time).await;
+    log_index_prebuild(&plan, budget_mb, &report, "before_ready");
+}
+
+/// Any SSP that is not a blue/green standby (a restart without a successor
+/// handover, standalone mode) goes Ready first and rebuilds the indexes the
+/// SSPs before it held here, in the background, so no restart waits for it:
+/// the database read included, and each index a short step at a time
+/// ([`ssp_node::index_memory::prebuild_in_background`]), so ingest and
+/// registrations keep flowing. A registration that needs an index this is
+/// building finishes the same part-built index instead of starting another.
+/// One at a time (a re-bootstrap's replaces the last one); stops when the
+/// SSP stops serving or on shutdown ([`Self::stop`]).
+struct BackgroundPrebuild {
+    /// How long one step holds the circuit.
+    step: std::time::Duration,
+    current: std::sync::Mutex<Option<RunningPrebuild>>,
+}
+
+impl Default for BackgroundPrebuild {
+    fn default() -> Self {
+        Self { step: ssp_node::index_memory::BACKGROUND_STEP, current: Default::default() }
+    }
+}
+
+struct RunningPrebuild {
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl BackgroundPrebuild {
+    fn start(
+        &self,
+        db: Arc<dyn ssp_node::ports::Db>,
+        processor: Arc<RwLock<Circuit>>,
+        status: Arc<RwLock<SspStatus>>,
+        rows: Option<Arc<warm::RowCheckpoints>>,
+    ) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let step = self.step;
+        let task = tokio::spawn({
+            let stop = Arc::clone(&stop);
+            async move {
+                // A contended status lock reads as "still serving".
+                let should_stop = || {
+                    stop.load(Ordering::SeqCst) || status.try_read().is_ok_and(|s| *s != SspStatus::Ready)
+                };
+                let Some(mut plan) = held_index_plan(db.as_ref(), &processor, rows.as_deref()).await else { return };
+                let selection = std::mem::take(&mut plan.selection);
+                let budget_mb = selection.byte_budget / (1024 * 1024);
+                let report = ssp_node::index_memory::prebuild_in_background(
+                    &processor,
+                    selection,
+                    plan.time,
+                    step,
+                    should_stop,
+                )
+                .await;
+                log_index_prebuild(&plan, budget_mb, &report, "background");
+            }
+        });
+        let previous = self
+            .current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(RunningPrebuild { stop, task });
+        if let Some(previous) = previous {
+            previous.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Stop the running prebuild and wait for it to let go of the circuit.
+    /// A step is short; only the database read can hang, and that is
+    /// abandoned after two seconds.
+    async fn stop(&self) {
+        let running = self.current.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let Some(RunningPrebuild { stop, mut task }) = running else { return };
+        stop.store(true, Ordering::SeqCst);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task).await.is_err() {
+            task.abort();
         }
     }
 }
@@ -2268,6 +2394,174 @@ fn routed_path(uri: &axum::http::Uri) -> String {
             format!("{}?{}", uri.path(), q)
         }
         _ => uri.path().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod background_prebuild_tests {
+    use super::*;
+    use ssp::circuit::index::IndexDef;
+    use ssp::circuit::TableMeta;
+    use ssp_node::ports::{Db, DbError};
+    use std::time::{Duration, Instant};
+
+    /// Answers the record read with `records`, or never answers.
+    struct FakeDb(Option<Value>);
+
+    #[async_trait::async_trait]
+    impl Db for FakeDb {
+        async fn query(&self, _: &str, _: &[(&str, Value)]) -> Result<Vec<Value>, DbError> {
+            match &self.0 {
+                Some(records) => Ok(vec![records.clone()]),
+                None => std::future::pending().await,
+            }
+        }
+        async fn version(&self) -> Result<String, DbError> {
+            Ok("test".into())
+        }
+    }
+
+    const ROWS: usize = 20_000;
+
+    fn circuit() -> Arc<RwLock<Circuit>> {
+        let mut c = Circuit::new();
+        c.set_table_meta("game", TableMeta {
+            permission: "true".into(),
+            indexes: vec![IndexDef { name: "game_n".into(), fields: vec!["n".into()] }],
+            ..Default::default()
+        });
+        for i in 0..ROWS {
+            c.load([Record::new("game", &format!("g{i:06}"), json!({ "n": i % 97 }))]);
+        }
+        Arc::new(RwLock::new(c))
+    }
+
+    fn records() -> FakeDb {
+        FakeDb(Some(json!([{
+            "format": 1, "ssp_id": "ssp-0", "at_ms": ssp_node::now_epoch_ms(),
+            "indexes": [{ "table": "game", "name": "game_n", "fields": ["n"], "idle_ms": 0, "rows": ROWS, "bytes": 1000 }],
+        }])))
+    }
+
+    fn rows_held(processor: &RwLock<Circuit>) -> usize {
+        processor.try_read().map(|c| c.held_indexes().first().map_or(0, |i| i.rows)).unwrap_or(0)
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let started = Instant::now();
+        while !done() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The SSP goes Ready, then starts the prebuild: starting it waits for
+    /// neither the database nor a build, even when the database never answers.
+    #[tokio::test]
+    async fn starting_it_waits_for_neither_the_database_nor_a_build() {
+        let processor = circuit();
+        let status = Arc::new(RwLock::new(SspStatus::Ready));
+        let background = BackgroundPrebuild::default();
+        let started = Instant::now();
+        background.start(Arc::new(FakeDb(None)), Arc::clone(&processor), Arc::clone(&status), None);
+        assert!(started.elapsed() < Duration::from_millis(50), "{:?}", started.elapsed());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(rows_held(&processor), 0, "still waiting on the database");
+        // Shutdown: the hung read is abandoned after its two seconds.
+        let started = Instant::now();
+        background.stop().await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(background.current.lock().unwrap().is_none());
+    }
+
+    /// Ready first, the index right after, while the circuit stays free for
+    /// writes: every step lets a waiting writer in.
+    #[tokio::test]
+    async fn it_builds_after_ready_and_lets_writes_in_between_steps() {
+        let processor = circuit();
+        let status = Arc::new(RwLock::new(SspStatus::Ready));
+        let background = BackgroundPrebuild::default();
+        background.start(Arc::new(records()), Arc::clone(&processor), Arc::clone(&status), None);
+        assert_eq!(rows_held(&processor), 0, "nothing built before the caller moves on");
+        let mut writes = 0;
+        while rows_held(&processor) < ROWS {
+            // An ingest: needs the write lock the prebuild must not hold on to.
+            let write = processor.write();
+            let mut circuit = tokio::time::timeout(Duration::from_secs(1), write).await.expect("a write got in");
+            circuit.load([Record::new("game", &format!("w{writes}"), json!({ "n": 1 }))]);
+            writes += 1;
+            drop(circuit);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        background.stop().await;
+        let held = processor.read().await.held_indexes();
+        assert_eq!(held[0].rows, ROWS + writes, "every write reached the part-built index");
+    }
+
+    /// Shutdown (or anything that takes the SSP out of Ready) stops it
+    /// between two steps; the part-built index is left for its next reader.
+    #[tokio::test]
+    async fn it_stops_when_the_ssp_stops_serving() {
+        let processor = circuit();
+        let status = Arc::new(RwLock::new(SspStatus::Ready));
+        // 512-row steps: 40 of them for this table.
+        let background = BackgroundPrebuild { step: Duration::ZERO, ..Default::default() };
+        background.start(Arc::new(records()), Arc::clone(&processor), Arc::clone(&status), None);
+        // Take the circuit between two steps (the write lock queues the
+        // prebuild's next read behind it) and leave Ready there. From a
+        // spawned task: the test body itself is only polled every ~60 polls
+        // of the queued tasks, a spawned one takes turns with the prebuild.
+        let gate = tokio::spawn({
+            let (processor, status) = (Arc::clone(&processor), Arc::clone(&status));
+            async move {
+                loop {
+                    // Requeue behind the prebuild (tokio's `yield_now` defers
+                    // the wake until the driver runs).
+                    let mut yielded = false;
+                    std::future::poll_fn(|cx| {
+                        if yielded {
+                            return std::task::Poll::Ready(());
+                        }
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    })
+                    .await;
+                    let circuit = processor.write().await;
+                    if circuit.held_indexes().first().is_some_and(|i| i.rows > 0) {
+                        *status.write().await = SspStatus::Stopping;
+                        return;
+                    }
+                }
+            }
+        });
+        gate.await.unwrap();
+        let task = background.current.lock().unwrap().take().unwrap().task;
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("stopped on its own").unwrap();
+        let held = rows_held(&processor);
+        assert!(held > 0 && held < ROWS, "stopped part way: {held}");
+    }
+
+    /// No record in the database: the warm restart's `indexes.json` follows
+    /// the same rule, built after Ready in the background.
+    #[tokio::test]
+    async fn the_local_file_is_built_in_the_background_too() {
+        let dir = std::env::temp_dir().join(format!("ssp-bg-prebuild-{}-{}", std::process::id(), ssp_node::now_epoch_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("indexes.json"), r#"{"game":["game_n","gone"]}"#).unwrap();
+        let rows = Arc::new(warm::RowCheckpoints::at(
+            dir.clone(),
+            ssp::circuit::checkpoint::BodyVerify::AtLoad,
+            ssp::circuit::arena::ArenaBacking::Heap,
+        ));
+        let processor = circuit();
+        let status = Arc::new(RwLock::new(SspStatus::Ready));
+        let background = BackgroundPrebuild::default();
+        background.start(Arc::new(FakeDb(Some(json!([])))), Arc::clone(&processor), status, Some(rows));
+        assert_eq!(rows_held(&processor), 0);
+        until("the local index", || rows_held(&processor) == ROWS).await;
+        background.stop().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

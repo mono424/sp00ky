@@ -7,8 +7,7 @@ import * as R from '../state/reducers';
 import { needed, overlay, vouched } from '../state/selectors';
 import { isAnswered } from '../state/lifecycle';
 import type { Overlay } from '../state/selectors';
-import { isWindowed, materializeEffect, rowKey, rowsEqual, rowsFromResult } from './materialize';
-import { buildRenderIds, paintsCold, resolveMembership } from './render-set';
+import { materializeEffect, renderRead, rowsEqual, rowsFromResult } from './materialize';
 
 const NONE: ReadonlySet<string> = new Set();
 
@@ -29,32 +28,13 @@ export function* materialize(hash: QueryHash): Saga<void> {
   })) as [QueryEntry | undefined, Overlay, ReadonlySet<string>, boolean];
   if (!entry) return;
   const t0 = (yield fx.now()) as number;
-  const isWindow = isWindowed(entry.def.surql);
-  const paints = (id: string | null) => id === null || paintsCold(id, known, ov);
-  const coldWindow = entry.lifecycle.phase === 'cold' && isWindow;
-  const membership = resolveMembership({
-    phase: entry.lifecycle.phase,
-    remoteArray: entry.remoteArray,
-    localArray: coldWindow ? entry.localArray.filter(([id]) => paints(id)) : entry.localArray,
-    isWindow,
-  });
-  const ids = membership
-    ? buildRenderIds(membership, entry.localArray, ov, {
-        hasExplicitOrder: (entry.def.plan?.orderBy?.length ?? 0) > 0,
-        isWindow,
-      })
-    : null;
-  const effect = materializeEffect(entry.def, ids);
+  const read = renderRead(entry, ov, known);
+  // Named by the view key, which a reload keeps: the store may keep this
+  // read's answer for the next page load to paint from (see `registerLocal`).
+  const effect = materializeEffect(entry.def, read.ids, entry.def.viewKey);
   let rows: Record<string, unknown>[];
   try {
-    rows = rowsFromResult(effect, yield effect);
-    // A peer's delete leaves the row in the store until it is confirmed, so
-    // the predicate scan must drop it here (an own delete removed it already).
-    if (ids === null)
-      rows = rows.filter((row) => {
-        const key = rowKey(row);
-        return paints(key) && !(key !== null && ov.deletes.has(key));
-      });
+    rows = read.shows(rowsFromResult(effect, yield effect));
   } catch (error) {
     yield fx.state.update(R.compose(R.recordError(hash), R.clearDirty(hash)));
     yield fx.emit({ type: 'log', level: 'warn', message: 'materialize failed', data: { hash, error } });

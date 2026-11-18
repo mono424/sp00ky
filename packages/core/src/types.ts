@@ -178,6 +178,21 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
      */
     paintCache?: boolean;
     /**
+     * `localEngine: 'rows'` with `sharedTabs` only. Where a follower tab's
+     * reads are answered.
+     *   - `'leader'` (default): by the leader tab's worker, over a port.
+     *   - `'direct'`: by a worker of the follower's own that reads the store's
+     *     file beside the leader. A read then never waits for the leader's
+     *     work (a sync-down in another tab), and crosses no tab boundary.
+     *     Writes still go to the leader. Needs shared OPFS access handles
+     *     (Chrome 121+); elsewhere, and whenever its worker fails, a follower
+     *     reads through the leader as before. The price: nothing but the
+     *     leader's lock stands between two writers of the file, where the
+     *     default has the browser refuse a second one, and each follower
+     *     holds the store's index in memory.
+     */
+    followerReads?: 'leader' | 'direct';
+    /**
      * Deadline (ms) for every LOCAL store operation (a SQLite worker round trip,
      * or a query on the in-process surrealdb engine). Local ops are serialized
      * too, and one that never answered - a worker starved behind a long select,

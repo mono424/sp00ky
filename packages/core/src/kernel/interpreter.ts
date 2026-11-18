@@ -9,7 +9,7 @@ import type { OutEvent, RuntimeEvent } from './events';
 
 /** The five adapters plus the pure ports, as the interpreter sees them. */
 export interface Adapters {
-  local: Pick<LocalStore, 'query' | 'execute' | 'select' | 'getById' | 'upsert' | 'delete'> & { readonly epoch: number };
+  local: Pick<LocalStore, 'query' | 'execute' | 'select' | 'peekSelect' | 'getById' | 'upsert' | 'delete'> & { readonly epoch: number };
   remote: {
     queryResponses(sql: string, vars?: Record<string, unknown>): Promise<StatementResult[]>;
     /**
@@ -63,7 +63,10 @@ export function createInterpreter(adapters: Adapters, host: InterpreterHost): In
       case 'local.query':
         return adapters.local.query(effect.sql, effect.vars, effect.epoch === undefined ? undefined : { epoch: effect.epoch });
       case 'local.select':
-        return adapters.local.select(effect.plan, effect.params);
+        return adapters.local.select(effect.plan, effect.params, effect.paintKey === undefined ? undefined : { paintKey: effect.paintKey });
+      case 'local.peekSelect':
+        // Synchronous in the store, and optional: only an engine that keeps a paint cache has one.
+        return adapters.local.peekSelect?.(effect.plan, effect.params, { paintKey: effect.paintKey }) ?? null;
       case 'local.execute':
         return adapters.local.execute(effect.query, effect.vars, effect.epoch === undefined ? undefined : { epoch: effect.epoch });
       case 'local.getById':

@@ -17,6 +17,7 @@ import { SqliteCacheEngine } from '@core/services/database/sqlite-cache-engine';
 import { RowsCacheEngine } from '@core/services/database/rows-cache-engine';
 import { mergePatch } from '@core/services/database/rows-exec';
 import { surql } from '@core/utils/surql';
+import { RecordId } from 'surrealdb';
 import type { Row } from './data';
 
 export const BUCKET = 'bench';
@@ -36,11 +37,16 @@ export interface Backend {
   get(table: string, id: string): Promise<Row | null>;
   getMany(table: string, ids: string[], fields?: string[]): Promise<Row[]>;
   /**
-   * What `getMany` answered last session, synchronously and without waiting
-   * for `open`: something to paint from until the read itself lands. Only the
-   * row store has one.
+   * The read a query's first render makes in the client: the games of its
+   * render set, by id, as one select the client names after the query.
    */
-  peek?(table: string, ids: string[]): Row[] | null;
+  firstQuery(ids: string[]): Promise<Row[]>;
+  /**
+   * What `firstQuery` answered in the last page load, synchronously and
+   * without waiting for `open`: the rows the client seeds a new query with,
+   * so its first render is not empty. Only the row store keeps them.
+   */
+  peekFirstQuery?(ids: string[]): Row[] | null;
   /** `WHERE field = value ORDER BY orderBy DESC LIMIT limit`. */
   where(table: string, field: string, value: unknown, orderBy: string, limit: number): Promise<Row[]>;
   /** Rows of `table` whose `field` is one of `keys`. */
@@ -65,7 +71,16 @@ const logger = {
   },
 };
 
-type Engine = SqliteCacheEngine;
+type Engine = SqliteCacheEngine & {
+  peekSelect?: (plan: QueryPlan, params: Record<string, unknown>, opts: { paintKey: string }) => Row[] | null;
+};
+type QueryPlan = Parameters<SqliteCacheEngine['select']>[0];
+
+/** The name the client gives a query's render read: its view key. */
+const FIRST_QUERY = { paintKey: 'bench:first-screen' };
+/** A query's rows by id, as `materialize` asks for them. */
+const firstPlan = (ids: string[]): QueryPlan => ({ table: 'game', ids: ids.map((id) => new RecordId('game', id.slice(id.indexOf(':') + 1))) });
+
 
 /** Sealed `tx([upsertMerge × n])`, cached per batch size: the text only depends on n. */
 const bulkStatements = new Map<number, ReturnType<typeof surql.seal>>();
@@ -79,6 +94,17 @@ function bulkStatement(n: number): ReturnType<typeof surql.seal> {
     bulkStatements.set(n, sealed);
   }
   return sealed;
+}
+
+/** One sync-down batch into an engine: the transaction the client's sync layer sends. */
+export async function engineBulk(engine: SqliteCacheEngine, rows: Row[]): Promise<void> {
+  const vars: Record<string, unknown> = {};
+  for (let i = 0; i < rows.length; i++) {
+    const { id, ...data } = rows[i];
+    vars[`i${i}`] = id;
+    vars[`d${i}`] = data;
+  }
+  await engine.execute(bulkStatement(rows.length), vars);
 }
 
 const createNote = surql.seal(
@@ -161,8 +187,12 @@ class EngineBackend implements Backend {
     return this.e.selectByIds(table, ids, fields ? { select: fields } : undefined);
   }
 
-  peek(table: string, ids: string[]): Row[] | null {
-    return (this.engine as { peekByIds?: (table: string, ids: string[]) => Row[] | null } | null)?.peekByIds?.(table, ids) ?? null;
+  firstQuery(ids: string[]): Promise<Row[]> {
+    return this.e.select(firstPlan(ids), {}, FIRST_QUERY);
+  }
+
+  peekFirstQuery(ids: string[]): Row[] | null {
+    return this.engine?.peekSelect?.(firstPlan(ids), {}, FIRST_QUERY) ?? null;
   }
 
   where(table: string, field: string, value: unknown, orderBy: string, limit: number): Promise<Row[]> {
@@ -322,6 +352,10 @@ class IdbBackend implements Backend {
     return (req.result as Row | undefined) ?? null;
   }
 
+  firstQuery(ids: string[]): Promise<Row[]> {
+    return this.getMany('game', ids);
+  }
+
   async getMany(table: string, ids: string[], fields?: string[]): Promise<Row[]> {
     const tx = this.d.transaction(table, 'readonly');
     const store = tx.objectStore(table);
@@ -391,6 +425,10 @@ class IdbBackend implements Backend {
     return estimate.usageDetails?.indexedDB ?? null;
   }
 }
+
+/** A row store engine in a shared-tabs role, for the two-tab test (`tabs.ts`). */
+export const sharedRowsEngine = (followerReads: 'leader' | 'direct'): RowsCacheEngine =>
+  new RowsCacheEngine({ store: 'indexeddb', followerReads } as never, logger as never, { useOpfs: true, shared: true });
 
 export const BACKENDS: Record<string, () => Backend> = {
   indexeddb: () => new IdbBackend(),

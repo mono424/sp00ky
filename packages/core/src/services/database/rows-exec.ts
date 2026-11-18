@@ -269,8 +269,27 @@ export class RowsExec {
   /** Relation fetches of the request in flight, for the engine's stats. */
   private relationFetches = 0;
 
-  constructor(private store: RowStore) {
-    const saved = store.get(META_TABLE, INDEXES_ROW);
+  /** Where the registry row read last lies in the file; tells a reader when the writer has changed it. */
+  private registryAt = -1;
+
+  /**
+   * `readOnly` is for a store opened as a reader (a follower tab on the
+   * leader's file): it uses the indexes the writer keeps and builds none.
+   */
+  constructor(
+    private store: RowStore,
+    private readOnly = false
+  ) {
+    this.syncRegistry();
+  }
+
+  /** Read the index registry, again when the store's writer has rewritten it. */
+  syncRegistry(): void {
+    const at = this.store.find(META_TABLE, INDEXES_ROW)?.off ?? -1;
+    if (at === this.registryAt) return;
+    this.registryAt = at;
+    this.indexes.clear();
+    const saved = at < 0 ? null : this.store.get(META_TABLE, INDEXES_ROW);
     if (!saved) return;
     try {
       const parsed = JSON.parse(decoder.decode(saved.body)) as Record<string, Record<string, boolean>>;
@@ -434,6 +453,8 @@ export class RowsExec {
     const known = this.indexes.get(table)?.get(field);
     if (known === true) return true;
     if (known === false && !force) return false;
+    // A reader has what the writer built and scans for the rest.
+    if (this.readOnly) return false;
     const index = indexTable(table, field);
     const puts: StoreOp[] = [];
     const distinct = new Set<string>();
@@ -904,6 +925,47 @@ const withBytes = (rows: { buf: ArrayBuffer | null; u8: boolean }, extra: Record
  * can run the same code in-process. Returns `null` for a message it does not
  * know.
  */
+/** The ops a reader store answers: the ones that leave the store as it was. */
+export const ROWS_READER_OPS: ReadonlySet<string> = new Set([
+  'select',
+  'by-ids',
+  'get',
+  'relation',
+  'select-table',
+  'count',
+  'versions',
+  'tables',
+  'blob-get',
+]);
+
+const READER_ATTEMPTS = 4;
+
+/**
+ * {@link handleRowsOp} on a store opened as a reader, beside its writer. The
+ * reader takes in what was appended, answers, and then checks that the file
+ * it read is still the live one (`RowStore.current`): a compaction that
+ * emptied it meanwhile means the answer was read from bytes that are gone,
+ * and it is read again from the file the rows moved to.
+ */
+// oxlint-disable-next-line typescript/no-explicit-any
+export async function handleReaderOp(exec: RowsExec, store: RowStore, type: string, payload: any): Promise<RowsReply | null> {
+  if (!ROWS_READER_OPS.has(type)) throw new Error(`rows reader: op ${type} is not a read`);
+  for (let attempt = 1; ; attempt++) {
+    store.refresh();
+    exec.syncRegistry();
+    try {
+      // oxlint-disable-next-line no-await-in-loop
+      const reply = await handleRowsOp(exec, store, type, payload);
+      if (store.current()) return reply;
+    } catch (error) {
+      // Rows read from an emptied file do not parse. Only when the file is
+      // still live is the failure the read's own.
+      if (store.current()) throw error;
+    }
+    if (attempt === READER_ATTEMPTS) throw new Error('rows reader: the store kept moving under the read');
+  }
+}
+
 // oxlint-disable-next-line typescript/no-explicit-any
 export async function handleRowsOp(exec: RowsExec, store: RowStore, type: string, payload: any): Promise<RowsReply | null> {
   switch (type) {

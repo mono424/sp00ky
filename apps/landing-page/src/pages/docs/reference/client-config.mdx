@@ -126,15 +126,44 @@ Whatever is left of them is dropped the moment the tab writes, and nothing is re
 The browser only starts a worker when the page's main thread is free, so this helps while the
 bundle is on the network or being compiled, and not while a long script runs.
 
+The published worker (`@spooky-sync/core/rows-worker`) starts with the line
+`//# allFunctionsCalledOnLoad`, a V8 compile hint (Chrome 136+): the browser compiles the whole
+file while it loads, off the worker's thread, where it would otherwise compile each function the
+first time it runs. That takes about a millisecond off the worker's first `open`. A bundler that
+minifies the worker drops the comment. To keep it in a Vite build, put it back on the worker's
+chunk:
+
+<CodeBlock code={compileHintCode} lang="typescript" fileName="vite.config.ts" />
+
 #### `database.paintCache`
 
-`localEngine: 'rows'` only, default `true` for a durable store. The engine keeps a copy of the rows
-the app reads in its first seconds (up to about 1 MB, in localStorage), and
-`peekSelect(plan, params)` / `peekByIds(table, ids)` on the engine hand that copy back
-synchronously, before the store is open: something to paint from in a fraction of a millisecond.
-The copy is dropped the moment this tab writes to a table it came from and taken again from the
-next read of the same thing. It is still a copy: run the real read after a peek, and render that
-when it differs. Set `false` to keep nothing in localStorage.
+`localEngine: 'rows'` only, default `true` for a durable store. The engine keeps a copy of what
+each query rendered in the app's first seconds (up to about 1 MB, in localStorage). On the next
+page load a query is born holding those rows: the first value `useQuery` hands a component is the
+list it showed last time, not an empty one, and the component renders once where it used to render
+twice. The read that follows is the answer, as always, and replaces the rows when the store says
+otherwise; until then the query reports itself unanswered, as any query still loading does.
+
+A copy is dropped the moment this tab writes to a table it came from and taken again from the
+query's next render, so it holds what the query last showed. Not used with `sharedTabs`. Set
+`false` to keep nothing in localStorage.
+
+#### `database.followerReads`
+
+`localEngine: 'rows'` with `sharedTabs` only. `'leader'` (default) or `'direct'`.
+
+With `sharedTabs` one tab holds the store and every other tab (a follower) reads and writes
+through a port into that tab's worker. A follower's read then waits behind whatever the leader's
+worker is doing, a sync-down in the other tab included. `'direct'` gives each follower a worker of
+its own that reads the store's file beside the leader: its reads cross no tab boundary and wait
+for nobody. Writes still go to the leader, and a follower sees every write (its own, the leader's,
+another follower's) in the read after it.
+
+The price is in what the browser no longer checks. By default the leader's file handle is
+exclusive, so a second writer cannot even open the file; shared handles (Chrome 121+,
+`readwrite-unsafe`) leave the leader's Web Lock as the only thing between two writers. Each
+follower also keeps the store's index in its own memory. Where shared handles are missing (Safari,
+Firefox for now), or a follower's reader fails, that follower reads through the leader as before.
 
 `sharedTabs: true` (one durable store for all tabs of the origin) works with `'sqlite'` and `'rows'`.
 
@@ -325,8 +354,10 @@ export const code2 = `interface SyncedDbConfig<Schema> {
       rows?: () => Worker;
     };
 
-    /** Rows engine: keep startup reads in localStorage for synchronous peeks (default: true) */
+    /** Rows engine: keep what queries rendered at startup, to render it at once on the next load (default: true) */
     paintCache?: boolean;
+    /** Rows engine + sharedTabs: where a follower tab's reads are answered (default: 'leader') */
+    followerReads?: 'leader' | 'direct';
   };
 
   /** Local cache engine: 'surrealdb' (default), 'sqlite', or 'rows' (experimental) */
@@ -413,6 +444,25 @@ export const viteExcludeCode = `export default defineConfig({
     include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch'],
   },
   build: { target: 'esnext' },
+});`;
+
+export const compileHintCode = `const HINT = '//# allFunctionsCalledOnLoad\\n';
+
+export default defineConfig({
+  worker: {
+    format: 'es',
+    plugins: () => [
+      {
+        name: 'sp00ky-compile-hint',
+        // After minification, so nothing strips it again.
+        generateBundle(_options, bundle) {
+          for (const file of Object.values(bundle)) {
+            if (file.type === 'chunk' && file.fileName.includes('rows-worker')) file.code = HINT + file.code;
+          }
+        },
+      },
+    ],
+  },
 });`;
 
 export const prewarmCode = `import { ROWS_PREWARM_SNIPPET } from '@spooky-sync/core';

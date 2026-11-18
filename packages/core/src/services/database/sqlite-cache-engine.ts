@@ -330,7 +330,7 @@ export class SqliteCacheEngine implements LocalStore {
     }
   }
 
-  private rawCall<T = any>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T> {
+  protected rawCall<T = any>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T> {
     if (!this.transport) throw new Error('SqliteCacheEngine: not connected');
     // --- instrumentation: live, inspectable via `globalThis.__sqliteStats` ---
     const s = getStats();
@@ -763,7 +763,8 @@ export class SqliteCacheEngine implements LocalStore {
 
   // ---- reads ---------------------------------------------------------------
 
-  async select(plan: QueryPlan, params: Record<string, unknown> = {}): Promise<Row[]> {
+  // `_opts.paintKey` names the read for a store that keeps answers to paint from; this one keeps none.
+  async select(plan: QueryPlan, params: Record<string, unknown> = {}, _opts?: { paintKey?: string }): Promise<Row[]> {
     if (this.workerSelect) {
       // ONE round-trip: the worker executes the whole plan (table creation,
       // base select, relation tree, JSON parse) and returns structured-clone

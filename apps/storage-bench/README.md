@@ -20,9 +20,19 @@ pnpm --filter @spooky-sync/storage-bench build
 pnpm --filter @spooky-sync/storage-bench preview   # http://localhost:4410
 ```
 
-Press **Run**. The page reloads itself through the steps (about 120 page loads, five minutes) and ends on a table;
-the JSON below it is the same numbers. Use the production build: against the dev server the cold
-opens measure Vite, not the stores.
+Press **Run**. The page reloads itself through the steps (about 120 page loads, six minutes) and
+ends on charts: every scenario is a row of bars, one per backend, with the median beside it and a
+tick at the p95. Hover a bar for the detail; the same numbers are below as a table and as JSON. Use
+the production build: against the dev server the fresh-page numbers measure Vite, not the stores.
+
+**Comparing runs.** Every finished run is kept (the last eight, in localStorage). Give a run a name
+before pressing Run, change the code, rebuild, run again, and pick the earlier run under *compare
+with*: each bar then shows how far it moved (a green arrow down is faster).
+
+**Shared-tabs test.** A second button, because it needs a second tab: it opens one that leads (it
+holds the store and, on request, keeps writing sync-down batches) and follows it from this tab
+twice, once reading through the leader and once with `followerReads: 'direct'`. Allow the popup,
+or open `/?leader=1` yourself in another tab first.
 
 ## What is measured
 
@@ -52,8 +62,14 @@ The page head starts what can be started ahead of the app: the row store's worke
 `ROWS_PREWARM_SNIPPET`, added by `vite.config.ts`), which opens the store and reads ahead what the
 last load read first, and the IndexedDB connection.
 
-A last table compares JSON text against CBOR (the SurrealDB SDK's codec) as the stored form of a
-row.
+The fresh-page read is the one a query's first render makes in the client: the rows of its render
+set, by id, as one `select` the client names after the query. The row store seeds a new query with
+what that read answered in the last page load (its paint cache), which is the "first rows on
+screen" line.
+
+Two more sections follow the three-way comparison: the row store's worker started with and without
+the V8 compile hint (`vite.config.ts` writes a copy of the worker without it), and JSON text
+against CBOR (the SurrealDB SDK's codec) as the stored form of a row.
 
 ## Reading the numbers
 

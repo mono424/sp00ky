@@ -14,7 +14,7 @@ import {
 } from './sqlite-cache-engine';
 import { WorkerSqliteTransport, type SqliteTransport } from './sqlite-transport';
 import { tableOf, type SqlOp } from './surql-translate';
-import { ROWS_PROTOCOL, parseRowBytes, type WireOp } from './rows-exec';
+import { ROWS_PROTOCOL, ROWS_READER_OPS, parseRowBytes, type WireOp } from './rows-exec';
 import { FLAG_RAW, FLAG_U8, bucketDirName, type StoreStats } from './rows-store';
 import {
   ROWS_AHEAD_OPS,
@@ -55,6 +55,8 @@ const AHEAD_MAX_TOTAL_BYTES = 2 << 20;
 const AHEAD_MAX_REQUEST_CHARS = 32_000;
 /** How long a read waits for an answer that was asked ahead before asking again itself. */
 const AHEAD_WAIT_MS = 250;
+/** How long a follower's own reader may take over one read before the leader is asked instead. */
+const READER_OP_TIMEOUT_MS = 2000;
 
 /** A timer nothing should wait for (a Node process, a test run). */
 function background<T>(timer: T): T {
@@ -429,7 +431,11 @@ export class RowsCacheEngine extends SqliteCacheEngine {
         // The prewarm's work stands only for the first open, of the store it
         // was started on, with nothing more asked of the worker (under a
         // role's lock other tabs write through this worker too).
-        const asked = payload as { dbName: string; useOpfs: boolean; workerLockName?: string };
+        const asked = payload as { dbName: string; useOpfs: boolean; workerLockName?: string; share?: boolean };
+        // A leader whose followers read the file themselves opens it for sharing.
+        if (asked.workerLockName && asked.useOpfs && this.config.followerReads === 'direct') {
+          asked.share = true;
+        }
         const mine = ahead !== null && opens++ === 0 && asked.useOpfs && asked.dbName === pre!.bucket && !asked.workerLockName;
         const answered = pre?.opened as (OpenReply & { ok?: boolean }) | undefined;
         if (pre) pre.opened = undefined;
@@ -504,6 +510,7 @@ export class RowsCacheEngine extends SqliteCacheEngine {
   }
 
   override async switchBucket(bucketId: string): Promise<void> {
+    this.dropReader('bucket switch');
     await super.switchBucket(bucketId);
     this.paint?.start(bucketId);
     this.beginStartupReads();
@@ -516,7 +523,102 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     onPortDead: (reason: string) => void
   ): Promise<void> {
     takePrewarmed()?.worker.terminate();
-    return super.adoptAttached(dbPort, snapshot, onPortDead);
+    this.dropReader('attaching to a leader');
+    await super.adoptAttached(dbPort, snapshot, onPortDead);
+    if (this.config.followerReads === 'direct' && this.useOpfs && snapshot.storageHealth.status === 'persistent') {
+      await this.startReader(snapshot.bucketId);
+    }
+  }
+
+  // ---- a follower's own reader ------------------------------------------------
+  // With `followerReads: 'direct'` a follower answers its reads from a worker
+  // of its own, on a reader of the store's file (`RowStore` reader mode). The
+  // reader is an optimization and nothing depends on it: when it cannot be
+  // had, or fails, the read goes to the leader as it would have.
+
+  /** The follower's reader worker, while this engine follows and has one. */
+  private reader: SqliteTransport | null = null;
+
+  private async startReader(bucketId: string): Promise<void> {
+    let transport: SqliteTransport | null = null;
+    // Every change of role bumps the epoch: the same epoch later means still this follower.
+    const asFollower = this.epoch;
+    try {
+      transport = new WorkerSqliteTransport(
+        this.logger,
+        this.config.workers?.rows ?? (() => new Worker(new URL('./rows-worker.ts', import.meta.url), { type: 'module' }))
+      );
+      const reply = await transport.call<OpenReply>('open', {
+        dbName: bucketId,
+        useOpfs: true,
+        reader: true,
+        openOptions: { maxAttempts: 2, disallowMemoryFallback: true },
+      });
+      if (reply.proto !== ROWS_PROTOCOL || !reply.persisted) throw new Error('reader worker is not this release\'s');
+      // The role may have moved on while the worker started.
+      if (this.epoch !== asFollower || this.bucketId !== bucketId) throw new Error('no longer a follower of this store');
+      this.reader = transport;
+    } catch (error) {
+      transport?.close('reader unavailable');
+      this.logger.info(
+        { error: String(error), Category: 'sp00ky-client::RowsCacheEngine::reader' },
+        'No direct reads for this follower tab; it reads through the leader'
+      );
+    }
+  }
+
+  private dropReader(reason: string): void {
+    const reader = this.reader;
+    this.reader = null;
+    reader?.close(reason);
+  }
+
+  /** True while this follower answers its reads from the store's file itself. */
+  get readsDirectly(): boolean {
+    return this.reader !== null;
+  }
+
+  protected override rawCall<T = unknown>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T> {
+    const reader = this.reader;
+    if (!reader || !ROWS_READER_OPS.has(type)) return super.rawCall<T>(type, payload, transfer);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('reader timed out')), READER_OP_TIMEOUT_MS);
+    });
+    return Promise.race([reader.call<T>(type, payload), late])
+      .catch((error: unknown) => {
+        if (this.reader === reader) {
+          this.dropReader('read failed');
+          this.logger.warn(
+            { error: String(error), type, Category: 'sp00ky-client::RowsCacheEngine::reader' },
+            'Direct read failed; this tab reads through the leader from here on'
+          );
+        }
+        return super.rawCall<T>(type, payload, transfer);
+      })
+      .finally(() => clearTimeout(timer));
+  }
+
+  override async adoptOwner(...args: Parameters<SqliteCacheEngine['adoptOwner']>): ReturnType<SqliteCacheEngine['adoptOwner']> {
+    this.dropReader('becoming the leader');
+    return super.adoptOwner(...args);
+  }
+
+  override async releaseOwnership(): Promise<void> {
+    this.dropReader('releasing the store');
+    return super.releaseOwnership();
+  }
+
+  override onLeaderLost(reason: string): void {
+    // The file is still there and still whole, but writes have nowhere to go:
+    // read through the next leader, with a reader started against it.
+    this.dropReader('leader lost');
+    super.onLeaderLost(reason);
+  }
+
+  override async close(): Promise<void> {
+    this.dropReader('engine closed');
+    return super.close();
   }
 
   /** Tables need no creating: a table is the rows written to it. */
@@ -593,9 +695,19 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     return { plan: normalizePlanForClone(plan), params: normParams };
   }
 
-  override async select(plan: QueryPlan, params: Record<string, unknown> = {}): Promise<Row[]> {
+  /**
+   * The paint cache's name for a select. A caller that reads the same thing
+   * again and again under changing arguments (a query whose id set moves)
+   * names it itself with `paintKey`, so the copy kept is always its latest
+   * answer; without one a read is told apart by its plan and parameters.
+   */
+  private selectKey(payload: unknown, opts?: { paintKey?: string }): string {
+    return opts?.paintKey === undefined ? hashKey('s' + JSON.stringify(payload)) : hashKey('q' + opts.paintKey);
+  }
+
+  override async select(plan: QueryPlan, params: Record<string, unknown> = {}, opts?: { paintKey?: string }): Promise<Row[]> {
     const payload = this.selectPayload(plan, params);
-    return this.rows('select', payload, this.paint ? { key: hashKey('s' + JSON.stringify(payload)), tables: tablesOf(plan) } : undefined);
+    return this.rows('select', payload, this.paint ? { key: this.selectKey(payload, opts), tables: tablesOf(plan) } : undefined);
   }
 
   /**
@@ -605,8 +717,11 @@ export class RowsCacheEngine extends SqliteCacheEngine {
    * real `select`, which is the answer; they differ only when something wrote
    * to these tables that this tab did not see.
    */
-  peekSelect(plan: QueryPlan, params: Record<string, unknown> = {}): Row[] | null {
-    return this.paint?.get(hashKey('s' + JSON.stringify(this.selectPayload(plan, params))), fromBase64) ?? null;
+  peekSelect(plan: QueryPlan, params: Record<string, unknown> = {}, opts?: { paintKey?: string }): Row[] | null {
+    if (!this.paint) return null;
+    // A named read needs no payload to find its copy.
+    const payload = opts?.paintKey === undefined ? this.selectPayload(plan, params) : null;
+    return this.paint.get(this.selectKey(payload, opts), fromBase64);
   }
 
   /** {@link peekSelect} for `selectByIds`. */

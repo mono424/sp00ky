@@ -438,6 +438,8 @@ function writeSuperblock(file: SyncFile, sb: Superblock): void {
   file.write(buf, (sb.seq % 2) * SB_SIZE);
 }
 
+const EMPTY_SUPERBLOCK: Superblock = { seq: 0, state: ACTIVE, dirOff: 0, dirLen: 0, dirSum: 0, covered: HEADER_END, gen: 0 };
+
 /** An index block whose bytes are not the ones a checkpoint wrote. */
 class IndexMismatch extends Error {
   constructor(table: string) {
@@ -456,6 +458,14 @@ export class RowStore {
   private needsFlush = false;
   private rebuilt = false;
   private closed = false;
+  /**
+   * A reader: a second view of a store another `RowStore` is writing through
+   * handles of its own (a follower tab reading the leader's file). It never
+   * writes a byte. See {@link refresh}.
+   */
+  private reader = false;
+  /** Generation of the superblock a reader's index came from; `null` when it found none. */
+  private readGen: number | null = null;
 
   private constructor(
     private io: StoreIo,
@@ -469,7 +479,15 @@ export class RowStore {
 
   // ---- open ----------------------------------------------------------------
 
-  static async open(io: StoreIo): Promise<RowStore> {
+  static async open(io: StoreIo, opts: { reader?: boolean } = {}): Promise<RowStore> {
+    if (opts.reader) {
+      // Both files, for good: which of them is live changes under a reader,
+      // and it finds out in the middle of a synchronous read.
+      const store = new RowStore(io, await io.open('a'), 'a', await io.open('b'), EMPTY_SUPERBLOCK, HEADER_END);
+      store.reader = true;
+      store.reload();
+      return store;
+    }
     const a = await io.open('a');
     let file = a;
     let name: 'a' | 'b' = 'a';
@@ -502,7 +520,7 @@ export class RowStore {
       file,
       name,
       other,
-      sb ?? { seq: 0, state: ACTIVE, dirOff: 0, dirLen: 0, dirSum: 0, covered: HEADER_END, gen: 0 },
+      sb ?? EMPTY_SUPERBLOCK,
       HEADER_END
     );
     if (fresh || !store.loadDirectory()) store.resetIndex();
@@ -590,7 +608,67 @@ export class RowStore {
       pos = align8(pos + XH + len);
     }
     this.end = pos;
-    if (size > this.end) this.file.truncate(this.end);
+    // What follows the last whole batch is a write that died halfway, for the
+    // writer. For a reader it is one still being made: leave it, look again later.
+    if (!this.reader && size > this.end) this.file.truncate(this.end);
+  }
+
+  // ---- reading beside a writer ----------------------------------------------
+  //
+  // The file is a log: a writer only appends to it, so everything a reader has
+  // seen stays where it is, and catching up is replaying what was appended.
+  // Two things do move bytes. A checkpoint rewrites a superblock slot (a
+  // reader carries on: its own index already holds what the new one says).
+  // A compaction copies the live rows to the other file, marks this one MOVED
+  // and then empties it, in that order, so a reader that read from the old
+  // file checks the superblock AFTER its read: still ACTIVE and of the same
+  // generation, and every byte it read was in place ({@link current}).
+
+  /** Take in what the writer did since the last look. A reader calls this before it answers. */
+  refresh(): void {
+    if (!this.reader || this.closed) return;
+    if (!this.current() || this.end > this.file.size()) this.reload();
+    else this.replay(this.end);
+  }
+
+  /** Whether the file this reader reads is still the one being written. Checked after a read, it vouches for it. */
+  current(): boolean {
+    if (!this.reader) return true;
+    const sb = readSuperblock(this.file);
+    if (!sb) return this.readGen === null && this.file.size() <= HEADER_END;
+    return sb.state === ACTIVE && sb.gen === this.readGen;
+  }
+
+  /** Start over from whichever file is live now. */
+  private reload(): void {
+    const a = this.name === 'a' ? this.file : this.other!;
+    const b = this.name === 'a' ? this.other! : this.file;
+    const sbA = readSuperblock(a);
+    const sbB = sbA?.state === ACTIVE ? null : readSuperblock(b);
+    let name: 'a' | 'b' = 'a';
+    let sb: Superblock | null = null;
+    if (sbA?.state === ACTIVE) sb = sbA;
+    else if (sbB?.state === ACTIVE) {
+      name = 'b';
+      sb = sbB;
+    } else if (a.size() <= HEADER_END && b.size() > HEADER_END) name = 'b';
+    this.name = name;
+    this.file = name === 'a' ? a : b;
+    this.other = name === 'a' ? b : a;
+    this.sb = sb ?? EMPTY_SUPERBLOCK;
+    this.readGen = sb ? sb.gen : null;
+    this.end = HEADER_END;
+    this.tables.clear();
+    this.byTid.clear();
+    this.nextTid = 1;
+    this.dirBytes = 0;
+    this.tailOps = 0;
+    if (sb === null || !this.loadDirectory()) this.resetIndex();
+    this.replay(this.sb.covered);
+  }
+
+  private mustWrite(): void {
+    if (this.reader) throw new Error('rows: this store only reads');
   }
 
   private applyBatch(buf: Uint8Array, fileOff: number): void {
@@ -668,6 +746,11 @@ export class RowStore {
       return fn();
     } catch (error) {
       if (!(error instanceof IndexMismatch)) throw error;
+      if (this.reader) {
+        // Not damage: the block lay in a file a compaction has emptied since.
+        this.reload();
+        return fn();
+      }
       this.resetIndex();
       this.rebuilt = true;
       this.replay(HEADER_END);
@@ -763,6 +846,7 @@ export class RowStore {
    * power cut) until the next {@link flush}.
    */
   write(ops: StoreOp[], sync = false): void {
+    this.mustWrite();
     if (this.closed) throw new Error('rows: store is closed');
     if (ops.length === 0) return;
     let bound = XH + 8;
@@ -860,7 +944,7 @@ export class RowStore {
   }
 
   flush(): void {
-    if (!this.needsFlush) return;
+    if (!this.needsFlush || this.reader) return;
     this.file.flush();
     this.needsFlush = false;
   }
@@ -882,7 +966,7 @@ export class RowStore {
   }
 
   private checkpointOnce(): boolean {
-    if (this.closed) return false;
+    if (this.closed || this.reader) return false;
     let dirty = this.end > this.sb.covered;
     for (const table of this.tables.values()) dirty = dirty || table.delta.size > 0 || table.unsaved;
     if (!dirty) return false;
@@ -969,6 +1053,7 @@ export class RowStore {
    * leaves the old file as it was, a crash after it finds the new one whole.
    */
   async compact(): Promise<void> {
+    this.mustWrite();
     if (this.closed) throw new Error('rows: store is closed');
     // Load every run up front, so a mismatching block is rebuilt before any byte is copied.
     for (const name of [...this.tables.keys()]) this.ordered(name);

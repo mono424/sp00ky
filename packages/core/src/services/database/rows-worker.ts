@@ -10,7 +10,7 @@
  * lifecycle messages, so the engine's transport, its shared-tabs roles and the
  * leader fencing work unchanged:
  *
- *   { id, type: 'open', payload: { dbName, useOpfs, workerLockName?, openOptions? } }
+ *   { id, type: 'open', payload: { dbName, useOpfs, workerLockName?, openOptions?, share?, reader? } }
  *        -> { id, ok, persisted, opfsError? }
  *   { id, type: 'close' | 'shutdown' | 'relock' | 'add-client' | 'remove-client' | 'diag' }
  *   every other type is a data op, answered by `handleRowsOp` (rows-exec.ts)
@@ -31,6 +31,7 @@ import {
   ROWS_CLIENT_OPS,
   ROWS_PROTOCOL,
   RowsExec,
+  handleReaderOp,
   handleRowsOp,
   maintenance,
   visibleTables,
@@ -88,18 +89,60 @@ class OpfsFile implements SyncFile {
 
 let store: RowStore | null = null;
 let exec: RowsExec | null = null;
+/** The open store is a reader's: it answers reads beside another worker's writes and does no housekeeping. */
+let reading = false;
 /** What the open store was opened as, so a second `open` for the same thing is a no-op. */
-let opened: { dbName: string; useOpfs: boolean; result: { persisted: boolean; opfsError?: string } } | null = null;
+let opened: { dbName: string; useOpfs: boolean; mode: FileMode; result: { persisted: boolean; opfsError?: string } } | null = null;
 /** Handles held for the open store, closed with it. */
 let openFiles: SyncFile[] = [];
 
-async function opfsIo(bucketId: string): Promise<StoreIo> {
+/**
+ * How the store's files are opened.
+ *   `own`    the default: one worker holds them, any other fails to open.
+ *   `share`  a shared-tabs leader that lets followers read the file beside it.
+ *   `reader` such a follower: it only reads (`RowStore` in reader mode).
+ * The last two use `readwrite-unsafe` handles (Chrome 121+), which several
+ * workers can hold on one file. Nothing but the leader's Web Lock then stands
+ * between two writers, which is why sharing is something an app asks for.
+ */
+type FileMode = 'own' | 'share' | 'reader';
+
+/**
+ * Whether this browser opens a second `readwrite-unsafe` handle on a file. One
+ * that does not know the option ignores it and hands out the exclusive handle,
+ * so the only way to know is to try, on a file of no importance.
+ */
+async function canShareFiles(dir: FileSystemDirectoryHandle): Promise<boolean> {
+  const handles: FileSystemSyncAccessHandle[] = [];
+  try {
+    const probe = await dir.getFileHandle('probe', { create: true });
+    // oxlint-disable-next-line typescript/no-explicit-any
+    const open = (): Promise<FileSystemSyncAccessHandle> => (probe as any).createSyncAccessHandle({ mode: 'readwrite-unsafe' });
+    handles.push(await open());
+    handles.push(await open());
+    return true;
+  } catch {
+    return false;
+  } finally {
+    for (const handle of handles) handle.close();
+  }
+}
+
+async function opfsIo(bucketId: string, mode: FileMode = 'own'): Promise<StoreIo> {
   const root = await navigator.storage.getDirectory();
   const dir = await root.getDirectoryHandle(bucketDirName(bucketId), { create: true });
+  let shared = false;
+  if (mode !== 'own') {
+    shared = await canShareFiles(dir);
+    // A leader without the option leads as before; a reader has nothing to read with.
+    if (!shared && mode === 'reader') throw new Error('Missing required OPFS APIs: shared access handles');
+  }
   return {
     open: async (name) => {
-      const access = await (await dir.getFileHandle(name, { create: true })).createSyncAccessHandle();
-      const file = new OpfsFile(access);
+      const handle = await dir.getFileHandle(name, { create: true });
+      // oxlint-disable-next-line typescript/no-explicit-any
+      const access = await (shared ? (handle as any).createSyncAccessHandle({ mode: 'readwrite-unsafe' }) : handle.createSyncAccessHandle());
+      const file = new OpfsFile(access as FileSystemSyncAccessHandle);
       openFiles.push(file);
       return file;
     },
@@ -135,8 +178,10 @@ const errMessage = (e: unknown): string =>
 async function openStore(
   bucketId: string,
   useOpfs: boolean,
-  opts: OpenOptions = {}
+  opts: OpenOptions = {},
+  mode: FileMode = 'own'
 ): Promise<{ persisted: boolean; opfsError?: string }> {
+  reading = false;
   if (!useOpfs) {
     store = await RowStore.open(memoryIo());
     exec = new RowsExec(store);
@@ -150,8 +195,9 @@ async function openStore(
     attempts = attempt;
     try {
       if (!navigator.storage?.getDirectory) throw new Error('Missing required OPFS APIs');
-      store = await RowStore.open(await opfsIo(bucketId));
-      exec = new RowsExec(store);
+      store = await RowStore.open(await opfsIo(bucketId, mode), { reader: mode === 'reader' });
+      exec = new RowsExec(store, mode === 'reader');
+      reading = mode === 'reader';
       return { persisted: true };
     } catch (e) {
       closeFiles();
@@ -160,7 +206,8 @@ async function openStore(
       await new Promise((resolve) => setTimeout(resolve, backoffMs[Math.min(attempt - 1, backoffMs.length - 1)] ?? 0));
     }
   }
-  if (opts.disallowMemoryFallback) throw new Error(`opfs-unavailable: ${lastError} (after ${attempts} attempts)`);
+  // A reader in memory would read nothing of the leader's: it has no fallback.
+  if (opts.disallowMemoryFallback || mode === 'reader') throw new Error(`opfs-unavailable: ${lastError} (after ${attempts} attempts)`);
   // Deliberately console, not a logger: host apps set their own log level, and
   // losing durability must never be filtered into silence.
   // oxlint-disable-next-line no-console
@@ -191,6 +238,7 @@ function closeStore(): void {
   store = null;
   exec = null;
   opened = null;
+  reading = false;
   warmQueue = null;
   closeFiles();
 }
@@ -428,11 +476,13 @@ async function handle(type: string, payload: any, source: 'owner' | 'client'): P
       }
       // The page may have started this worker and its store ahead of itself
       // (`prewarmRows`): the store it asks for is then already open.
-      const same = store !== null && opened !== null && opened.dbName === payload.dbName && opened.useOpfs === payload.useOpfs;
+      const mode: FileMode = payload.reader ? 'reader' : payload.share ? 'share' : 'own';
+      const same =
+        store !== null && opened !== null && opened.dbName === payload.dbName && opened.useOpfs === payload.useOpfs && opened.mode === mode;
       if (!same) {
         closeStore();
-        const result = await openStore(payload.dbName, payload.useOpfs, payload.openOptions);
-        opened = { dbName: payload.dbName, useOpfs: payload.useOpfs, result };
+        const result = await openStore(payload.dbName, payload.useOpfs, payload.openOptions, mode);
+        opened = { dbName: payload.dbName, useOpfs: payload.useOpfs, mode, result };
       }
       return { result: { ...opened!.result, proto: ROWS_PROTOCOL, workerUrl: self.location.href } };
     }
@@ -468,6 +518,7 @@ async function handle(type: string, payload: any, source: 'owner' | 'client'): P
     }
     case 'diag': {
       if (!store) throw new Error('rows: store not open');
+      store.refresh();
       const stats = store.stats();
       const tableCounts = payload?.tableCounts
         ? visibleTables(store).map((table) => ({ table, rows: store!.count(table) }))
@@ -476,6 +527,11 @@ async function handle(type: string, payload: any, source: 'owner' | 'client'): P
     }
     default: {
       if (!store || !exec) throw new Error('rows: store not open');
+      if (reading) {
+        const answer = await handleReaderOp(exec, store, type, payload);
+        if (!answer) throw new Error(`rows worker: unknown message ${type}`);
+        return answer;
+      }
       const reply = await handleRowsOp(exec, store, type, payload);
       if (!reply) throw new Error(`rows worker: unknown message ${type}`);
       afterOp(type === 'write' || type === 'reset-versions' || type === 'blob-put' || type === 'blob-del');

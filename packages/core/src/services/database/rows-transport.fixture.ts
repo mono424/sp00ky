@@ -11,7 +11,7 @@
  */
 import type { SqliteTransport } from './sqlite-transport';
 import { MemoryFile, RowStore } from './rows-store';
-import { ROWS_PROTOCOL, RowsExec, handleRowsOp, visibleTables } from './rows-exec';
+import { ROWS_PROTOCOL, RowsExec, handleReaderOp, handleRowsOp, visibleTables } from './rows-exec';
 
 export type RowsDisks = Map<string, { a: MemoryFile; b: MemoryFile }>;
 
@@ -23,6 +23,8 @@ export interface RowsHost {
   store(): RowStore | null;
   /** The protocol number `open` answers with; a test changes it to play an old worker. */
   proto: number;
+  /** The worker's answers themselves, for a second way in (a follower's port). */
+  answer: RowsAnswer;
 }
 
 /** What `rows-worker.ts` answers, for a caller that is not an engine (a fake Worker). */
@@ -67,8 +69,9 @@ export class FakeRowsWorker {
 }
 
 export function inProcessRows(engine: unknown, disks: RowsDisks = new Map()): RowsHost {
-  const host: RowsHost = { disks, calls: [], store: () => null, proto: ROWS_PROTOCOL };
+  const host = { disks, calls: [], store: () => null, proto: ROWS_PROTOCOL } as unknown as RowsHost;
   const answer = rowsAnswers(disks, host);
+  host.answer = answer;
 
   (engine as { createTransport: () => SqliteTransport }).createTransport = () => {
     let closed = false;
@@ -97,18 +100,21 @@ function rowsAnswers(disks: RowsDisks, host: RowsHost): RowsAnswer {
   let store: RowStore | null = null;
   let exec: RowsExec | null = null;
   let openedAs: string | null = null;
+  let reading = false;
   host.store = () => store;
   return async (type, payload) => {
     switch (type) {
       case 'open': {
         // As in the worker: a second open of the open bucket changes nothing.
-        if (!store || openedAs !== payload.dbName) {
+        const key = `${payload.dbName}${payload.reader ? ' (reader)' : ''}`;
+        if (!store || openedAs !== key) {
           store?.checkpoint();
           if (!disks.has(payload.dbName)) disks.set(payload.dbName, { a: new MemoryFile(), b: new MemoryFile() });
           const files = disks.get(payload.dbName)!;
-          store = await RowStore.open({ open: (name) => files[name] });
-          exec = new RowsExec(store);
-          openedAs = payload.dbName;
+          reading = payload.reader === true;
+          store = await RowStore.open({ open: (name) => files[name] }, { reader: reading });
+          exec = new RowsExec(store, reading);
+          openedAs = key;
         }
         return { result: { persisted: payload.useOpfs === true, proto: host.proto, workerUrl: 'https://app.test/assets/rows-worker.js' } };
       }
@@ -136,7 +142,7 @@ function rowsAnswers(disks: RowsDisks, host: RowsHost): RowsAnswer {
       }
       default: {
         if (!store || !exec) throw new Error('rows: store not open');
-        const reply = await handleRowsOp(exec, store, type, payload);
+        const reply = reading ? await handleReaderOp(exec, store, type, payload) : await handleRowsOp(exec, store, type, payload);
         if (!reply) throw new Error(`rows worker: unknown message ${type}`);
         return reply;
       }

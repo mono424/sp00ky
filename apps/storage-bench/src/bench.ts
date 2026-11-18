@@ -3,38 +3,34 @@
  * own so no backend runs beside another's worker or wasm heap:
  *
  *   warm    wipe everything, load the dataset, run every scenario in one session
- *   boot    open the store in a fresh page and read one window, as an app does:
- *           after its script arrived (the main thread idle meanwhile) and
- *           ran its startup work (the main thread busy)
+ *   boot    open the store in a fresh page and make a query's first read, as
+ *           an app does: after its script arrived (the main thread idle
+ *           meanwhile) and ran its startup work (the main thread busy)
  *   cold    the same the moment the script runs, with nothing else to do
  *   reload  the same, after 200 writes and a reload that closed nothing
+ *   start   the row store's worker, started on an idle page with and without
+ *           the compile hint
  *
  * The queue of steps and the results live in localStorage, and the page
- * reloads itself from step to step.
+ * reloads itself from step to step. Finished runs are kept (the last eight),
+ * so a run can be shown against an earlier one. The shared-tabs test needs a
+ * second tab and has a button of its own (`tabs.ts`).
  */
 import { CborCodec } from 'surrealdb';
 import { BACKENDS, type Backend } from './backends';
 import { generate, pick, rng, type Dataset, type Row } from './data';
+import { runTabsTest, serveAsLeader } from './tabs';
+import { ORDER, installTooltip, render, type Metric, type Results, type RunRecord } from './view';
 
 interface Step {
   backend: string;
-  phase: 'warm' | 'cold' | 'boot' | 'reload';
+  phase: 'warm' | 'cold' | 'boot' | 'reload' | 'start';
   i: number;
 }
 
-interface Metric {
-  /** Median of the timed runs, or the one total for a single run. */
-  ms: number;
-  p95?: number;
-  runs?: number;
-  note?: string;
-}
-
-type Results = Record<string, Record<string, Metric>>;
-
-const ORDER = ['indexeddb', 'sqlite', 'rows'];
 // Fresh-page loads per phase. The first is left out; of the rest, every other one peeks (see `runStep`).
 const COLD_RUNS = 13;
+const HISTORY = 8;
 const GAME_FIELDS = ['white_name', 'black_name', 'result', 'opening', 'played_at', 'moves'];
 
 const load = <T>(key: string, fallback: T): T => {
@@ -189,9 +185,61 @@ async function wipeAll(): Promise<void> {
   }
 }
 
+/**
+ * The row store's worker, started on an idle page: from `new Worker()` to the
+ * store being open. Twice over, alternating: the worker as built (the compile
+ * hint on its first line) and a copy without the hint (`vite.config.ts`
+ * writes both and says where).
+ */
+async function workerStart(): Promise<Record<string, Metric>> {
+  const urls = (await (await fetch('/assets/workers.json')).json()) as { hint: string; plain: string };
+  const g = globalThis as { __sp00kyRowsPrewarm?: { worker: Worker } };
+  g.__sp00kyRowsPrewarm?.worker.terminate();
+  delete g.__sp00kyRowsPrewarm;
+  await settle(400);
+  const once = async (url: string): Promise<{ total: number; inside: number }> => {
+    const t0 = performance.now();
+    const worker = new Worker(url, { type: 'module' });
+    const reply = await new Promise<{ ok: boolean; wt?: number; error?: string }>((resolve) => {
+      worker.onmessage = (ev) => resolve(ev.data as { ok: boolean; wt?: number });
+      worker.onerror = (ev) => resolve({ ok: false, error: ev.message });
+      worker.postMessage({ id: 1, type: 'open', payload: { dbName: 'bench-start', useOpfs: true } });
+    });
+    const total = performance.now() - t0;
+    if (!reply.ok) throw new Error(`worker start: ${reply.error ?? 'open failed'}`);
+    await new Promise<void>((resolve) => {
+      worker.onmessage = () => resolve();
+      worker.postMessage({ id: 2, type: 'close' });
+    });
+    worker.terminate();
+    // The files are let go a moment after the worker is: do not time the wait for them.
+    await settle(250);
+    return { total, inside: reply.wt ?? 0 };
+  };
+  const samples: Record<'hint' | 'plain', { total: number; inside: number }[]> = { hint: [], plain: [] };
+  for (let round = 0; round < 14; round++) {
+    for (const kind of round % 2 ? (['hint', 'plain'] as const) : (['plain', 'hint'] as const)) {
+      say(`rows: worker start ${round + 1} of 14`);
+      const sample = await once(urls[kind]);
+      // The first rounds fill the browser's code cache for each file.
+      if (round >= 4) samples[kind].push(sample);
+    }
+  }
+  return {
+    start_hint: stats(samples.hint.map((s) => s.total)),
+    start_plain: stats(samples.plain.map((s) => s.total)),
+    start_hint_inside: stats(samples.hint.map((s) => s.inside)),
+    start_plain_inside: stats(samples.plain.map((s) => s.inside)),
+  };
+}
+
 async function runStep(step: Step, results: Results): Promise<void> {
-  const backend = BACKENDS[step.backend]();
   const mine = (results[step.backend] ??= {});
+  if (step.phase === 'start') {
+    Object.assign(mine, await workerStart());
+    return;
+  }
+  const backend = BACKENDS[step.backend]();
   if (step.phase === 'warm') {
     say(`${step.backend}: wiping`);
     await wipeAll();
@@ -216,14 +264,15 @@ async function runStep(step: Step, results: Results): Promise<void> {
   // A backend that keeps rows to paint from is timed two ways, on alternate
   // loads: until it has those rows, and until the read itself answers with no
   // peek in its way. One load cannot give both: the peek is main-thread work.
-  const peeks = backend.peek !== undefined && step.i % 2 === 1;
+  const peeks = backend.peekFirstQuery !== undefined && step.i % 2 === 1;
   const t0 = performance.now();
   const opening = backend.open();
-  const painted = peeks ? (backend.peek?.('game', ids) ?? null) : null;
+  // What the client does when a query is registered: seed it with the rows the store kept.
+  const painted = peeks ? (backend.peekFirstQuery?.(ids) ?? null) : null;
   const tPaint = performance.now();
   await opening;
   const t1 = performance.now();
-  const rows = await backend.getMany('game', ids);
+  const rows = await backend.firstQuery(ids);
   const t2 = performance.now();
   if (rows.length !== ids.length) throw new Error(`${step.backend}: read ${rows.length} of ${ids.length} rows after reopening`);
   const key = step.phase;
@@ -246,7 +295,7 @@ async function runStep(step: Step, results: Results): Promise<void> {
   save(`bench:${key}:${step.backend}`, samples);
   // Without a peek, the rows to paint from are the rows the read answers with.
   const plain = samples.filter((s) => !s.peeked);
-  const painting = backend.peek ? samples.filter((s) => s.peeked) : samples;
+  const painting = backend.peekFirstQuery ? samples.filter((s) => s.peeked) : samples;
   if (plain.length > 0) {
     mine[`${key}_open`] = stats(plain.map((s) => s.open));
     mine[`${key}_first_window`] = stats(plain.map((s) => s.read));
@@ -265,82 +314,12 @@ async function runStep(step: Step, results: Results): Promise<void> {
     return;
   }
   // Leave work behind for the next load to find: writes no checkpoint has
-  // covered, and a store nobody closed. The window is read once more after
+  // covered, and a store nobody closed. The query is read once more after
   // them, as the client does when rows on screen change (it re-materializes
   // the query), and then the page goes without a goodbye.
   const rnd = rng(1000 + step.i);
   for (let i = 0; i < 200; i++) await backend.put('game', { id: ids[rnd(ids.length)], favorite: i % 2 === 0, _00_rv: 1000 + i });
-  await backend.getMany('game', ids);
-}
-
-// ---- rendering -----------------------------------------------------------------
-
-const LABELS: [key: string, label: string][] = [
-  ['cold_paint', 'Fresh page, asked the moment the script runs: 50 rows to paint from'],
-  ['cold_total', ' the read itself (open the store, read the 50 rows)'],
-  ['boot_paint', 'Fresh page, after a script download and app startup work: 50 rows to paint from'],
-  ['boot_total', ' the read itself'],
-  ['reload_paint', 'After 200 writes and a reload that closed nothing: 50 rows to paint from'],
-  ['reload_total', ' the read itself'],
-  ['reload_paint_differs', ' loads where the painted rows were then corrected'],
-  ['window50', 'Read a window of 50 rows by id'],
-  ['window50_fields', 'Read 6 fields of 50 rows by id'],
-  ['point', 'Read one row by id'],
-  ['screen30', 'A screen: 30 games, each with its player and top 3 comments'],
-  ['first_screen30', ' first time after loading'],
-  ['children30', 'Comments of 30 games (foreign key)'],
-  ['where_indexable', 'Filter + sort + limit 50, on a field IndexedDB has an index for'],
-  ['where_scan', 'Filter + sort + limit 50, on a field nobody indexes'],
-  ['first_where_scan', ' first time after loading'],
-  ['versions', 'Read (id, version) of every game'],
-  ['ingest', 'Load the whole dataset (sync-down batches)'],
-  ['merge250', 'Merge a patch into 250 stored rows'],
-  ['put1', 'Merge one row'],
-  ['user_write', 'A user write: row + outbox entry, durable'],
-  ['window50_after_writes', 'Read a window of 50 rows, after the writes'],
-  ['disk_mb', 'Size on disk (MB)'],
-];
-
-function fmt(value: number): string {
-  if (value >= 1000) return value.toFixed(0);
-  if (value >= 100) return value.toFixed(0);
-  if (value >= 10) return value.toFixed(1);
-  return value.toFixed(2);
-}
-
-function render(results: Results): void {
-  const root = document.getElementById('results')!;
-  const present = ORDER.filter((name) => results[name]);
-  let html = '';
-  if (present.length > 0) {
-    html += `<table><thead><tr><th>median ms <small>(p95)</small></th>${present.map((n) => `<th>${n}</th>`).join('')}</tr></thead><tbody>`;
-    for (const [key, label] of LABELS) {
-      const cells = present.map((name) => results[name][key]);
-      if (cells.every((c) => !c)) continue;
-      const least = Math.min(...cells.filter(Boolean).map((c) => c.ms));
-      html += `<tr><td>${label}</td>`;
-      for (const cell of cells) {
-        if (!cell) html += '<td>-</td>';
-        else {
-          const p95 = cell.p95 !== undefined && key !== 'disk_mb' ? ` <small>(${fmt(cell.p95)})</small>` : '';
-          html += `<td class="${cell.ms === least ? 'best' : ''}">${fmt(cell.ms)}${p95}</td>`;
-        }
-      }
-      html += '</tr>';
-    }
-    html += '</tbody></table>';
-  }
-  if (results.codec) {
-    const c = results.codec;
-    html += `<table><thead><tr><th>Body codec, 5000 game rows</th><th>encode ms</th><th>decode ms</th><th>MB</th></tr></thead><tbody>`;
-    html += `<tr><td>JSON text, a parse per row</td><td>${fmt(c.json_encode.ms)}</td><td>${fmt(c.json_decode.ms)}</td><td>${fmt(c.json_mb.ms)}</td></tr>`;
-    html += `<tr><td>JSON text, one parse for all</td><td>-</td><td>${fmt(c.json_decode_one_parse.ms)}</td><td>-</td></tr>`;
-    html += `<tr><td>CBOR (the SurrealDB SDK's codec)</td><td>${fmt(c.cbor_encode.ms)}</td><td>${fmt(c.cbor_decode.ms)}</td><td>${fmt(c.cbor_mb.ms)}</td></tr>`;
-    html += '</tbody></table>';
-  }
-  root.innerHTML = html;
-  (document.getElementById('json') as HTMLTextAreaElement).value = JSON.stringify({ config, userAgent: navigator.userAgent, results }, null, 2);
-  (window as unknown as { __bench: unknown }).__bench = { config, results, done: load<Step[]>('bench:queue', []).length === 0 };
+  await backend.firstQuery(ids);
 }
 
 // ---- the queue -------------------------------------------------------------------
@@ -353,45 +332,118 @@ function plan(): Step[] {
     for (let i = 0; i < COLD_RUNS; i++) steps.push({ backend, phase: 'cold', i });
     for (let i = 0; i < COLD_RUNS; i++) steps.push({ backend, phase: 'reload', i });
   }
+  steps.push({ backend: 'rows', phase: 'start', i: 0 });
   return steps;
 }
 
 function clearRun(): void {
   for (const key of Object.keys(localStorage)) {
-    if (key.startsWith('bench:') && key !== 'bench:config') localStorage.removeItem(key);
+    if (key.startsWith('bench:') && !['bench:config', 'bench:history', 'bench:label', 'bench:baseline'].includes(key)) localStorage.removeItem(key);
   }
 }
 
+const stamp = (at: number): string => new Date(at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+/** Keep a finished run, so a later one can be shown against it. */
+function remember(results: Results): void {
+  const history = load<RunRecord[]>('bench:history', []);
+  const at = Date.now();
+  history.unshift({ at, label: load('bench:label', '') || stamp(at), config: { ...config }, results });
+  save('bench:history', history.slice(0, HISTORY));
+  save('bench:shown', at);
+}
+
+function show(): void {
+  const results = load<Results>('bench:results', {});
+  const history = load<RunRecord[]>('bench:history', []);
+  const shown = load<number | null>('bench:shown', null);
+  const picker = document.getElementById('baseline') as HTMLSelectElement;
+  const chosen = load<number | null>('bench:baseline', null);
+  // Any kept run but the one on screen.
+  const others = history.filter((run) => run.at !== shown);
+  picker.innerHTML =
+    '<option value="">nothing</option>' +
+    others.map((run) => `<option value="${run.at}"${run.at === chosen ? ' selected' : ''}>${run.label.replace(/[<>&"]/g, '')} (${stamp(run.at)})</option>`).join('');
+  picker.disabled = others.length === 0;
+  const baseline = others.find((run) => run.at === chosen)?.results ?? null;
+  render(document.getElementById('results')!, results, baseline);
+  (document.getElementById('json') as HTMLTextAreaElement).value = JSON.stringify({ config, userAgent: navigator.userAgent, results }, null, 2);
+  (window as unknown as { __bench: unknown }).__bench = { config, results, done: load<Step[]>('bench:queue', []).length === 0 };
+}
+
 async function main(): Promise<void> {
-  const games = document.getElementById('games') as HTMLInputElement;
-  const comments = document.getElementById('comments') as HTMLInputElement;
-  const boot = document.getElementById('boot') as HTMLInputElement;
-  const idle = document.getElementById('idle') as HTMLInputElement;
-  idle.value = String(config.idle);
-  games.value = String(config.games);
-  comments.value = String(config.comments);
-  boot.value = String(config.boot);
+  if (new URLSearchParams(location.search).has('leader')) {
+    document.body.classList.add('leader');
+    await serveAsLeader(say);
+    return;
+  }
+  const input = (id: string): HTMLInputElement => document.getElementById(id) as HTMLInputElement;
+  input('games').value = String(config.games);
+  input('comments').value = String(config.comments);
+  input('boot').value = String(config.boot);
+  input('idle').value = String(config.idle);
+  input('label').value = load('bench:label', '');
+  installTooltip(document.getElementById('results')!, document.getElementById('tip')!);
+
   document.getElementById('run')!.addEventListener('click', () => {
-    save('bench:config', { games: Number(games.value), comments: Number(comments.value), boot: Number(boot.value), idle: Number(idle.value) });
+    save('bench:config', {
+      games: Number(input('games').value),
+      comments: Number(input('comments').value),
+      boot: Number(input('boot').value),
+      idle: Number(input('idle').value),
+    });
+    save('bench:label', input('label').value.trim());
     clearRun();
     save('bench:queue', plan());
     location.reload();
   });
   document.getElementById('reset')!.addEventListener('click', async () => {
     clearRun();
+    localStorage.removeItem('bench:history');
+    localStorage.removeItem('bench:baseline');
     await wipeAll();
     location.reload();
   });
+  document.getElementById('baseline')!.addEventListener('change', (ev) => {
+    const value = (ev.target as HTMLSelectElement).value;
+    save('bench:baseline', value ? Number(value) : null);
+    show();
+  });
+  document.getElementById('tabs')!.addEventListener('click', async () => {
+    const button = document.getElementById('tabs') as HTMLButtonElement;
+    button.disabled = true;
+    try {
+      // `noopener`: a tab of its own, in a process of its own, as a second tab of an app is.
+      const tabs = await runTabsTest(config, say, () => void window.open(`${location.pathname}?leader=1`, '_blank', 'noopener'));
+      const results = load<Results>('bench:results', {});
+      results.tabs = tabs;
+      save('bench:results', results);
+      // The run on screen is in the history too: keep the two the same.
+      const history = load<RunRecord[]>('bench:history', []);
+      const current = history.find((run) => run.at === load<number | null>('bench:shown', null));
+      if (current) {
+        current.results = results;
+        save('bench:history', history);
+      }
+      say('Shared tabs: done.');
+      show();
+    } catch (error) {
+      console.error(error);
+      say(`Shared tabs failed: ${String(error)}`);
+    } finally {
+      button.disabled = false;
+    }
+  });
 
-  const results = load<Results>('bench:results', {});
-  render(results);
+  show();
   const queue = load<Step[]>('bench:queue', []);
   if (queue.length === 0) {
-    say(Object.keys(results).length > 0 ? 'Done.' : 'Idle.');
+    say(Object.keys(load<Results>('bench:results', {})).length > 0 ? 'Done.' : 'Idle.');
     return;
   }
+  const results = load<Results>('bench:results', {});
   const step = queue[0];
-  say(`${step.backend}: ${step.phase} ${step.i + 1}`);
+  say(`${step.backend}: ${step.phase} ${step.i + 1} (${queue.length} steps left)`);
   try {
     await runStep(step, results);
   } catch (error) {
@@ -403,6 +455,7 @@ async function main(): Promise<void> {
   }
   save('bench:results', results);
   save('bench:queue', queue.slice(1));
+  if (queue.length === 1) remember(results);
   location.reload();
 }
 

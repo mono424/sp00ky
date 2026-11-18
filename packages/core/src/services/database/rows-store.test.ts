@@ -464,6 +464,123 @@ describe('RowStore', () => {
   });
 });
 
+describe('RowStore read beside its writer', () => {
+  /** A reader over the very files `disk`'s writer holds, as a second tab has them. */
+  const readerOf = (disk: Disk): Promise<RowStore> => RowStore.open({ open: (name) => disk.files[name] }, { reader: true });
+  const seen = (reader: RowStore, table: string): [string, unknown][] => {
+    reader.refresh();
+    const rows = dump(reader, table);
+    expect(reader.current()).toBe(true);
+    return rows;
+  };
+
+  it('sees an empty store, then every write as it lands, without writing a byte', async () => {
+    const disk = new Disk();
+    const reader = await readerOf(disk);
+    expect(seen(reader, 'game')).toEqual([]);
+    expect(disk.files.a.size()).toBe(0);
+
+    const writer = await RowStore.open(disk);
+    writer.write([put('game', 'game:a', { n: 1 })]);
+    expect(seen(reader, 'game')).toEqual([['game:a', { n: 1 }]]);
+    writer.write([put('game', 'game:b', { n: 2 }), del('game', 'game:a')]);
+    writer.write([put('user', 'user:x', { name: 'Zoë' })]);
+    expect(seen(reader, 'game')).toEqual([['game:b', { n: 2 }]]);
+    expect(seen(reader, 'user')).toEqual([['user:x', { name: 'Zoë' }]]);
+
+    const before = disk.files.a.snapshot();
+    reader.refresh();
+    seen(reader, 'game');
+    expect(disk.files.a.snapshot()).toEqual(before);
+    expect(() => reader.write([put('game', 'game:c', {})])).toThrow(/only reads/);
+    expect(reader.checkpoint()).toBe(false);
+  });
+
+  it('leaves a half-written batch alone and takes it once it is whole', async () => {
+    const disk = new Disk();
+    const writer = await RowStore.open(disk);
+    writer.write([put('game', 'game:a', { n: 1 })]);
+    const reader = await readerOf(disk);
+    writer.write([put('game', 'game:b', { n: 2, pad: 'x'.repeat(500) })]);
+    // The writer's last batch as it is halfway through reaching the file.
+    const whole = disk.files.a.snapshot();
+    disk.files.a.truncate(whole.length - 200);
+    expect(seen(reader, 'game')).toEqual([['game:a', { n: 1 }]]);
+    expect(disk.files.a.size()).toBe(whole.length - 200);
+    disk.files.a.write(whole.subarray(whole.length - 200), whole.length - 200);
+    expect(seen(reader, 'game').map(([id]) => id)).toEqual(['game:a', 'game:b']);
+  });
+
+  it('carries on across checkpoints and follows the rows into the other file', async () => {
+    const disk = new Disk();
+    const writer = await RowStore.open(disk);
+    for (let i = 0; i < 50; i++) writer.write([put('game', `game:${String(i).padStart(2, '0')}`, { i, pad: 'x'.repeat(200) })]);
+    const reader = await readerOf(disk);
+    expect(seen(reader, 'game').length).toBe(50);
+
+    writer.checkpoint();
+    writer.write([put('game', 'game:50', { i: 50 })]);
+    expect(seen(reader, 'game').length).toBe(51);
+
+    // Rows the reader holds offsets of, in a file about to be emptied.
+    const stale = reader.ordered('game');
+    for (let i = 0; i < 40; i++) writer.write([del('game', `game:${String(i).padStart(2, '0')}`)]);
+    await writer.compact();
+    expect(writer.stats().file).toBe('b');
+    expect(reader.current()).toBe(false);
+    // A read that raced the compaction got bytes of a file that is gone: `current` said so.
+    const body = new Uint8Array(stale.len[45]);
+    reader.readInto(stale.off[45], stale.len[45], body, 0);
+    expect(body.every((byte) => byte === 0)).toBe(true);
+
+    expect(seen(reader, 'game').map(([id]) => id)).toEqual(dump(writer, 'game').map(([id]) => id));
+    writer.write([put('game', 'game:new', { fresh: true })]);
+    expect(seen(reader, 'game')).toEqual(dump(writer, 'game'));
+    // And back into the first file.
+    for (let i = 40; i < 50; i++) writer.write([del('game', `game:${i}`)]);
+    await writer.compact();
+    expect(writer.stats().file).toBe('a');
+    expect(seen(reader, 'game')).toEqual(dump(writer, 'game'));
+  });
+
+  it('opens on a checkpointed store and reads its index blocks', async () => {
+    const disk = new Disk();
+    const writer = await RowStore.open(disk);
+    for (let i = 0; i < 20; i++) writer.write([put('game', `game:${i}`, { i }, i)]);
+    writer.checkpoint();
+    writer.write([put('game', 'game:tail', { tail: true })]);
+    const reader = await readerOf(disk);
+    expect(reader.stats().tailOps).toBe(1);
+    expect(seen(reader, 'game')).toEqual(dump(writer, 'game'));
+    expect(reader.find('game', 'game:7')?.rv).toBe(7);
+  });
+
+  it('matches its writer through random writes, checkpoints and compactions', async () => {
+    const disk = new Disk();
+    const writer = await RowStore.open(disk);
+    const reader = await readerOf(disk);
+    let seed = 7;
+    const rnd = (n: number): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    for (let step = 0; step < 600; step++) {
+      const table = rnd(2) ? 'game' : 'user';
+      const id = `${table}:${rnd(40)}`;
+      const roll = rnd(100);
+      if (roll < 60) writer.write([put(table, id, { step, pad: 'p'.repeat(rnd(300)) }, step)]);
+      else if (roll < 80) writer.write([del(table, id)]);
+      else if (roll < 84) writer.write([{ t: 'clear', table }]);
+      else if (roll < 92) writer.checkpoint();
+      else if (roll < 96) await writer.compact();
+      if (rnd(3) === 0) {
+        for (const name of ['game', 'user']) expect(seen(reader, name)).toEqual(dump(writer, name));
+      }
+    }
+    for (const name of ['game', 'user']) expect(seen(reader, name)).toEqual(dump(writer, name));
+  });
+});
+
 describe('RowStore as an index', () => {
   it('walks the ids under a prefix, in order, across folded and pending writes', async () => {
     const disk = new Disk();

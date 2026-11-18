@@ -352,6 +352,178 @@ describe('RowsCacheEngine: store lifecycle', () => {
   });
 });
 
+describe('a follower that reads the store\'s file itself', () => {
+  let disks: RowsDisks;
+  let leader: RowsCacheEngine;
+  let host: ReturnType<typeof inProcessRows>;
+  /** Workers followers started for reading. */
+  let readers: FakeRowsWorker[];
+  const attached = { bucketId: 'user_a', storageHealth: { status: 'persistent', fallback: false } as const };
+
+  const follower = (config: Record<string, unknown> = { followerReads: 'direct' }): RowsCacheEngine =>
+    new RowsCacheEngine(
+      {
+        store: 'indexeddb',
+        ...config,
+        workers: {
+          rows: () => {
+            const worker = new FakeRowsWorker(disks);
+            readers.push(worker);
+            return worker as unknown as Worker;
+          },
+        },
+      } as any,
+      logger,
+      { useOpfs: true, shared: true }
+    );
+
+  /** A port into the leader's worker, as the tabs broker hands one to a follower. */
+  const leaderPort = () => {
+    const port = {
+      onmessage: null as null | ((ev: { data: unknown }) => void),
+      onmessageerror: null,
+      posted: [] as string[],
+      start() {},
+      close() {},
+      postMessage(msg: { id: number; type: string; payload: unknown }, transfer?: Transferable[]) {
+        port.posted.push(msg.type);
+        const payload = structuredClone(msg.payload, { transfer: transfer ?? [] });
+        void host.answer(msg.type, payload).then(
+          ({ result, transfer: back }) =>
+            port.onmessage?.({ data: { id: msg.id, ok: true, wt: 0, ...(structuredClone(result, { transfer: back ?? [] }) as object) } }),
+          (error: unknown) => port.onmessage?.({ data: { id: msg.id, ok: false, error: String(error) } })
+        );
+      },
+    };
+    return port;
+  };
+  const attach = async (tab: RowsCacheEngine) => {
+    const port = leaderPort();
+    await tab.adoptAttached(port as unknown as MessagePort, attached, () => {});
+    return port;
+  };
+
+  beforeEach(async () => {
+    disks = new Map();
+    readers = [];
+    leader = new RowsCacheEngine({ store: 'indexeddb', followerReads: 'direct' } as any, logger, { useOpfs: true, shared: true });
+    host = inProcessRows(leader, disks);
+    await leader.adoptOwner('user_a', { workerLockName: 'lock-1', allowMemoryFallback: false, resumeHeld: false });
+    await leader.upsert('game', 'game:a', { n: 1, white: 'user:1' }, 'replace');
+  });
+
+  it('reads from its own worker, writes through the leader, and sees every write at once', async () => {
+    const tab = follower();
+    const port = await attach(tab);
+    expect(tab.readsDirectly).toBe(true);
+    expect(readers[0].posted.map((m) => m.type)).toEqual(['open']);
+    expect(await tab.getById('game', 'game:a')).toEqual({ id: 'game:a', n: 1, white: 'user:1' });
+
+    await tab.upsert('game', 'game:b', { n: 2, white: 'user:1' }, 'replace');
+    expect((await tab.selectByIds('game', ['game:a', 'game:b'])).map((r) => r.n)).toEqual([1, 2]);
+    // Another tab's write, and the leader's own.
+    await leader.upsert('game', 'game:c', { n: 3, white: 'user:2' }, 'replace');
+    await leader.delete('game', 'game:a');
+    expect((await tab.select({ table: 'game' })).map((r) => r.id)).toEqual(['game:b', 'game:c']);
+    expect(await tab.scanVersions(['game'])).toEqual(await leader.scanVersions(['game']));
+
+    // Only the write crossed to the leader.
+    expect(port.posted).toEqual(['write']);
+    expect(readers[0].posted.map((m) => m.type)).toEqual(['open', 'get', 'by-ids', 'select', 'versions']);
+  });
+
+  it('uses the indexes the leader keeps and builds none of its own', async () => {
+    for (let i = 0; i < 80; i++) await leader.upsert('game', `game:x${i}`, { n: i, white: `user:${i % 20}` }, 'replace');
+    const byWhite: QueryPlan = { table: 'game', where: [{ field: 'white', op: '=', value: 'user:7' }] };
+    const byN: QueryPlan = { table: 'game', where: [{ field: 'n', op: '=', value: 7 }] };
+    const tab = follower();
+    const port = await attach(tab);
+    const size = (): number => disks.get('user_a')!.a.size() + disks.get('user_a')!.b.size();
+    const before = size();
+    // A field nobody indexed yet: the follower scans, and writes nothing to find out.
+    expect((await tab.select(byN)).map((r) => r.id)).toEqual(['game:x7']);
+    expect(size()).toBe(before);
+    expect(await tab.select(byWhite)).toEqual(await leader.select(byWhite));
+    // The leader builds the index for `n`; the follower reads through it from then on.
+    expect((await leader.select(byN)).map((r) => r.id)).toEqual(['game:x7']);
+    expect(size()).toBeGreaterThan(before);
+    expect((await tab.select(byN)).map((r) => r.id)).toEqual(['game:x7']);
+    expect(port.posted).toEqual([]);
+  });
+
+  it('follows the rows through a compaction of the leader\'s', async () => {
+    const tab = follower();
+    await attach(tab);
+    for (let i = 0; i < 60; i++) await leader.upsert('game', `game:x${i}`, { n: i, pad: 'p'.repeat(300) }, 'replace');
+    expect((await tab.select({ table: 'game' })).length).toBe(61);
+    for (let i = 0; i < 50; i++) await leader.delete('game', `game:x${i}`);
+    await host.store()!.compact();
+    expect(host.store()!.stats().file).toBe('b');
+    expect(await tab.select({ table: 'game' })).toEqual(await leader.select({ table: 'game' }));
+    await leader.upsert('game', 'game:z', { n: 99 }, 'replace');
+    expect(await tab.getById('game', 'game:z')).toEqual({ id: 'game:z', n: 99 });
+  });
+
+  it('reads through the leader when it is not asked to read directly, or cannot', async () => {
+    const plain = follower({});
+    const plainPort = await attach(plain);
+    expect(plain.readsDirectly).toBe(false);
+    expect(readers).toEqual([]);
+    expect((await plain.getById('game', 'game:a'))?.n).toBe(1);
+    expect(plainPort.posted).toEqual(['get']);
+
+    // A browser without shared handles: the reader's open fails.
+    const tab = new RowsCacheEngine(
+      {
+        store: 'indexeddb',
+        followerReads: 'direct',
+        workers: {
+          rows: () => {
+            const worker = new FakeRowsWorker(disks);
+            worker.postMessage = (msg: { id: number }) =>
+              queueMicrotask(() => worker.onmessage?.({ data: { id: msg.id, ok: false, error: 'opfs-unavailable: shared access handles' } }));
+            readers.push(worker);
+            return worker as unknown as Worker;
+          },
+        },
+      } as any,
+      logger,
+      { useOpfs: true, shared: true }
+    );
+    const port = await attach(tab);
+    expect(tab.readsDirectly).toBe(false);
+    expect(readers[0].terminated).toBe(true);
+    expect((await tab.getById('game', 'game:a'))?.n).toBe(1);
+    expect(port.posted).toEqual(['get']);
+  });
+
+  it('asks the leader when its reader fails, and from then on', async () => {
+    const tab = follower();
+    const port = await attach(tab);
+    expect((await tab.getById('game', 'game:a'))?.n).toBe(1);
+    readers[0].postMessage = () => readers[0].onerror?.({ message: 'out of memory' });
+    expect((await tab.getById('game', 'game:a'))?.n).toBe(1);
+    expect(tab.readsDirectly).toBe(false);
+    expect(readers[0].terminated).toBe(true);
+    expect((await tab.selectByIds('game', ['game:a'])).length).toBe(1);
+    expect(port.posted).toEqual(['get', 'by-ids']);
+  });
+
+  it('lets go of the reader when the role changes', async () => {
+    const tab = follower();
+    await attach(tab);
+    tab.onLeaderLost('leader tab closed');
+    expect(tab.readsDirectly).toBe(false);
+    expect(readers[0].terminated).toBe(true);
+    // A new leader, a new reader.
+    await attach(tab);
+    expect(tab.readsDirectly).toBe(true);
+    expect(readers.length).toBe(2);
+    await tab.close();
+    expect(readers[1].terminated).toBe(true);
+  });
+});
+
 describe('packWrites', () => {
   it('lays every row\'s text in one buffer and says where', () => {
     const { wire, buf, sync } = packWrites([
@@ -742,6 +914,24 @@ describe('painting from the last session', () => {
     expect(next.peekByIds('game', ids, { select: ['n'] })).toBeNull();
     await opening;
     expect(await next.selectByIds('game', ids)).toEqual(rows);
+  });
+
+  it('keeps a named read under its name, whatever its arguments were', async () => {
+    const whole: QueryPlan = { table: 'game' };
+    const one: QueryPlan = { table: 'game', ids: [new RecordId('game', 'a')] };
+    // A query whose id set moved between two renders: one name, the latest answer.
+    await engine.select(whole, {}, { paintKey: 'view-1' });
+    const latest = await engine.select(one, {}, { paintKey: 'view-1' });
+    expect(latest.map((r) => r.id)).toEqual(['game:a']);
+    flush(engine);
+    await engine.close();
+
+    const next = fresh();
+    void next.connect('user_a');
+    expect(next.peekSelect(whole, {}, { paintKey: 'view-1' })).toEqual(latest);
+    expect(next.peekSelect(whole, {}, { paintKey: 'view-2' })).toBeNull();
+    // The unnamed read of the same plan is another thing.
+    expect(next.peekSelect(whole)).toBeNull();
   });
 
   it('lets go of a copy the moment its table is written, and takes the next read of the same thing', async () => {

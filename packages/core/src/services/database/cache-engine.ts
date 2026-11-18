@@ -76,7 +76,7 @@ export interface LocalCacheEngine extends RowFetcher {
    * Materialize a query, including its `.related()` tree (via §3
    * decomposition). Params bind `where` `paramRef`s and any windowing id-set.
    */
-  select(plan: QueryPlan, params?: Record<string, unknown>): Promise<Row[]>;
+  select(plan: QueryPlan, params?: Record<string, unknown>, opts?: { paintKey?: string }): Promise<Row[]>;
 
   /** Fetch rows by primary id, preserving `ids` order; missing ids are skipped. */
   selectByIds(table: string, ids: Id[], opts?: { select?: string[]; orderBy?: OrderBy }): Promise<Row[]>;
@@ -173,7 +173,7 @@ export interface LocalStore extends LocalCacheEngine {
    * Something to paint from; the read itself stays the answer and must follow.
    * OPTIONAL: only an engine that keeps such a copy (`'rows'`) has them.
    */
-  peekSelect?(plan: QueryPlan, params?: Record<string, unknown>): Row[] | null;
+  peekSelect?(plan: QueryPlan, params?: Record<string, unknown>, opts?: { paintKey?: string }): Row[] | null;
   peekByIds?(table: string, ids: Id[], opts?: { select?: string[]; orderBy?: OrderBy }): Row[] | null;
   getSnapshot?(key: string): Promise<StoredSnapshot | null>;
   putSnapshot?(key: string, bytes: Uint8Array, meta: SnapshotMeta): Promise<void>;

@@ -390,8 +390,16 @@ impl Collection {
     /// every restart would start each index's idle clock again and an
     /// index nobody reads would never go on a project that deploys more
     /// often than the grace.
+    ///
+    /// A clock already running that says the index was read more recently
+    /// stays, and a zero `idle` (age unknown) only starts a clock that is
+    /// not running.
     pub fn set_index_idle_for(&self, name: &str, idle: std::time::Duration, now: Instant) {
         if let Some(index) = self.indexes.lock().get_mut(name) {
+            let running = index.idle_since.map(|since| now.saturating_duration_since(since));
+            if running.is_some_and(|running| running <= idle || idle.is_zero()) {
+                return;
+            }
             index.idle_since = Some(now.checked_sub(idle).unwrap_or(now));
         }
     }

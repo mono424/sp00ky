@@ -339,9 +339,11 @@ async fn a_background_prebuild_stops_between_steps_and_leaves_the_rest_to_the_ne
     ]);
     let partial = report.stats.rows_indexed;
     assert!(partial > 0 && partial < ROWS, "stopped part way: {partial}");
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let held = green.read().await.held_indexes();
     assert_eq!(held.len(), 1);
     assert_eq!((held[0].name.as_str(), held[0].rows), ("game_white", partial));
+    assert!(held[0].idle_ms >= 5, "left part built and unread: idle, not in use");
 
     let (client_rows, client_builds) = register_like_a_client(&green, "white", WHITE).await;
     assert_eq!(partial + client_rows, ROWS, "finished from where it stopped");

@@ -869,12 +869,12 @@ impl Circuit {
         }
     }
 
-    /// Start a rebuilt index's idle clock `idle` back, unless a graph here
-    /// reads it.
-    fn carry_index_idle(&self, table: &str, name: &str, idle: std::time::Duration) {
-        if idle.is_zero() {
-            return;
-        }
+    /// Start the idle clock of an index this circuit rebuilt for another
+    /// process (or left part built) `idle` back, unless a graph here reads
+    /// it. A zero `idle` (age unknown, as the warm restart's `indexes.json`
+    /// has it) starts it now: an index no view reads must be idle, or every
+    /// record would list it as in use and it would never be released.
+    pub fn carry_index_idle(&self, table: &str, name: &str, idle: std::time::Duration) {
         let read_here = self.graphs.values().any(|graph| {
             graph.index_uses().iter().any(|(t, n)| t == table && n == name)
         });
@@ -6512,6 +6512,37 @@ mod index_tests {
         third.set_index_idle_release(Duration::from_secs(300));
         third.remove_query(id);
         assert_eq!(third.built_indexes()["game"], vec!["game_database_sort".to_string()], "idle from now");
+    }
+
+    #[test]
+    fn an_index_rebuilt_with_no_known_age_is_idle_from_then_unless_read() {
+        use std::time::Duration;
+        let make = || {
+            let mut c = Circuit::new();
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(game_indexes()));
+            for i in 0..20 {
+                c.store.apply_change(&Change::create("game", &format!("g{i}"), json!({ "database": "game_database:d1", "sort_index": i })));
+            }
+            c
+        };
+        let fields = vec!["database".to_string(), "sort_index".to_string()];
+        // The warm restart's indexes.json has no age: zero.
+        let c = make();
+        assert!(matches!(c.prebuild_held_index("game", "game_database_sort", &fields, Duration::ZERO), PrebuildOutcome::Built(_)));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(c.held_indexes()[0].idle_ms >= 5, "no view reads it: idle, not in use");
+
+        // A running clock keeps its age against an unknown one and an older
+        // one; a more recent read elsewhere wins.
+        let c = make();
+        c.prebuild_held_index("game", "game_database_sort", &fields, Duration::from_secs(600));
+        c.carry_index_idle("game", "game_database_sort", Duration::ZERO);
+        assert!(c.held_indexes()[0].idle_ms >= 600_000);
+        c.carry_index_idle("game", "game_database_sort", Duration::from_secs(900));
+        assert!((600_000..900_000).contains(&c.held_indexes()[0].idle_ms));
+        c.carry_index_idle("game", "game_database_sort", Duration::from_secs(60));
+        assert!((60_000..600_000).contains(&c.held_indexes()[0].idle_ms));
     }
 
     #[test]

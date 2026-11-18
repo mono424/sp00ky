@@ -545,6 +545,9 @@ pub async fn prebuild_in_background(
             if should_stop() {
                 stopped = true;
                 report.skipped.push((index.label(), SkipReason::Stopped));
+                // Each step clears the idle clock: start it again, or the
+                // part-built index would read as in use until a release pass.
+                processor.read().await.carry_index_idle(&index.table, &index.name, index.idle);
                 break;
             }
         }

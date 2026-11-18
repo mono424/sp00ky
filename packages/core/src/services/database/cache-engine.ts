@@ -125,7 +125,7 @@ export interface LocalStore extends LocalCacheEngine {
   /** Which built-in backend this is. OPTIONAL: absent (custom engines) is
    *  reported as `'custom'` by DevTools. More robust than `instanceof` for
    *  engines constructed outside this package. */
-  readonly engineKind?: 'surrealdb' | 'sqlite';
+  readonly engineKind?: 'surrealdb' | 'sqlite' | 'rows';
   /** Engine-specific storage numbers for DevTools (DB file size, per-table
    *  row counts). OPTIONAL: only engines with something to report implement it. */
   getStorageDiagnostics?(opts?: { tableCounts?: boolean }): Promise<EngineStorageDiagnostics>;
@@ -190,7 +190,7 @@ export interface StoredSnapshot {
 }
 
 /** Selected local cache backend. Mirrors the `persistenceClient` config pattern. */
-export type LocalEngineChoice = 'surrealdb' | 'sqlite' | LocalStore;
+export type LocalEngineChoice = 'surrealdb' | 'sqlite' | 'rows' | LocalStore;
 
 /** Thrown when relation decomposition nests past {@link MAX_RELATION_DEPTH} —
  *  a guard against a cyclic schema producing unbounded fan-out. */

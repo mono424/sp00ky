@@ -16,7 +16,7 @@ export interface OpfsEntry {
 
 /** Engine-side numbers only the engine can produce (worker round-trips). */
 export interface EngineStorageDiagnostics {
-  engine: 'sqlite';
+  engine: 'sqlite' | 'rows';
   bucketId: string;
   useOpfs: boolean;
   workerSelectConfigured: boolean;
@@ -25,7 +25,8 @@ export interface EngineStorageDiagnostics {
   workerSelectEffective: boolean;
   /** page_count * page_size. */
   dbSizeBytes?: number;
-  /** freelist_count * page_size — reclaimable via VACUUM. */
+  /** freelist_count * page_size — reclaimable via VACUUM. On the row store:
+   *  dead bytes in the log, reclaimed by its next compaction. */
   freelistBytes?: number;
   tableCounts?: { table: string; rows: number }[];
   error?: string;
@@ -58,7 +59,7 @@ export interface SharedTabsInfo {
 
 export interface StorageInfo {
   at: number;
-  engine: { kind: 'surrealdb' | 'sqlite' | 'custom'; store: string; bucketId: string };
+  engine: { kind: 'surrealdb' | 'sqlite' | 'rows' | 'custom'; store: string; bucketId: string };
   health: { status: 'unknown' | 'persistent' | 'memory'; fallback: boolean; error?: string };
   /** Shared-tabs state, or null when the feature was never requested. */
   tabs?: SharedTabsInfo | null;

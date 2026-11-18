@@ -3,7 +3,8 @@
   "version": "1.0.0-beta.7",
   "type": "module",
   "sideEffects": [
-    "./dist/sqlite-worker.js"
+    "./dist/sqlite-worker.js",
+    "./dist/rows-worker.js"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -31,6 +32,10 @@
     "./sqlite-worker": {
       "types": "./dist/sqlite-worker.d.ts",
       "import": "./dist/sqlite-worker.js"
+    },
+    "./rows-worker": {
+      "types": "./dist/rows-worker.d.ts",
+      "import": "./dist/rows-worker.js"
     }
   },
   "scripts": {

@@ -126,6 +126,8 @@ export interface LocalWorkers {
   surreal?: () => Worker;
   /** The SQLite engine's worker (`localEngine: 'sqlite'`): runs `@spooky-sync/core/sqlite-worker`. */
   sqlite?: () => Worker;
+  /** The row store's worker (`localEngine: 'rows'`): runs `@spooky-sync/core/rows-worker`. */
+  rows?: () => Worker;
 }
 
 /**
@@ -200,9 +202,13 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
   /**
    * Local cache engine backend. `'surrealdb'` (default) uses the in-browser
    * SurrealDB-WASM store; `'sqlite'` uses official SQLite-WASM in a Worker with
-   * OPFS persistence; or pass a custom {@link LocalCacheEngine}. The local cache
-   * is a passive queryable store — reactivity is driven by the remote SSP, not
-   * this engine. See `services/database/cache-engine.ts`.
+   * OPFS persistence; `'rows'` (experimental) uses sp00ky's own row store in a
+   * Worker, also on OPFS: an append-only file per bucket with a flat index,
+   * built for this client's reads and writes and nothing else, and answering
+   * every query the way `'sqlite'` does; or pass a custom
+   * {@link LocalCacheEngine}. The local cache is a passive queryable store —
+   * reactivity is driven by the remote SSP, not this engine. See
+   * `services/database/cache-engine.ts` and `services/database/rows-store.ts`.
    */
   localEngine?: LocalEngineChoice;
   /**
@@ -233,7 +239,7 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
   };
   /**
    * Share ONE durable local store across all tabs of this origin (default
-   * `false`). Requires `localEngine: 'sqlite'`. A SharedWorker broker elects a
+   * `false`). Requires `localEngine: 'sqlite'` or `'rows'`. A SharedWorker broker elects a
    * leader tab per bucket via Web Locks; the leader owns the OPFS SQLite
    * worker and the sync loop, and follower tabs read/write the same store over
    * MessagePorts, so every tab is durable instead of only the first one.
@@ -252,8 +258,8 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
   /**
    * Persist the in-browser SSP circuit's store as a snapshot in the local
    * store, so a reload restores it and only steps in what changed since.
-   * Defaults to `true` under `localEngine: 'sqlite'` (the OPFS-backed store
-   * can hold the bytes) and `false` otherwise.
+   * Defaults to `true` under `localEngine: 'sqlite'` and `'rows'` (the
+   * OPFS-backed stores can hold the bytes) and `false` otherwise.
    *
    * Without a snapshot the circuit is primed by reading every cached row back
    * out of the local store; either way a reload never re-downloads the working

@@ -60,7 +60,7 @@ import type { EngineStorageDiagnostics } from '../../modules/devtools/storage-in
  * on a fresh bucket throws "no such table". Keep in sync with the systemSchema
  * block in `local-migrator.ts`.
  */
-const SNAPSHOT_TABLE = '_00_circuit_snapshot';
+export const SNAPSHOT_TABLE = '_00_circuit_snapshot';
 
 const SYSTEM_TABLES = [
   '_00_stream_processor_state',
@@ -121,7 +121,7 @@ export class SqliteCacheEngine implements LocalStore {
   private transport: SqliteTransport | null = null;
   private storeEpoch = 0;
   private knownTables = new Set<string>();
-  private useOpfs: boolean;
+  protected useOpfs: boolean;
   /** Whether `select` runs as one worker round-trip (plan executed in-worker).
    *  Flipped off at runtime if the worker script predates the `select` op
    *  (stale cached bundle) — degrade to the legacy multi-hop path, don't break. */
@@ -130,7 +130,7 @@ export class SqliteCacheEngine implements LocalStore {
    *  downgrade (configured true, effective false) from a configured-off. */
   private workerSelectConfigured: boolean;
   private events: DatabaseEventSystem = createDatabaseEventSystem();
-  private bucketId = 'anon';
+  protected bucketId = 'anon';
   /** Deadline for one worker round trip; see `localOpTimeoutMs`. */
   private readonly localOpTimeoutMs: number;
   /** Durability of the local store, set on every open. A plain Set of callbacks
@@ -141,7 +141,7 @@ export class SqliteCacheEngine implements LocalStore {
   /** Schemaless — tables are created lazily on first write; no migrator. */
   readonly usesSurqlSchema = false;
 
-  readonly engineKind = 'sqlite' as const;
+  readonly engineKind: 'sqlite' | 'rows' = 'sqlite';
 
   /** Shared-tabs mode: the engine's transport is swapped at runtime by the
    *  TabsCoordinator (owner worker as leader, leader's port as follower). */
@@ -152,8 +152,8 @@ export class SqliteCacheEngine implements LocalStore {
   private roleGateTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
-    private config: Sp00kyConfig<any>['database'],
-    private logger: Logger,
+    protected config: Sp00kyConfig<any>['database'],
+    protected logger: Logger,
     opts: { useOpfs?: boolean; workerSelect?: boolean; shared?: boolean } = {}
   ) {
     this.localOpTimeoutMs = Math.max(0, config.localOpTimeoutMs ?? DEFAULT_LOCAL_OP_TIMEOUT_MS);
@@ -284,7 +284,7 @@ export class SqliteCacheEngine implements LocalStore {
    *  the boot/switch atomicity below.) */
   private opQueue: Promise<unknown> = Promise.resolve();
 
-  private call<T = any>(type: string, payload?: unknown): Promise<T> {
+  protected call<T = any>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T> {
     const enqueuedAt = performance.now();
     const run = async () => {
       // Leaderless window (shared mode): park behind the role gate instead of
@@ -292,7 +292,7 @@ export class SqliteCacheEngine implements LocalStore {
       if (this.roleGate) await this.roleGate.promise;
       // Time spent waiting behind other ops in the queue, not doing work.
       getStats().queueWaitMs += performance.now() - enqueuedAt;
-      return this.rawCall<T>(type, payload);
+      return this.rawCall<T>(type, payload, transfer);
     };
     const result = this.opQueue.then(run, run);
     // Keep the chain alive regardless of individual failures.
@@ -330,7 +330,7 @@ export class SqliteCacheEngine implements LocalStore {
     }
   }
 
-  private rawCall<T = any>(type: string, payload?: unknown): Promise<T> {
+  private rawCall<T = any>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T> {
     if (!this.transport) throw new Error('SqliteCacheEngine: not connected');
     // --- instrumentation: live, inspectable via `globalThis.__sqliteStats` ---
     const s = getStats();
@@ -365,7 +365,7 @@ export class SqliteCacheEngine implements LocalStore {
     // one, and killing it mid-write would cost more than the wait.
     const timeoutMs = this.localOpTimeoutMs;
     const result = withTimeout(
-      this.transport.call<T>(type, payload),
+      this.transport.call<T>(type, payload, transfer),
       timeoutMs,
       () => new LocalOpTimeoutError(type, timeoutMs)
     ).then(
@@ -740,7 +740,7 @@ export class SqliteCacheEngine implements LocalStore {
     this.transport = null;
   }
 
-  private async ensureTable(table: string): Promise<void> {
+  protected async ensureTable(table: string): Promise<void> {
     if (this.knownTables.has(table)) return;
     await this.call('run', {
       sql: `CREATE TABLE IF NOT EXISTS "${table}" (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
@@ -1130,25 +1130,16 @@ export class SqliteCacheEngine implements LocalStore {
         if (op.value) return rows.map((r) => r[op.value!]);
         return op.select ? rows.map((r) => project(r, op.select!)) : rows;
       }
-      case 'count': {
-        await this.ensureTable(op.table);
-        const bind: unknown[] = [];
-        let sql = `SELECT COUNT(*) AS n FROM "${op.table}"`;
-        if (op.where && op.where.length > 0) sql += ` WHERE ${renderWhereSql(op.where, bind, {})}`;
-        const { rows } = await this.call<{ rows: { n: number }[] }>('exec', { sql, bind });
+      case 'count':
         // `GROUP ALL` collapses to a single `{ count }` row on SurrealDB; match
         // it exactly so callers can read `rows[0].count` on either engine.
-        return [{ count: rows?.[0]?.n ?? 0 }];
-      }
+        return [{ count: await this.countRows(op.table, op.where) }];
       case 'infoForDb': {
-        const { rows } = await this.call<{ rows: { name: string }[] }>('exec', {
-          sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        });
         // SurrealDB answers with the DEFINE statement per table. Nothing here
         // parses it (the DevTools explorer only reads the keys), so a truthful
         // schemaless stand-in beats inventing field definitions.
         const tables: Record<string, string> = {};
-        for (const r of rows ?? []) tables[r.name] = `DEFINE TABLE ${r.name} SCHEMALESS`;
+        for (const name of await this.listTables()) tables[name] = `DEFINE TABLE ${name} SCHEMALESS`;
         return { tables, analyzers: {}, functions: {}, params: {}, users: {} };
       }
       case 'upsert':
@@ -1177,8 +1168,7 @@ export class SqliteCacheEngine implements LocalStore {
         await this.delete(tableOf(op.id), op.id);
         return pureWriteOpResult(op);
       case 'deleteAll':
-        await this.ensureTable(op.table);
-        await this.call('run', { sql: `DELETE FROM "${op.table}"` });
+        await this.deleteAllRows(op.table);
         return pureWriteOpResult(op);
       case 'let': {
         let result = await this.execOp(op.inner, scope, vars);
@@ -1203,12 +1193,37 @@ export class SqliteCacheEngine implements LocalStore {
     }
   }
 
+  // The three statements `execOp` needs beyond the verbs. Methods of their own
+  // so an engine that stores rows differently (`RowsCacheEngine`) answers them
+  // its own way.
+
+  protected async countRows(table: string, where?: WhereNode[]): Promise<number> {
+    await this.ensureTable(table);
+    const bind: unknown[] = [];
+    let sql = `SELECT COUNT(*) AS n FROM "${table}"`;
+    if (where && where.length > 0) sql += ` WHERE ${renderWhereSql(where, bind, {})}`;
+    const { rows } = await this.call<{ rows: { n: number }[] }>('exec', { sql, bind });
+    return rows?.[0]?.n ?? 0;
+  }
+
+  protected async listTables(): Promise<string[]> {
+    const { rows } = await this.call<{ rows: { name: string }[] }>('exec', {
+      sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    });
+    return (rows ?? []).map((r) => r.name);
+  }
+
+  protected async deleteAllRows(table: string): Promise<void> {
+    await this.ensureTable(table);
+    await this.call('run', { sql: `DELETE FROM "${table}"` });
+  }
+
   /**
    * Compile a pure-write op list to ONE worker `batch` (single SQLite
    * transaction). Ensures each touched table exists, then one statement per op.
    * Merges happen in-SQL via json_patch — no read-back round-trips.
    */
-  private async runWriteBatch(ops: SqlOp[]): Promise<void> {
+  protected async runWriteBatch(ops: SqlOp[]): Promise<void> {
     const stmts: { sql: string; bind?: unknown[] }[] = [];
     const tables = new Set<string>();
     const ensure = (t: string) => {
@@ -1254,7 +1269,7 @@ export class SqliteCacheEngine implements LocalStore {
     if (stmts.length > 0) await this.call('batch', stmts);
   }
 
-  private async rawSelectTable(
+  protected async rawSelectTable(
     table: string,
     where?: WhereNode[],
     orderBy?: OrderBy,
@@ -1369,7 +1384,7 @@ function getStats(): SqliteStats {
  * `stableKey` string (the exact value `scalar()` would bind on the main
  * thread), leave everything clone-representable untouched.
  */
-function toCloneSafe(v: unknown): unknown {
+export function toCloneSafe(v: unknown): unknown {
   if (v === null || typeof v !== 'object') return v;
   if (Array.isArray(v) || v instanceof Uint8Array || v instanceof Date) return v;
   const proto = Object.getPrototypeOf(v);
@@ -1377,7 +1392,7 @@ function toCloneSafe(v: unknown): unknown {
   return stableKey(v);
 }
 
-function normalizeWhereForClone(nodes: WhereNode[] | undefined): WhereNode[] | undefined {
+export function normalizeWhereForClone(nodes: WhereNode[] | undefined): WhereNode[] | undefined {
   if (!nodes) return nodes;
   return nodes.map((n) =>
     'or' in n
@@ -1396,7 +1411,7 @@ function normalizeRelationForClone(r: RelationPlan): RelationPlan {
 
 /** Normalize every baked value a plan carries (where trees, window ids) for
  *  the postMessage to the worker's `select` op. */
-function normalizePlanForClone(plan: QueryPlan): QueryPlan {
+export function normalizePlanForClone(plan: QueryPlan): QueryPlan {
   return {
     ...plan,
     ids: plan.ids?.map(stableKey),

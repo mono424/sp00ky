@@ -61,10 +61,18 @@ const versionDefinePlugin = {
 const workerUrlPlugin = {
   name: 'sp00ky-worker-url',
   transform(code: string) {
-    if (!code.includes('sqlite-worker.ts') && !code.includes('tabs-broker-worker.ts')) return null;
+    if (
+      !code.includes('sqlite-worker.ts') &&
+      !code.includes('rows-worker.ts') &&
+      !code.includes('tabs-broker-worker.ts')
+    ) {
+      return null;
+    }
     return code
       .split('sqlite-worker.ts')
       .join('sqlite-worker.js')
+      .split('rows-worker.ts')
+      .join('rows-worker.js')
       .split('tabs-broker-worker.ts')
       .join('tabs-broker-worker.js');
   },
@@ -81,6 +89,8 @@ export default defineConfig([
     index: 'src/index.ts',
     'otel/index': 'src/otel/index.ts',
     'sqlite-worker': 'src/services/database/sqlite-worker.ts',
+    // The row store's worker (`localEngine: 'rows'`), emitted the same way.
+    'rows-worker': 'src/services/database/rows-worker.ts',
     // The shared-tabs broker MUST stay a self-contained emit (no chunk
     // imports): bundlers cannot trace `new SharedWorker(url)` graphs, so a
     // relative chunk import would 404 in consumers. The source keeps zero

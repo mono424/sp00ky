@@ -28,6 +28,18 @@ impl std::ops::AddAssign for IndexBuildStats {
     }
 }
 
+/// One index a collection holds, as [`Collection::index_states`] reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexState {
+    pub def: IndexDef,
+    /// How long no graph has read it, once a release pass has seen that.
+    pub idle: Option<std::time::Duration>,
+    /// Entries it holds (a part-built index holds fewer than the table).
+    pub rows: usize,
+    /// See [`OrderedIndex::bytes`].
+    pub bytes: usize,
+}
+
 /// Rows a stepped index build reads between two checks of its time budget,
 /// and the least one step reads; see [`Collection::build_index_step`].
 pub const INDEX_STEP_ROWS: usize = 512;
@@ -352,6 +364,36 @@ impl Collection {
         let mut names: Vec<String> = self.indexes.lock().keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Every index this collection holds, built or part built, with how long
+    /// it has sat unread (`None` while a graph reads it, or until the next
+    /// release pass notices it is not read) and its approximate size.
+    pub fn index_states(&self, now: Instant) -> Vec<IndexState> {
+        let slots = self.indexes.lock();
+        let mut states: Vec<IndexState> = slots
+            .values()
+            .map(|index| IndexState {
+                def: index.def.clone(),
+                idle: index.idle_since.map(|since| now.saturating_duration_since(since)),
+                rows: index.len(),
+                bytes: index.bytes(),
+            })
+            .collect();
+        states.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+        states
+    }
+
+    /// Record that the index `name` has sat unread for `idle` already, so it
+    /// is released when its grace runs out, not a whole grace from now. A
+    /// restart that rebuilds what an earlier process held calls this, or
+    /// every restart would start each index's idle clock again and an
+    /// index nobody reads would never go on a project that deploys more
+    /// often than the grace.
+    pub fn set_index_idle_for(&self, name: &str, idle: std::time::Duration, now: Instant) {
+        if let Some(index) = self.indexes.lock().get_mut(name) {
+            index.idle_since = Some(now.checked_sub(idle).unwrap_or(now));
+        }
     }
 
     /// Approximate heap bytes held by built indexes.

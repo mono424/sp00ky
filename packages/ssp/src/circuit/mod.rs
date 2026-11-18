@@ -8,7 +8,7 @@ pub mod graph;
 pub mod view;
 pub mod circuit;
 
-pub use circuit::{Circuit, Reconciled, TableMeta, ViewDelta, SubqueryOp, SubqueryDeltaItem};
+pub use circuit::{Circuit, HeldIndex, PrebuildOutcome, Reconciled, TableMeta, ViewDelta, SubqueryOp, SubqueryDeltaItem};
 pub use circuit::{SizeReport, TableSize, ViewSize};
-pub use store::{Applied, Change, ChangeSet, IndexBuildStats, Record, Store, Operation};
+pub use store::{Applied, Change, ChangeSet, IndexBuildStats, IndexState, Record, Store, Operation};
 pub use view::{OutputFormat, View};

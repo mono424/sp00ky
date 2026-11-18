@@ -45,5 +45,7 @@ libc = "0.2"
 chrono = "0.4"
 
 [dev-dependencies]
+# Paused clock for timeout tests.
+tokio = { version = "1.0", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

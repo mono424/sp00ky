@@ -233,6 +233,41 @@ fn parse_index_idle_release(raw: Option<&str>) -> std::time::Duration {
         .unwrap_or(INDEX_IDLE_RELEASE)
 }
 
+/// One index a circuit holds, as [`Circuit::held_indexes`] reports it and an
+/// SSP records it for the process that replaces it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldIndex {
+    pub table: String,
+    pub name: String,
+    /// The definition's fields, in index order: a rebuild elsewhere skips an
+    /// index the schema has since redefined under the same name.
+    pub fields: Vec<String>,
+    /// Milliseconds since a view last read it; 0 while one does.
+    #[serde(default)]
+    pub idle_ms: u64,
+    /// Entries it held.
+    #[serde(default)]
+    pub rows: usize,
+    /// Approximate heap bytes (an upper bound, see `OrderedIndex::bytes`).
+    #[serde(default)]
+    pub bytes: usize,
+}
+
+/// What [`Circuit::prebuild_held_index`] did with one index.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PrebuildOutcome {
+    Built(IndexBuildStats),
+    /// It was built already, by a re-registered view or an earlier pass.
+    AlreadyBuilt,
+    /// The mirrored schema has no such index (or no such table) any more.
+    NotDefined,
+    /// The schema defines an index of that name over other fields now.
+    Redefined,
+    /// A step of [`Circuit::prebuild_held_index_step`] that left the index
+    /// part built: the work it did.
+    InProgress(IndexBuildStats),
+}
+
 /// One table's schema as the circuit uses it, read from upstream DDL: the
 /// select permission from `DEFINE TABLE`, the rest from `INFO FOR TABLE`.
 /// Applied with [`Circuit::set_table_meta`].
@@ -689,8 +724,9 @@ impl Circuit {
     }
 
     /// Drop the built indexes no registered graph reads any more (see
-    /// [`Collection::release_indexes`] for when).
-    fn release_unused_indexes(&mut self) {
+    /// [`Collection::release_indexes`] for when). Runs whenever a view goes
+    /// or the schema changes; a host may also call it on its own.
+    pub fn release_unused_indexes(&mut self) {
         let mut used: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
         for graph in self.graphs.values() {
             for (table, index) in graph.index_uses() {
@@ -723,6 +759,144 @@ impl Circuit {
             .map(|(table, coll)| (table.clone(), coll.built_indexes()))
             .filter(|(_, names)| !names.is_empty())
             .collect()
+    }
+
+    /// The idle grace this circuit releases indexes after (see
+    /// [`Self::set_index_idle_release`]).
+    pub fn index_idle_release(&self) -> std::time::Duration {
+        self.index_idle_release
+    }
+
+    /// The mirrored definition of `table`'s index `name`, if the schema has one.
+    pub fn index_def(&self, table: &str, name: &str) -> Option<&crate::circuit::index::IndexDef> {
+        self.index_defs.get(table)?.iter().find(|def| def.name == name)
+    }
+
+    /// Every index this circuit holds, with how long it has gone unread
+    /// (zero while a graph reads it) and its size: what the SSP records in
+    /// the database so the SSP that replaces it can rebuild the same ones
+    /// before it serves ([`Self::prebuild_held_index`]).
+    pub fn held_indexes(&self) -> Vec<HeldIndex> {
+        let in_use: std::collections::BTreeSet<(String, String)> =
+            self.graphs.values().flat_map(Graph::index_uses).collect();
+        let now = Instant::now();
+        let mut held = Vec::new();
+        for (table, coll) in &self.store.collections {
+            for state in coll.index_states(now) {
+                let used = in_use.contains(&(table.clone(), state.def.name.clone()));
+                held.push(HeldIndex {
+                    table: table.clone(),
+                    name: state.def.name,
+                    fields: state.def.fields,
+                    idle_ms: if used {
+                        0
+                    } else {
+                        state.idle.map_or(0, |idle| u64::try_from(idle.as_millis()).unwrap_or(u64::MAX))
+                    },
+                    rows: state.rows,
+                    bytes: state.bytes,
+                });
+            }
+        }
+        held.sort_by(|a, b| (&a.table, &a.name).cmp(&(&b.table, &b.name)));
+        held
+    }
+
+    /// Build one index another process held, if the schema this circuit
+    /// mirrors still defines it with the same fields. `idle` is how long it
+    /// had gone unread there: when no graph here reads it either, its idle
+    /// clock starts that far back, so it is released when its grace runs
+    /// out rather than a whole grace after every restart.
+    ///
+    /// One pass over the table, like a lookup's first build: the caller holds
+    /// the circuit (a read lock) for the build and frees it between indexes.
+    pub fn prebuild_held_index(
+        &self,
+        table: &str,
+        name: &str,
+        fields: &[String],
+        idle: std::time::Duration,
+    ) -> PrebuildOutcome {
+        let Some(def) = self.index_defs.get(table).and_then(|defs| defs.iter().find(|def| def.name == name)) else {
+            return PrebuildOutcome::NotDefined;
+        };
+        if def.fields != fields {
+            self.drop_stale_index(table, def);
+            return PrebuildOutcome::Redefined;
+        }
+        let Some(collection) = self.store.get_collection(table) else {
+            return PrebuildOutcome::NotDefined;
+        };
+        let stats = collection.prewarm_index(def);
+        self.carry_index_idle(table, name, idle);
+        if stats.indexes_built == 0 {
+            PrebuildOutcome::AlreadyBuilt
+        } else {
+            PrebuildOutcome::Built(stats)
+        }
+    }
+
+    /// [`Self::prebuild_held_index`] for about `budget` at a time, through
+    /// the same stepped build a registration runs
+    /// ([`Collection::build_index_step`]): a host that serves already calls
+    /// it in a loop, holding its read lock for one step, so writes and
+    /// registrations get in between. Both advance the one part-built index
+    /// in the collection, so a registration that needs the index meanwhile
+    /// finishes it rather than building it again, and whichever step reads
+    /// the last row reports the build. `InProgress` until the index is
+    /// complete; the idle age is carried over once it is.
+    pub fn prebuild_held_index_step(
+        &self,
+        table: &str,
+        name: &str,
+        fields: &[String],
+        idle: std::time::Duration,
+        budget: std::time::Duration,
+    ) -> PrebuildOutcome {
+        let Some(def) = self.index_defs.get(table).and_then(|defs| defs.iter().find(|def| def.name == name)) else {
+            return PrebuildOutcome::NotDefined;
+        };
+        if def.fields != fields {
+            self.drop_stale_index(table, def);
+            return PrebuildOutcome::Redefined;
+        }
+        let Some(collection) = self.store.get_collection(table) else {
+            return PrebuildOutcome::NotDefined;
+        };
+        let (done, stats) = collection.build_index_step(def, budget);
+        if !done {
+            return PrebuildOutcome::InProgress(stats);
+        }
+        self.carry_index_idle(table, name, idle);
+        if stats.indexes_built == 0 && stats.rows_indexed == 0 {
+            PrebuildOutcome::AlreadyBuilt
+        } else {
+            PrebuildOutcome::Built(stats)
+        }
+    }
+
+    /// The schema redefined an index this circuit may have started building
+    /// to the old definition (a stepped prebuild, say): drop that.
+    fn drop_stale_index(&self, table: &str, current: &crate::circuit::index::IndexDef) {
+        if let Some(collection) = self.store.get_collection(table) {
+            collection.drop_stale_index(current);
+        }
+    }
+
+    /// Start the idle clock of an index this circuit rebuilt for another
+    /// process (or left part built) `idle` back, unless a graph here reads
+    /// it. A zero `idle` (age unknown, as the warm restart's `indexes.json`
+    /// has it) starts it now: an index no view reads must be idle, or every
+    /// record would list it as in use and it would never be released.
+    pub fn carry_index_idle(&self, table: &str, name: &str, idle: std::time::Duration) {
+        let read_here = self.graphs.values().any(|graph| {
+            graph.index_uses().iter().any(|(t, n)| t == table && n == name)
+        });
+        if !read_here {
+            if let Some(collection) = self.store.get_collection(table) {
+                collection.set_index_idle_for(name, idle, Instant::now());
+            }
+        }
     }
 
     /// Build the named indexes the schema still defines and return how many
@@ -5967,6 +6141,74 @@ mod index_tests {
         eprintln!("stepped: {steps} steps, longest {longest:?} held, {:?} in all", t.elapsed());
     }
 
+    /// WhitePawn scale: what a replacement SSP spends rebuilding the indexes
+    /// its predecessor held on a 750k-row `game` table, against the stepped
+    /// build a registration runs when the index is not there.
+    /// `cargo test --release -p ssp --lib index_prebuild_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn index_prebuild_scale() {
+        use std::time::Duration;
+        let indexes = vec![
+            def("game_white", &["white", "date"]),
+            def("game_black", &["black", "date"]),
+            def("game_owner_source", &["owner", "source"]),
+        ];
+        let build = || {
+            let mut c = Circuit::new();
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(indexes.clone()));
+            for i in 0..750_000u64 {
+                let source = ["lichess", "chesscom", "pgn"][(i % 3) as usize];
+                c.store.apply_change(&Change::create(
+                    "game",
+                    &format!("{:026}", i * 7_919 % 1_000_003),
+                    json!({
+                        "white": format!("user:{:020}", i * 31 % 50_000),
+                        "black": format!("user:{:020}", i * 17 % 50_000),
+                        "owner": format!("user:{:020}", i % 2_000),
+                        "source": source,
+                        "date": format!("2026-{:02}-{:02}T{:02}:00:00Z", 1 + i % 12, 1 + i % 28, i % 24),
+                        "event": "Casual game", "result": "1-0", "moves": "e4 e5 Nf3 Nc6 Bb5 a6",
+                    }),
+                ));
+            }
+            c
+        };
+        let rss_mb = || {
+            let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0
+        };
+        let t = Instant::now();
+        let replacement = build();
+        eprintln!("loaded 750k rows in {:?}", t.elapsed());
+        let base = rss_mb();
+        let t = Instant::now();
+        for index in &indexes {
+            let t1 = Instant::now();
+            let outcome = replacement.prebuild_held_index("game", &index.name, &index.fields, Duration::ZERO);
+            assert!(matches!(outcome, PrebuildOutcome::Built(_)), "{outcome:?}");
+            eprintln!("prebuild {}: {:?}", index.name, t1.elapsed());
+        }
+        eprintln!("prebuild all three: {:?}, rss +{:.0} MB", t.elapsed(), rss_mb() - base);
+        for held in replacement.held_indexes() {
+            eprintln!("  {} rows {} recorded {:.0} MB", held.name, held.rows, held.bytes as f64 / 1048576.0);
+        }
+        drop(replacement);
+
+        // What a registration pays instead, a 25 ms step at a time.
+        let lazy = build();
+        let collection = lazy.store.get_collection("game").unwrap();
+        for index in &indexes {
+            let t1 = Instant::now();
+            let mut steps = 0;
+            while !collection.build_index_step(index, Duration::from_millis(25)).0 {
+                steps += 1;
+            }
+            eprintln!("stepped {}: {:?} over {steps} steps", index.name, t1.elapsed());
+        }
+    }
+
     /// Customer scale: 1M games, 422k of them in one database, a scroll of
     /// windowed registrations over it. `cargo test --release -p ssp --lib
     /// index_scale -- --ignored --nocapture`.
@@ -6217,5 +6459,208 @@ mod index_tests {
         let held = BTreeMap::from([("game".to_string(), vec!["game_database_sort".to_string(), "gone".to_string()])]);
         assert_eq!(circuit.prebuild_indexes(&held).indexes_built, 1);
         assert_eq!(circuit.prebuild_indexes(&held).indexes_built, 0);
+    }
+
+    #[test]
+    fn held_indexes_carry_their_idle_age_to_the_circuit_that_rebuilds_them() {
+        use std::time::Duration;
+        let make = || {
+            let mut c = Circuit::new();
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(game_indexes()));
+            for i in 0..20 {
+                c.store.apply_change(&Change::create(
+                    "game",
+                    &format!("g{i}"),
+                    json!({ "database": "game_database:d1", "sort_index": i }),
+                ));
+            }
+            c
+        };
+        let (id, plan, params, _) = views().into_iter().next().unwrap();
+        let register = |c: &mut Circuit| {
+            c.add_query_with_auth(QueryPlan { id: id.into(), root: plan.clone() }, Some(params.clone()), None, String::new())
+        };
+
+        let mut first = make();
+        assert!(first.held_indexes().is_empty());
+        register(&mut first);
+        let held = first.held_indexes();
+        assert_eq!(held.len(), 1, "{held:?}");
+        let index = &held[0];
+        assert_eq!((index.table.as_str(), index.name.as_str()), ("game", "game_database_sort"));
+        assert_eq!(index.fields, vec!["database".to_string(), "sort_index".to_string()]);
+        assert_eq!((index.idle_ms, index.rows), (0, 20), "read by a view: not idle");
+        assert!(index.bytes > 0);
+        first.remove_query(id);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(first.held_indexes()[0].idle_ms >= 5, "idle since its last view went");
+
+        // Another circuit over the same rows and schema rebuilds it, once.
+        let ten_minutes = Duration::from_secs(600);
+        let mut second = make();
+        let built = second.prebuild_held_index("game", &index.name, &index.fields, ten_minutes);
+        assert!(matches!(built, PrebuildOutcome::Built(stats) if stats.indexes_built == 1 && stats.rows_indexed == 20), "{built:?}");
+        assert_eq!(second.prebuild_held_index("game", &index.name, &index.fields, ten_minutes), PrebuildOutcome::AlreadyBuilt);
+        assert_eq!(second.prebuild_held_index("game", "gone", &index.fields, ten_minutes), PrebuildOutcome::NotDefined);
+        assert_eq!(second.prebuild_held_index("other", &index.name, &index.fields, ten_minutes), PrebuildOutcome::NotDefined);
+        assert_eq!(
+            second.prebuild_held_index("game", &index.name, &["database".to_string()], ten_minutes),
+            PrebuildOutcome::Redefined
+        );
+        assert!(second.held_indexes()[0].idle_ms >= 600_000, "the idle clock started ten minutes back");
+        // Unread here too, so it goes when the grace runs out counting the
+        // ten minutes it had already sat, not a whole grace from the rebuild.
+        second.set_index_idle_release(Duration::from_secs(900));
+        second.release_unused_indexes();
+        assert_eq!(second.built_indexes()["game"], vec!["game_database_sort".to_string()]);
+        second.set_index_idle_release(Duration::from_secs(300));
+        second.release_unused_indexes();
+        assert!(second.built_indexes().is_empty(), "ten minutes idle is past a five minute grace");
+
+        // A view here reads it: its clock is not backdated.
+        let mut third = make();
+        register(&mut third);
+        assert_eq!(third.prebuild_held_index("game", &index.name, &index.fields, ten_minutes), PrebuildOutcome::AlreadyBuilt);
+        assert_eq!(third.held_indexes()[0].idle_ms, 0);
+        third.set_index_idle_release(Duration::from_secs(300));
+        third.remove_query(id);
+        assert_eq!(third.built_indexes()["game"], vec!["game_database_sort".to_string()], "idle from now");
+    }
+
+    #[test]
+    fn an_index_rebuilt_with_no_known_age_is_idle_from_then_unless_read() {
+        use std::time::Duration;
+        let make = || {
+            let mut c = Circuit::new();
+            c.store.ensure_collection("game");
+            c.set_table_meta("game", meta(game_indexes()));
+            for i in 0..20 {
+                c.store.apply_change(&Change::create("game", &format!("g{i}"), json!({ "database": "game_database:d1", "sort_index": i })));
+            }
+            c
+        };
+        let fields = vec!["database".to_string(), "sort_index".to_string()];
+        // The warm restart's indexes.json has no age: zero.
+        let c = make();
+        assert!(matches!(c.prebuild_held_index("game", "game_database_sort", &fields, Duration::ZERO), PrebuildOutcome::Built(_)));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(c.held_indexes()[0].idle_ms >= 5, "no view reads it: idle, not in use");
+
+        // A running clock keeps its age against an unknown one and an older
+        // one; a more recent read elsewhere wins.
+        let c = make();
+        c.prebuild_held_index("game", "game_database_sort", &fields, Duration::from_secs(600));
+        c.carry_index_idle("game", "game_database_sort", Duration::ZERO);
+        assert!(c.held_indexes()[0].idle_ms >= 600_000);
+        c.carry_index_idle("game", "game_database_sort", Duration::from_secs(900));
+        assert!((600_000..900_000).contains(&c.held_indexes()[0].idle_ms));
+        c.carry_index_idle("game", "game_database_sort", Duration::from_secs(60));
+        assert!((60_000..600_000).contains(&c.held_indexes()[0].idle_ms));
+    }
+
+    /// A host up for less time than the age it carries cannot set its
+    /// monotonic clock back that far: the age is kept all the same, so the
+    /// index goes when its grace runs out, not a whole grace later.
+    #[test]
+    fn an_idle_age_older_than_the_clock_is_kept() {
+        use std::time::Duration;
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        c.store.apply_change(&Change::create("game", "g1", json!({ "database": "game_database:d1", "sort_index": 1 })));
+        let fields = vec!["database".to_string(), "sort_index".to_string()];
+        // Past the range of every platform's monotonic clock (on Unix it may
+        // go below zero; Windows and a browser's cannot).
+        let ages = Duration::from_secs(u64::MAX / 2 + u64::MAX / 4);
+        assert!(Instant::now().checked_sub(ages).is_none(), "older than any monotonic clock");
+        c.prebuild_held_index("game", "game_database_sort", &fields, ages);
+        assert_eq!(c.held_indexes()[0].idle_ms, u64::MAX, "reported, saturated");
+        c.set_index_idle_release(ages + Duration::from_secs(86_400));
+        c.release_unused_indexes();
+        assert!(!c.built_indexes().is_empty(), "within its grace");
+        c.set_index_idle_release(ages / 2);
+        c.release_unused_indexes();
+        assert!(c.built_indexes().is_empty(), "past its grace");
+    }
+
+    #[test]
+    fn an_index_redefined_mid_build_drops_the_stale_part() {
+        use std::time::Duration;
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        for i in 0..3_000 {
+            c.store.apply_change(&Change::create("game", &format!("g{i}"), json!({ "database": "game_database:d1", "sort_index": i, "white": "a" })));
+        }
+        let old_fields = vec!["database".to_string(), "sort_index".to_string()];
+        let step = |c: &Circuit| c.prebuild_held_index_step("game", "game_database_sort", &old_fields, Duration::ZERO, Duration::ZERO);
+        assert!(matches!(step(&c), PrebuildOutcome::InProgress(_)));
+        assert_eq!(c.built_indexes()["game"], vec!["game_database_sort".to_string()], "part built");
+
+        // DEFINE INDEX OVERWRITE upstream: same name, other fields.
+        let mut redefined = game_indexes();
+        redefined.retain(|d| d.name != "game_database_sort");
+        redefined.push(def("game_database_sort", &["database", "white"]));
+        c.set_table_meta("game", meta(redefined.clone()));
+        assert_eq!(c.built_indexes()["game"], vec!["game_database_sort".to_string()], "the release pass keeps a defined name");
+        assert_eq!(step(&c), PrebuildOutcome::Redefined);
+        assert!(c.built_indexes().is_empty(), "the stale part went");
+
+        // An index built to the current definition stays.
+        let current = redefined.iter().find(|d| d.name == "game_database_sort").unwrap().clone();
+        c.store.get_collection("game").unwrap().prewarm_index(&current);
+        assert_eq!(step(&c), PrebuildOutcome::Redefined);
+        assert_eq!(c.built_indexes()["game"], vec!["game_database_sort".to_string()]);
+    }
+
+    #[test]
+    fn a_stepped_prebuild_and_a_registration_share_one_build() {
+        use std::time::Duration;
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        for i in 0..3_000 {
+            c.store.apply_change(&Change::create(
+                "game",
+                &format!("g{i:05}"),
+                json!({ "database": "game_database:d1", "sort_index": i }),
+            ));
+        }
+        let (id, plan, params, _) = views().into_iter().next().unwrap();
+        let plan = QueryPlan { id: id.into(), root: plan };
+        let fields = vec!["database".to_string(), "sort_index".to_string()];
+        let idle = Duration::from_secs(60);
+
+        // A background prebuild and a registration's prewarm take turns on
+        // the same index, one 512-row step each.
+        let (mut background, mut registration) = (IndexBuildStats::default(), IndexBuildStats::default());
+        let mut finished_by = None;
+        for turn in 0.. {
+            if turn % 2 == 0 {
+                match c.prebuild_held_index_step("game", "game_database_sort", &fields, idle, Duration::ZERO) {
+                    PrebuildOutcome::InProgress(stats) => background += stats,
+                    PrebuildOutcome::Built(stats) => { background += stats; finished_by = Some("background"); break }
+                    other => panic!("{other:?}"),
+                }
+            } else {
+                let (done, stats) = c.prewarm_query_indexes_step(&plan, Some(&params), Duration::ZERO);
+                registration += stats;
+                if done { finished_by = Some("registration"); break }
+            }
+        }
+        assert!(background.rows_indexed > 0 && registration.rows_indexed > 0, "both took turns");
+        assert_eq!(background.rows_indexed + registration.rows_indexed, 3_000, "every row read once between them");
+        assert_eq!(background.indexes_built + registration.indexes_built, 1, "one build, by {finished_by:?}");
+        // The loser of the race sees it done; the view registers without a build.
+        assert_eq!(
+            c.prebuild_held_index_step("game", "game_database_sort", &fields, idle, Duration::ZERO),
+            PrebuildOutcome::AlreadyBuilt
+        );
+        assert!(c.held_indexes()[0].idle_ms >= 60_000, "unread here: the idle age carried over");
+        let (_, timings) = c.add_query_with_auth_timed(plan, Some(params), None, String::new());
+        assert_eq!(timings.indexes_built, 0);
+        assert_eq!(c.held_indexes()[0].rows, 3_000);
+        assert_eq!(c.held_indexes()[0].idle_ms, 0, "read now");
     }
 }

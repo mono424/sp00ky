@@ -136,8 +136,12 @@ pub struct OrderedIndex {
     /// Heap the entries point at; see [`Self::bytes`].
     heap: usize,
     /// Since when no graph has read this index; see
-    /// [`super::store::Collection::release_indexes`].
+    /// [`super::store::Collection::release_indexes`]. Read through
+    /// [`Self::idle_for`].
     pub(crate) idle_since: Option<web_time::Instant>,
+    /// Idle time from before `idle_since` that the monotonic clock could not
+    /// be set back by (a host up for less than the age being carried).
+    idle_carry: std::time::Duration,
     /// While the index is built step by step: the ids of the rows it has not
     /// read yet. `None` once it holds every row.
     ///
@@ -164,7 +168,33 @@ fn entry_heap(key: &IndexKey, row: &RowKey) -> usize {
 impl OrderedIndex {
     pub(crate) fn new(def: IndexDef) -> Self {
         let paths = def.paths();
-        Self { def, paths, entries: BTreeSet::new(), heap: 0, idle_since: None, pending: None }
+        Self {
+            def,
+            paths,
+            entries: BTreeSet::new(),
+            heap: 0,
+            idle_since: None,
+            idle_carry: std::time::Duration::ZERO,
+            pending: None,
+        }
+    }
+
+    /// How long no graph has read it, once its idle clock runs.
+    pub(crate) fn idle_for(&self, now: web_time::Instant) -> Option<std::time::Duration> {
+        self.idle_since.map(|since| now.saturating_duration_since(since).saturating_add(self.idle_carry))
+    }
+
+    /// Start its idle clock as if it had gone unread for `idle` already.
+    pub(crate) fn set_idle(&mut self, now: web_time::Instant, idle: std::time::Duration) {
+        match now.checked_sub(idle) {
+            Some(since) => (self.idle_since, self.idle_carry) = (Some(since), std::time::Duration::ZERO),
+            None => (self.idle_since, self.idle_carry) = (Some(now), idle),
+        }
+    }
+
+    /// A graph reads it: stop its idle clock.
+    pub(crate) fn clear_idle(&mut self) {
+        (self.idle_since, self.idle_carry) = (None, std::time::Duration::ZERO);
     }
 
     /// Whether the index holds every row, so a lookup may read it.

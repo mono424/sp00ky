@@ -28,6 +28,18 @@ impl std::ops::AddAssign for IndexBuildStats {
     }
 }
 
+/// One index a collection holds, as [`Collection::index_states`] reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexState {
+    pub def: IndexDef,
+    /// How long no graph has read it, once a release pass has seen that.
+    pub idle: Option<std::time::Duration>,
+    /// Entries it holds (a part-built index holds fewer than the table).
+    pub rows: usize,
+    /// See [`OrderedIndex::bytes`].
+    pub bytes: usize,
+}
+
 /// Rows a stepped index build reads between two checks of its time budget,
 /// and the least one step reads; see [`Collection::build_index_step`].
 pub const INDEX_STEP_ROWS: usize = 512;
@@ -231,7 +243,7 @@ impl Collection {
             fresh.pending = Some(self.rows.keys().map(SmolStr::new).collect());
             fresh
         });
-        index.idle_since = None;
+        index.clear_idle();
         let mut stats = IndexBuildStats::default();
         if index.is_complete() {
             return (true, stats);
@@ -331,14 +343,16 @@ impl Collection {
     ) {
         self.indexes.get_mut().retain(|name, index| {
             if used.contains(name) {
-                index.idle_since = None;
+                index.clear_idle();
                 return true;
             }
             if !defined.contains(name) {
                 return false;
             }
-            let since = *index.idle_since.get_or_insert(now);
-            now.duration_since(since) < grace
+            if index.idle_since.is_none() {
+                index.set_idle(now, std::time::Duration::ZERO);
+            }
+            index.idle_for(now).unwrap_or_default() < grace
         });
     }
 
@@ -352,6 +366,56 @@ impl Collection {
         let mut names: Vec<String> = self.indexes.lock().keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Every index this collection holds, built or part built, with how long
+    /// it has sat unread (`None` while a graph reads it, or until the next
+    /// release pass notices it is not read) and its approximate size.
+    pub fn index_states(&self, now: Instant) -> Vec<IndexState> {
+        let slots = self.indexes.lock();
+        let mut states: Vec<IndexState> = slots
+            .values()
+            .map(|index| IndexState {
+                def: index.def.clone(),
+                idle: index.idle_for(now),
+                rows: index.len(),
+                bytes: index.bytes(),
+            })
+            .collect();
+        states.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+        states
+    }
+
+    /// Record that the index `name` has sat unread for `idle` already, so it
+    /// is released when its grace runs out, not a whole grace from now. A
+    /// restart that rebuilds what an earlier process held calls this, or
+    /// every restart would start each index's idle clock again and an
+    /// index nobody reads would never go on a project that deploys more
+    /// often than the grace.
+    ///
+    /// A clock already running that says the index was read more recently
+    /// stays, and a zero `idle` (age unknown) only starts a clock that is
+    /// not running.
+    pub fn set_index_idle_for(&self, name: &str, idle: std::time::Duration, now: Instant) {
+        if let Some(index) = self.indexes.lock().get_mut(name) {
+            if index.idle_for(now).is_some_and(|running| running <= idle || idle.is_zero()) {
+                return;
+            }
+            index.set_idle(now, idle);
+        }
+    }
+
+    /// Drop the index this collection holds under `current`'s name if it was
+    /// built (or is part built) to another definition. Returns whether it
+    /// dropped one. A lookup over `current` would replace it anyway; until
+    /// then every write keeps it in step for nothing.
+    pub fn drop_stale_index(&self, current: &IndexDef) -> bool {
+        let mut slots = self.indexes.lock();
+        if slots.get(&current.name).is_some_and(|held| held.def != *current) {
+            slots.remove(&current.name);
+            return true;
+        }
+        false
     }
 
     /// Approximate heap bytes held by built indexes.

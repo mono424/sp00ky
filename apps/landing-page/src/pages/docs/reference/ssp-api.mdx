@@ -978,28 +978,42 @@ Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.
 - The same path runs **in place** when the scheduler forgets the SSP (a
   scheduler restart) or asks for a resync: the rows already in memory are the
   starting point and the process never exits.
-- **Secondary indexes are rebuilt before Ready, in both modes.** A serving SSP
+- **Secondary indexes are rebuilt after a restart, in both modes.** A serving SSP
   records which indexes it holds, how long each has gone unread and its size
   in the private `_00_sync_evidence:⟨ssp_indexes:<ssp id>⟩` record: checked
   every minute, written when that changed (and at least every ten minutes),
   and once more on graceful shutdown. A standby or retired SSP writes nothing,
-  and a record not written for seven days is deleted. A starting SSP reads
-  every such record after its bootstrap and, before it reports Ready (a
-  blue/green standby while its predecessor still serves), builds the indexes
-  the mirrored schema still defines with the same fields and that were read
-  within `SPKY_SSP_INDEX_IDLE_RELEASE_SECS`, most recently read first, until
+  and a record not written for seven days is deleted. After its bootstrap a
+  starting SSP reads every such record and builds the indexes the mirrored
+  schema still defines with the same fields and that were read within
+  `SPKY_SSP_INDEX_IDLE_RELEASE_SECS`, most recently read first, until
   `SPKY_SSP_INDEX_PREBUILD_SECS` (default 60) runs out and within
   `SPKY_SSP_INDEX_PREBUILD_MAX_MB` (default: as much as the largest earlier
   SSP held). Each index keeps the idle age it had, so it is freed when its
-  grace runs out rather than a whole grace after every deploy. One build at a
-  time, under a circuit read lock that is freed between builds.
-  `Rebuilt the indexes the SSPs before this one held` carries `built`,
-  `already_built` (built by a re-registered view), `skipped`, `rows_indexed`
-  and `ms`; `Left indexes to build on first use` names each skipped index with
-  its reason (`idle_past_grace`, `memory_budget`, `time_budget`,
-  `not_defined`, `redefined`). Anything not built here is built by the first
-  registration that needs it, as before. With no record to go by, a warm
-  restart falls back to the `indexes.json` the row checkpoint writes.
+  grace runs out rather than a whole grace after every deploy.
+  - A blue/green standby does this before it reports Ready, while its
+    predecessor still serves: one build at a time, each in one pass under a
+    circuit read lock that is freed between builds.
+  - Any other SSP (a restart without a handover, standalone mode) reports
+    Ready first and does it in the background, the database read included,
+    so no restart waits for it. Each index is built 25 ms at a time, the read
+    lock freed between steps, so ingest and registrations keep flowing. A
+    registration that needs an index the background is building advances
+    the same part-built index, so between them every row is read once. It
+    stops between two steps when the SSP stops serving (shutdown,
+    re-bootstrap); a part-built index is finished by the next registration
+    that needs it.
+
+  `Rebuilt the indexes the SSPs before this one held` carries `mode`
+  (`before_ready` or `background`), `source` (`database` or `local`),
+  `built`, `already_built` (built by a re-registered view), `skipped`,
+  `rows_indexed` and `ms`; `Left indexes to build on first use` names each
+  skipped index with its reason (`idle_past_grace`, `memory_budget`,
+  `time_budget`, `stopped`, `not_defined`, `redefined`). Anything not built
+  here is built by the first registration that needs it, as before. With no
+  record to go by, a warm restart falls back to the `indexes.json` the row
+  checkpoint writes, by the same rule (before Ready for a standby, in the
+  background otherwise) and with no time limit, as before.
 - Standalone mode keeps nothing but the arena across restarts: every start
   rebuilds from SurrealDB. Without a scheduler there is no content hash to
   verify a checkpoint against, and listing a table's ids to reconcile one

@@ -828,9 +828,12 @@ plus per-status backend counts.</p>
 <p>SurrealDB and the scheduler’s replica are always the durable source of truth.
 Anything the SSP keeps on disk is a cache that exists to make a restart cheaper.</p>
 <ul>
-<li>On a cold start the SSP <strong>self-bootstraps</strong> by paging every synced table
-through the scheduler’s <code>POST /proxy/query</code> endpoint into its circuit.</li>
-<li><strong>Cluster mode keeps its rows.</strong> With <code>SPKY_SSP_SNAPSHOT_DIR</code> set to a
+<li>
+<p>On a cold start the SSP <strong>self-bootstraps</strong> by paging every synced table
+through the scheduler’s <code>POST /proxy/query</code> endpoint into its circuit.</p>
+</li>
+<li>
+<p><strong>Cluster mode keeps its rows.</strong> With <code>SPKY_SSP_SNAPSHOT_DIR</code> set to a
 writable directory, each table’s rows go to <code>&lt;dir&gt;/rows/</code>: a base image
 <code>&lt;table&gt;.rows</code> (a binary copy of the encoded rows, each row’s head, that is
 its digest, version, id and body pointer, in one region and the bodies in
@@ -845,8 +848,10 @@ first), two minutes after every bootstrap or promotion, and every
 tables whose content changed since they were last written are written at
 all, one table at a time, and a delta costs the churn rather than the
 table. <code>Row checkpoint written</code> carries <code>full</code>, <code>deltas</code>, <code>tombstones</code>,
-<code>bytes</code>, <code>encode_ms</code> and <code>fsync_ms</code>.</li>
-<li><strong>On boot the rows are loaded before the SSP registers, then verified.</strong>
+<code>bytes</code>, <code>encode_ms</code> and <code>fsync_ms</code>.</p>
+</li>
+<li>
+<p><strong>On boot the rows are loaded before the SSP registers, then verified.</strong>
 A checkpoint file is not read whole: its heads are read and checked against
 their hash (about 75 bytes a row), the file is mapped read-only as the
 table’s row arena (or adopted into memory where there is no file-backed
@@ -883,27 +888,80 @@ result, so a stale or corrupt checkpoint costs time, never correctness.
 What changed with the lazy verification: until the pass reaches a file, a
 flipped body byte could be served; the scheduler’s hash check cannot catch
 it, since the hash is folded from the digests in the heads. The exposure
-is seconds, and <code>load</code> restores the old guarantee at the old cost.</li>
-<li>Files written before the split layout (sp00ky before canary.303) are
+is seconds, and <code>load</code> restores the old guarantee at the old cost.</p>
+</li>
+<li>
+<p>Files written before the split layout (sp00ky before canary.303) are
 converted at load, which costs what loading them used to, and rewritten
 whole at the next write. A build from before it refuses the new files and
-pages the table instead.</li>
-<li>The same path runs <strong>in place</strong> when the scheduler forgets the SSP (a
+pages the table instead.</p>
+</li>
+<li>
+<p>The same path runs <strong>in place</strong> when the scheduler forgets the SSP (a
 scheduler restart) or asks for a resync: the rows already in memory are the
-starting point and the process never exits.</li>
-<li>Standalone mode keeps nothing but the arena across restarts: every start
+starting point and the process never exits.</p>
+</li>
+<li>
+<p><strong>Secondary indexes are rebuilt after a restart, in both modes.</strong> A serving SSP
+records which indexes it holds, how long each has gone unread and its size
+in the private <code>_00_sync_evidence:⟨ssp_indexes:&lt;ssp id&gt;⟩</code> record: checked
+every minute, written when that changed (and at least every ten minutes),
+and once more on graceful shutdown. A standby or retired SSP writes nothing,
+and a record not written for seven days is deleted. After its bootstrap a
+starting SSP reads every such record (giving up after five seconds) and builds the indexes the mirrored
+schema still defines with the same fields and that were read within
+<code>SPKY_SSP_INDEX_IDLE_RELEASE_SECS</code>, until <code>SPKY_SSP_INDEX_PREBUILD_SECS</code>
+(default 60, a soft limit checked before each index: the build under way
+finishes) runs out and within <code>SPKY_SSP_INDEX_PREBUILD_MAX_MB</code> (default:
+as much as the largest earlier SSP held). Its own line goes first (records
+written by itself, by the SSP it replaces, or by an SSP of the same <code>ssp-N</code>
+slot), most recently read first; other SSPs’ records only fill what is
+left of the memory budget. Each index keeps the idle age it had, so it is freed when its
+grace runs out rather than a whole grace after every deploy.</p>
+<ul>
+<li>A blue/green standby does this before it reports Ready, while its
+predecessor still serves: one build at a time, each in one pass under a
+circuit read lock that is freed between builds.</li>
+<li>Any other SSP (a restart without a handover, standalone mode) reports
+Ready first and does it in the background, the database read included,
+so no restart waits for it. Each index is built 25 ms at a time, the read
+lock freed between steps, so ingest and registrations keep flowing. A
+registration that needs an index the background is building advances
+the same part-built index, so between them every row is read once. It
+stops between two steps when the SSP stops serving (shutdown,
+re-bootstrap); a part-built index is finished by the next registration
+that needs it.</li>
+</ul>
+<p><code>Rebuilt the indexes the SSPs before this one held</code> carries <code>mode</code>
+(<code>before_ready</code> or <code>background</code>), <code>source</code> (<code>database</code> or <code>local</code>),
+<code>built</code>, <code>already_built</code> (built by a re-registered view), <code>skipped</code>,
+<code>rows_indexed</code> and <code>ms</code>; <code>Left indexes to build on first use</code> names each
+skipped index with its reason (<code>idle_past_grace</code>, <code>memory_budget</code>,
+<code>time_budget</code>, <code>stopped</code>, <code>not_defined</code>, <code>redefined</code>). Anything not built
+here is built by the first registration that needs it, as before. With no
+record to go by, a warm restart falls back to the <code>indexes.json</code> the row
+checkpoint writes, by the same rule (before Ready for a standby, in the
+background otherwise) and with no time limit, as before.</p>
+</li>
+<li>
+<p>Standalone mode keeps nothing but the arena across restarts: every start
 rebuilds from SurrealDB. Without a scheduler there is no content hash to
 verify a checkpoint against, and listing a table’s ids to reconcile one
 costs as much as the rebuild. Row bytes live in a sparse-file arena at
-<code>SPKY_SSP_ARENA_DIR</code> in both modes.</li>
-<li>With the directory unset or not writable, the SSP logs it once and runs
-memory-only: every start is a full rebuild.</li>
-<li>Sp00ky Cloud sets the snapshot and arena directories on a volume that
+<code>SPKY_SSP_ARENA_DIR</code> in both modes.</p>
+</li>
+<li>
+<p>With the directory unset or not writable, the SSP logs it once and runs
+memory-only: every start is a full rebuild.</p>
+</li>
+<li>
+<p>Sp00ky Cloud sets the snapshot and arena directories on a volume that
 survives a container recreate, and stops an SSP with SIGTERM and a grace
 period, so a cloud SSP restarts warm. A
 <a href="/docs/reference/admin-dashboard#restarting-an-ssp">clean restart</a> from the
 dashboard deletes these files, which is what forces the cold rebuild it
-promises.</li>
+promises.</p>
+</li>
 </ul>
 <h3 id="memory-management">Memory Management</h3>
 <ul>

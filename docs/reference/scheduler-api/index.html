@@ -896,7 +896,9 @@ It returns <code>samples</code> newest first, <code>total</code> after filtering
 An unavailable upstream database returns <code>503</code>; invalid kinds return <code>400</code>.</p>
 <p>The private <code>_00_sync_evidence:slow_operations</code> record retains the newest 100
 recorded successful registration and ingest requests taking at least 250 ms
-across SSP/scheduler restarts and view TTL cleanup.
+across SSP/scheduler restarts and view TTL cleanup. The same table holds one
+<code>ssp_indexes</code> record per SSP, the indexes it holds, which the SSP that replaces
+it rebuilds before Ready (see <a href="/docs/reference/ssp-api#state-persistence">State persistence</a>).
 Recording is best effort: at most four evidence writes run concurrently per
 process; excess requests increment <code>ssp_slow_evidence_dropped_total</code> and do not
 wait or spawn another writer. Samples contain

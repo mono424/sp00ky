@@ -817,6 +817,7 @@ impl Circuit {
             return PrebuildOutcome::NotDefined;
         };
         if def.fields != fields {
+            self.drop_stale_index(table, def);
             return PrebuildOutcome::Redefined;
         }
         let Some(collection) = self.store.get_collection(table) else {
@@ -852,6 +853,7 @@ impl Circuit {
             return PrebuildOutcome::NotDefined;
         };
         if def.fields != fields {
+            self.drop_stale_index(table, def);
             return PrebuildOutcome::Redefined;
         }
         let Some(collection) = self.store.get_collection(table) else {
@@ -866,6 +868,14 @@ impl Circuit {
             PrebuildOutcome::AlreadyBuilt
         } else {
             PrebuildOutcome::Built(stats)
+        }
+    }
+
+    /// The schema redefined an index this circuit may have started building
+    /// to the old definition (a stepped prebuild, say): drop that.
+    fn drop_stale_index(&self, table: &str, current: &crate::circuit::index::IndexDef) {
+        if let Some(collection) = self.store.get_collection(table) {
+            collection.drop_stale_index(current);
         }
     }
 
@@ -6543,6 +6553,36 @@ mod index_tests {
         assert!((600_000..900_000).contains(&c.held_indexes()[0].idle_ms));
         c.carry_index_idle("game", "game_database_sort", Duration::from_secs(60));
         assert!((60_000..600_000).contains(&c.held_indexes()[0].idle_ms));
+    }
+
+    #[test]
+    fn an_index_redefined_mid_build_drops_the_stale_part() {
+        use std::time::Duration;
+        let mut c = Circuit::new();
+        c.store.ensure_collection("game");
+        c.set_table_meta("game", meta(game_indexes()));
+        for i in 0..3_000 {
+            c.store.apply_change(&Change::create("game", &format!("g{i}"), json!({ "database": "game_database:d1", "sort_index": i, "white": "a" })));
+        }
+        let old_fields = vec!["database".to_string(), "sort_index".to_string()];
+        let step = |c: &Circuit| c.prebuild_held_index_step("game", "game_database_sort", &old_fields, Duration::ZERO, Duration::ZERO);
+        assert!(matches!(step(&c), PrebuildOutcome::InProgress(_)));
+        assert_eq!(c.built_indexes()["game"], vec!["game_database_sort".to_string()], "part built");
+
+        // DEFINE INDEX OVERWRITE upstream: same name, other fields.
+        let mut redefined = game_indexes();
+        redefined.retain(|d| d.name != "game_database_sort");
+        redefined.push(def("game_database_sort", &["database", "white"]));
+        c.set_table_meta("game", meta(redefined.clone()));
+        assert_eq!(c.built_indexes()["game"], vec!["game_database_sort".to_string()], "the release pass keeps a defined name");
+        assert_eq!(step(&c), PrebuildOutcome::Redefined);
+        assert!(c.built_indexes().is_empty(), "the stale part went");
+
+        // An index built to the current definition stays.
+        let current = redefined.iter().find(|d| d.name == "game_database_sort").unwrap().clone();
+        c.store.get_collection("game").unwrap().prewarm_index(&current);
+        assert_eq!(step(&c), PrebuildOutcome::Redefined);
+        assert_eq!(c.built_indexes()["game"], vec!["game_database_sort".to_string()]);
     }
 
     #[test]

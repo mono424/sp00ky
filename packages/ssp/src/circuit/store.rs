@@ -404,6 +404,19 @@ impl Collection {
         }
     }
 
+    /// Drop the index this collection holds under `current`'s name if it was
+    /// built (or is part built) to another definition. Returns whether it
+    /// dropped one. A lookup over `current` would replace it anyway; until
+    /// then every write keeps it in step for nothing.
+    pub fn drop_stale_index(&self, current: &IndexDef) -> bool {
+        let mut slots = self.indexes.lock();
+        if slots.get(&current.name).is_some_and(|held| held.def != *current) {
+            slots.remove(&current.name);
+            return true;
+        }
+        false
+    }
+
     /// Approximate heap bytes held by built indexes.
     pub fn secondary_index_bytes(&self) -> usize {
         self.indexes.lock().values().map(OrderedIndex::bytes).sum()

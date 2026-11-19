@@ -36,8 +36,9 @@ With the CLI it is one line in `sp00ky.yml`:
 <CodeBlock code={ymlCode} lang="yaml" fileName="sp00ky.yml" />
 
 `spky dev` then starts it on port `8668`, and `spky deploy` (or a git-linked push) puts it at
-`wss://{slug}-relay.<domain>/room`. Either way your frontend gets the address as
-`VITE_SPKY_RELAY_URL`. See [`relay` in sp00ky.yml](/docs/reference/config#relay).
+`wss://{slug}-spky-relay.<domain>/room`. Either way your frontend gets the address as
+`VITE_SPKY_RELAY_URL`. The host is the platform's, not one of your apps', so a service of your own
+named `relay` is left alone. See [`relay` in sp00ky.yml](/docs/reference/config#relay).
 
 On your own servers it is one Rust binary (`apps/relay`), configured through the environment:
 

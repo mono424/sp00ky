@@ -67,6 +67,17 @@ On a Cloudflare project a backend may instead set `worker:` to run as a Cloudfla
 
 `dev` accepts either a raw command string or a typed form: `{type: npm, script, workdir?}`, `{type: docker, file, workdir?, port?}` (builds a Dockerfile for this app's dev server), or `{type: uv, script, workdir?}`. `deploy` accepts `dockerfile`, `context`, `port`, `healthcheck`, `resources` (`vcpus`, `memory`, `disk`), a `timeout`, a `cmd` (override the image's ENTRYPOINT/CMD), `build_args` (build-time-only args, same shape as `env`), `expose` (backends only: publish it at `<slug>-<name>.<domain>`, which is also what a [custom domain](/docs/reference/cli) can point at), `grpc_port` (a second, h2c port at `<slug>-<name>-grpc.<domain>`), and `static` (`{build, dir}`, for Cloudflare static-asset frontends).
 
+#### Names you cannot use
+
+An app's name is also its address: a frontend, and a backend or docker app with `deploy.expose`, is published at `<slug>-<name>.<domain>`. The platform has hosts of the same shape, so two kinds of name are not yours to give:
+
+| Name | Why | Applies to |
+| --- | --- | --- |
+| anything starting with `spky-` | The prefix of the services Sp00ky runs for a project. The [room relay](#relay) is `spky-relay`. | Every app, whether or not you use the service. |
+| `db`, `admin`, `pool` | `<slug>-db`, `<slug>-admin` and `<slug>-pool` are the project's database, the scheduler's admin plane and the [pool](#machine-pools) listener. | Apps with a public host. A backend that is not exposed, or a `devOnly` app, may keep the name. |
+
+The CLI refuses such a manifest when it reads it (`spky-`) or when you run `spky lint` or `spky deploy` (the three hosts), and Sp00ky Cloud refuses the deployment either way.
+
 #### `worker`: a backend as a Cloudflare Worker
 
 A `type: backend` app with a `worker:` block is a [Worker backend](/docs/backend/workers). On a Cloudflare project, `spky deploy` bundles `entry` with esbuild and the project's SSP Worker runs it as a Dynamic Worker. It is called through jobs like any backend, so `spec` and an outbox `method` with a `table` are still required. On a VM project the block is ignored and the backend deploys from its Dockerfile.
@@ -222,13 +233,18 @@ What it does:
 
 - **`spky dev`** starts it as a container on port `8668`, with its log lines among the others. Your
   apps get `SPKY_RELAY_URL` and `VITE_SPKY_RELAY_URL` (`ws://localhost:8668/room`).
-- **`spky deploy` and git-linked pushes** deploy it like an exposed backend named `relay`, at
-  `wss://{slug}-relay.<domain>/room`, and build your frontend with that address in
-  `VITE_SPKY_RELAY_URL` (declare `ARG VITE_SPKY_RELAY_URL` in its Dockerfile, as for
-  `VITE_DB_ENDPOINT`). A value you set yourself wins.
+- **`spky deploy` and git-linked pushes** deploy it at `wss://{slug}-spky-relay.<domain>/room`, and
+  build your frontend with that address in `VITE_SPKY_RELAY_URL` (declare
+  `ARG VITE_SPKY_RELAY_URL` in its Dockerfile, as for `VITE_DB_ENDPOINT`). A value you set yourself
+  wins.
 - **Cloudflare projects** run no containers, so the relay is skipped there with a warning.
 
-It is an app like any other underneath, so an app of your own named `relay` cannot exist beside it.
+It is a service of the platform, like the database and the scheduler, so it does not take a name
+from your apps: it runs as `spky-relay`, under the [prefix kept for Sp00ky](#names-you-cannot-use).
+An app of your own called `relay` (a stream relay, a TURN server) keeps its name and its host,
+`{slug}-relay.<domain>`, beside it. Release `1.0.0-beta.9` ran the room relay under that plain
+name; from the next release on it is `spky-relay`.
+
 Hand the address to the client:
 
 <CodeBlock code={relayClient} lang="ts" />

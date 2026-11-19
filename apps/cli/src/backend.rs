@@ -638,22 +638,64 @@ impl Sp00kyConfig {
         self.relay.as_ref().is_some_and(RelayConfig::enabled)
     }
 
+    /// Refuse an app whose name is sp00ky's own.
+    ///
+    /// Every public host of a project has the shape `{slug}-{name}.<domain>`,
+    /// so the services sp00ky adds must not share names with the apps a
+    /// manifest declares. The prefix [`RESERVED_APP_PREFIX`] is theirs (the
+    /// room relay is [`RELAY_APP`]), whether or not the service is on: a name
+    /// that is free today and taken once `relay:` is switched on would be a
+    /// trap. Called by the canonical parse, before [`Self::expand_relay`] adds
+    /// the one app that may carry the prefix.
+    pub fn refuse_reserved_app_names(&self) -> Result<()> {
+        for name in self.apps.keys() {
+            if name.starts_with(RESERVED_APP_PREFIX) {
+                bail!(
+                    "apps.{name}: names starting with `{RESERVED_APP_PREFIX}` are kept for sp00ky's own \
+                     services (the room relay runs as `{RELAY_APP}`). Rename the app."
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse an app that would be published on a host the platform owns.
+    ///
+    /// The database, the scheduler's admin plane and the pool listener of a
+    /// project are served at `{slug}-db`, `{slug}-admin` and `{slug}-pool`.
+    /// An app with one of those names and a public host of its own would
+    /// answer on the same address, and which of the two a request reaches is
+    /// then up to the proxy. An app nobody can reach from outside may keep
+    /// the name.
+    fn validate_public_app_names(&self) -> Result<()> {
+        for (name, app) in &self.apps {
+            if !app.public_on_deploy() {
+                continue;
+            }
+            if let Some((_, owner)) = PLATFORM_HOSTS.iter().find(|(host, _)| *host == name.as_str()) {
+                bail!(
+                    "App '{name}' would be published at `{{slug}}-{name}.<domain>`, which is {owner} \
+                     of every project. Rename the app."
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Turn `relay:` into the app that runs it.
     ///
     /// The relay is one container with one port, which is exactly what a
     /// `type: docker` app is, so it becomes one named [`RELAY_APP`]: `spky dev`
     /// starts it with the other docker apps (network, health wait, logs,
     /// cleanup) and `spky deploy` ships it as an exposed backend, reachable at
-    /// `{slug}-relay.<domain>`. Called once, by the canonical parse.
+    /// `{slug}-spky-relay.<domain>`. The name is in the reserved namespace, so
+    /// no app of the manifest can hold it
+    /// ([`Self::refuse_reserved_app_names`]). Called once, by the canonical
+    /// parse.
     pub fn expand_relay(&mut self) -> Result<()> {
         let Some(relay) = self.relay.clone().filter(RelayConfig::enabled) else {
             return Ok(());
         };
-        if self.apps.contains_key(RELAY_APP) {
-            bail!(
-                "`relay:` is on, and `apps.{RELAY_APP}` exists already: `relay:` runs the room relay as an                  app of that name. Rename your app, or drop `relay:` if that app is your own relay."
-            );
-        }
         // Inside the dev network the database is `surrealdb:8000`, not the
         // `localhost` the auto-injected variable names (that one is for
         // processes on the host). An external database keeps what it was given.
@@ -679,9 +721,23 @@ impl Sp00kyConfig {
     }
 }
 
+/// The start of every app name that is sp00ky's own. No app of a manifest may
+/// use it, so a service sp00ky runs for a project can never meet one of the
+/// project's apps: not as a container, and not as a public host.
+pub const RESERVED_APP_PREFIX: &str = "spky-";
+/// The hosts every project already has, `{slug}-{name}.<domain>`, and what
+/// answers there. Older than the prefix above, so they are plain words, and
+/// only an app with a public host of its own can collide with them.
+const PLATFORM_HOSTS: &[(&str, &str)] = &[
+    ("db", "the database"),
+    ("admin", "the scheduler's admin plane"),
+    ("pool", "the pool listener"),
+];
 /// The app name `relay:` runs the room relay under, and so its container
-/// (`sp00ky-dev-relay`) and its public host (`{slug}-relay.<domain>`).
-pub const RELAY_APP: &str = "relay";
+/// (`sp00ky-dev-spky-relay`) and its public host
+/// (`{slug}-spky-relay.<domain>`). It was `relay` in 1.0.0-beta.9, a name a
+/// project is likely to want for itself.
+pub const RELAY_APP: &str = "spky-relay";
 /// The port the relay listens on.
 pub const RELAY_PORT: u16 = 8668;
 /// The path of its WebSocket.
@@ -1618,6 +1674,7 @@ impl Sp00kyConfig {
         for (name, app) in &self.apps {
             app.validate(name)?;
         }
+        self.validate_public_app_names()?;
         self.validate_docker_depends_on()?;
         crate::schedule_config::validate_all(&self.schedules, &self.workflows)?;
         crate::pool_config::validate_all(self)?;
@@ -2772,6 +2829,19 @@ impl AppConfig {
         self.scope != AppScope::DevOnly
     }
 
+    /// True if a deploy gives this app a public host, `{slug}-{name}.<domain>`:
+    /// every deployed frontend has one, a backend or a docker app only with
+    /// `deploy.expose`.
+    pub fn public_on_deploy(&self) -> bool {
+        let Some(deploy) = self.deploy.as_ref().filter(|_| self.deploys()) else {
+            return false;
+        };
+        match self.app_type {
+            AppType::Frontend => true,
+            AppType::Backend | AppType::Docker => deploy.expose,
+        }
+    }
+
     /// Variables sp00ky injects into this app's env on every host, besides the
     /// project-wide `SPKY_*` ones: `SPKY_OUTBOX_TABLE`, where the backend SDK
     /// puts the jobs of a durable workflow.
@@ -3040,6 +3110,7 @@ pub fn parse_config_with_includes(content: &str, base_dir: &Path) -> Result<Sp00
     resolve_linked_definitions(&mut root, base_dir)?;
     let mut config: Sp00kyConfig =
         serde_yaml::from_value(root).context("failed to interpret sp00ky manifest")?;
+    config.refuse_reserved_app_names()?;
     config.expand_relay()?;
     Ok(config)
 }
@@ -4843,13 +4914,72 @@ mod relay_tests {
     }
 
     #[test]
-    fn a_typo_or_a_taken_name_is_an_error() {
+    fn a_typo_is_an_error() {
         assert!(parse("relay:\n  imgae: x\n").is_err());
         assert!(parse("relay: maybe").is_err());
-        let err = parse("relay: true\napps:\n  relay:\n    type: docker\n    image: mine:1\n").unwrap_err();
-        assert!(format!("{err:#}").contains("apps.relay"), "{err:#}");
-        // With `relay:` off, an app of that name is nobody's business.
-        assert!(parse("relay: false\napps:\n  relay:\n    type: docker\n    image: mine:1\n").is_ok());
+    }
+
+    /// The reason the relay is `spky-relay` and not `relay`: a project with a
+    /// relay of its own (a stream relay, a TURN relay) keeps the name.
+    #[test]
+    fn leaves_the_name_relay_to_the_project() {
+        let config = parse(
+            "relay: true\napps:\n  relay:\n    type: docker\n    image: mine:1\n    \
+             deploy: { port: 9000, expose: true }\n",
+        )
+        .unwrap();
+        assert_eq!(config.apps["relay"].image.as_deref(), Some("mine:1"));
+        assert_eq!(config.apps[RELAY_APP].image.as_deref(), Some(format!("{RELAY_IMAGE}:{DEFAULT_VERSION_CHANNEL}").as_str()));
+        assert_ne!(RELAY_APP, "relay");
+        config.validate_manifest().unwrap();
+    }
+
+    #[test]
+    fn its_namespace_is_closed_to_the_manifest() {
+        assert!(RELAY_APP.starts_with(RESERVED_APP_PREFIX));
+        // On or off: a name free today and taken tomorrow would be a trap.
+        for relay in ["relay: true\n", "relay: false\n", ""] {
+            for name in [RELAY_APP, "spky-anything"] {
+                let yaml = format!("{relay}apps:\n  {name}:\n    type: docker\n    image: mine:1\n");
+                let err = parse(&yaml).unwrap_err();
+                assert!(format!("{err:#}").contains(&format!("apps.{name}")), "{err:#}");
+            }
+        }
+        // Only the prefix: a name that merely holds the word is an app's own.
+        assert!(parse("apps:\n  my-spky-app:\n    type: docker\n    image: mine:1\n").is_ok());
+    }
+
+    #[test]
+    fn an_app_cannot_be_published_on_a_platform_host() {
+        let exposed = |name: &str| {
+            parse(&format!(
+                "apps:\n  {name}:\n    type: docker\n    image: mine:1\n    deploy: {{ port: 9000, expose: true }}\n"
+            ))
+            .unwrap()
+        };
+        for name in ["db", "admin", "pool"] {
+            let err = exposed(name).validate_manifest().unwrap_err();
+            assert!(format!("{err:#}").contains(&format!("-{name}.")), "{err:#}");
+            // A frontend always has a host.
+            let frontend = parse(&format!(
+                "apps:\n  {name}:\n    type: frontend\n    deploy: {{ dockerfile: ./Dockerfile }}\n"
+            ))
+            .unwrap();
+            assert!(frontend.validate_manifest().is_err(), "{name}");
+            // Nothing public, nothing to collide with: not exposed, or never deployed.
+            let private = parse(&format!(
+                "apps:\n  {name}:\n    type: docker\n    image: mine:1\n    deploy: {{ port: 9000 }}\n"
+            ))
+            .unwrap();
+            private.validate_manifest().unwrap();
+            let dev_only = parse(&format!(
+                "apps:\n  {name}:\n    type: docker\n    image: mine:1\n    scope: devOnly\n    \
+                 deploy: {{ port: 9000, expose: true }}\n"
+            ))
+            .unwrap();
+            dev_only.validate_manifest().unwrap();
+        }
+        exposed("database").validate_manifest().unwrap();
     }
 
     #[test]

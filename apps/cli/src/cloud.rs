@@ -155,9 +155,9 @@ fn derive_db_ws_endpoint(api_url: &str, slug: &str) -> Option<String> {
 }
 
 /// The room relay of a project (`relay: true`), which the control plane
-/// exposes like any backend named `relay`.
-/// api-stg.sp00ky.cloud → wss://{slug}-relay.stg.spky.cloud/room
-/// api.sp00ky.cloud → wss://{slug}-relay.spky.cloud/room
+/// exposes as the backend it is deployed as, `spky-relay`.
+/// api-stg.sp00ky.cloud → wss://{slug}-spky-relay.stg.spky.cloud/room
+/// api.sp00ky.cloud → wss://{slug}-spky-relay.spky.cloud/room
 fn derive_relay_ws_endpoint(api_url: &str, slug: &str) -> Option<String> {
     let db = derive_db_ws_endpoint(api_url, slug)?;
     let host = db.strip_prefix(&format!("wss://{}-db.", slug))?.strip_suffix("/rpc")?;
@@ -4438,11 +4438,11 @@ mod version_skew_tests {
     fn the_relay_endpoint_follows_the_api_host() {
         assert_eq!(
             derive_relay_ws_endpoint("https://api-stg.sp00ky.cloud", "demo").as_deref(),
-            Some("wss://demo-relay.stg.spky.cloud/room")
+            Some("wss://demo-spky-relay.stg.spky.cloud/room")
         );
         assert_eq!(
             derive_relay_ws_endpoint("https://api.sp00ky.cloud/", "demo").as_deref(),
-            Some("wss://demo-relay.spky.cloud/room")
+            Some("wss://demo-spky-relay.spky.cloud/room")
         );
         assert_eq!(derive_relay_ws_endpoint("http://localhost:8080", "demo"), None);
     }

@@ -35,7 +35,7 @@ refMode: dedicated
 # Room relay: the small server a user's devices meet on, for the client's
 # `channels.share` (a write on the phone shows on the laptop before the server
 # has seen it). Off unless set. `spky dev` runs it on port 8668, a deploy
-# exposes it at wss://{slug}-relay.<domain>/room, and the frontend gets its
+# exposes it at wss://{slug}-spky-relay.<domain>/room, and the frontend gets its
 # address as VITE_SPKY_RELAY_URL. Cloudflare projects cannot run it yet.
 # relay: true
 # relay:

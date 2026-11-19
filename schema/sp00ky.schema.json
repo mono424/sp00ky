@@ -126,7 +126,12 @@
     },
     "apps": {
       "type": "object",
-      "description": "Application definitions (backends, frontends, docker). Each key is the app name. A value is either an inline app config, or a reference `{ path: ./dir }` that pulls the app config from `./dir/sp00ky.app.yml` (fields set alongside `path` override the referenced file).",
+      "description": "Application definitions (backends, frontends, docker). Each key is the app name. A value is either an inline app config, or a reference `{ path: ./dir }` that pulls the app config from `./dir/sp00ky.app.yml` (fields set alongside `path` override the referenced file). Names starting with `spky-` are kept for Sp00ky's own services (the room relay is `spky-relay`), and an app with a public host cannot be named `db`, `admin` or `pool`.",
+      "propertyNames": {
+        "not": {
+          "pattern": "^spky-"
+        }
+      },
       "additionalProperties": {
         "$ref": "#/$defs/appEntry"
       }
@@ -222,7 +227,7 @@
       "examples": ["$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch"]
     },
     "relay": {
-      "description": "Run the room relay (sp00ky-relay), the server a user's devices meet on for the client's channels.share. spky dev starts it on port 8668, deploys expose it at {slug}-relay.<domain>.",
+      "description": "Run the room relay (sp00ky-relay), the server a user's devices meet on for the client's channels.share. spky dev starts it on port 8668, deploys expose it at {slug}-spky-relay.<domain>, a host of the platform's that no app name can take.",
       "oneOf": [
         { "type": "boolean" },
         {

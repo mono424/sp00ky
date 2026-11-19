@@ -55,7 +55,12 @@ jobs:
   build-and-push:
     needs: prepare
     runs-on: ${{ matrix.runner }}
+    # The relay image is the newest of the four. Should it fail to build or to
+    # be pushed, the SSP, scheduler and agent images of the release still go
+    # out: its own jobs may fail without failing or cancelling the others.
+    continue-on-error: ${{ matrix.short == 'relay' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - image: mono424/spooky-ssp
@@ -170,7 +175,9 @@ jobs:
   merge-manifests:
     needs: [prepare, build-and-push]
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.artifact_prefix == 'relay' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - image: mono424/spooky-ssp

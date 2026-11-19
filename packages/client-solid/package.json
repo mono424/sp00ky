@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/client-solid",
-  "version": "1.0.0-beta.9",
+  "version": "1.0.0-beta.10",
   "type": "module",
   "sideEffects": false,
   "description": "SurrealDB client with local and remote database support for browser applications",

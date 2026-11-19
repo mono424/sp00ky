@@ -124,7 +124,9 @@ requesting user before every operation, so <code>$auth</code>, <code>$action</co
 <code>$target</code> mean what they mean in the clause. Two differences from a SurrealDB
 bucket: the clause runs with the user’s table permissions (SurrealDB evaluates
 a bucket clause with them off), and signed-out requests are refused. Listing
-an <code>r2</code> bucket is refused, as SurrealDB refuses it to record users.</p>
+an <code>r2</code> bucket is refused, as SurrealDB refuses it to record users. A session
+token of another database on the same SurrealDB instance is refused too: the
+SSP checks that the answer came from its own namespace and database.</p>
 <p><code>spky bucket backend &lt;name&gt; r2</code> switches an existing bucket. The R2 backend is
 served by a Cloudflare project’s SSP; on the VM plans use a
 <a href="#persistent-storage">persistent</a> <code>file:</code> backend.</p>

@@ -191,7 +191,8 @@ is a plain getter, not reactive state).</li>
 <li>It is for client-rendered trees. A server render still produces the fallback.</li>
 </ul>
 <p>Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
-same browser, and not with <code>sharedTabs</code>.</p>
+same browser, and only while no write has touched their tables since. That includes writes made
+in another tab when <code>sharedTabs</code> is on.</p>
 <h2 id="queries">Queries</h2>
 <p><code>useQuery(query, options?)</code> subscribes a component to a live query. It takes a getter that builds
 the query: the getter re-runs when the state it reads changes, and the query is re-registered only

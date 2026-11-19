@@ -262,8 +262,8 @@ constructor() {
 <span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">  );</span></span>
 <span class="line"><span style="--shiki-light:#24292E;--shiki-dark:#E1E4E8">}</span></span></code></pre> </div> </div> </div> 
 <p>Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
-same browser, and only while no write has touched their tables since. With <code>sharedTabs</code> none are
-kept.</p>
+same browser, and only while no write has touched their tables since. That includes writes made
+in another tab when <code>sharedTabs</code> is on.</p>
 <h2 id="queries">Queries</h2>
 <p><code>injectQuery(query, options?)</code> subscribes a component to a live query. It takes a function that
 builds the query: the function re-runs when the signals it reads change, and the query is

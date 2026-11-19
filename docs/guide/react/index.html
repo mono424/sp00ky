@@ -187,7 +187,8 @@ value until the client is ready. Gate what a signed-out visitor must not see on
 <li>It is for client-rendered trees. A server render still produces the fallback.</li>
 </ul>
 <p>Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
-same browser, and only while no write has touched their tables since.</p>
+same browser, and only while no write has touched their tables since. That includes writes made
+in another tab when <code>sharedTabs</code> is on.</p>
 <h2 id="queries">Queries</h2>
 <p><code>useQuery(query, options?)</code> subscribes a component to a live query. Build the query inline: the hook
 re-registers only when the query’s identity (its SurrealQL and vars) changes, not when a new query

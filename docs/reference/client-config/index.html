@@ -379,12 +379,17 @@ the app’s entry does. On a first visit it does nothing; after that it starts t
 the last user’s store while the bundle downloads and parses, and the client adopts it when it
 connects. A worker it cannot use (a new release, another user, a failed start) is replaced by a
 fresh one.</p>
+<p>With <code>sharedTabs</code> the page cannot know yet which tab will lead. When it is this one (a reload of
+the only tab, or of the leading one), its client adopts the worker exactly as above. When another
+tab leads, that tab’s worker asks for the store and the one started here hands it over within
+milliseconds; this tab then follows as usual.</p>
 <p>The same script reads ahead: it asks the worker again for the reads the app made in its first
 seconds last time (up to 24 of them), and their answers wait in the page. When the client then
 makes one of those reads, it has the answer without a trip to the worker. These are answers from
 the store itself, read after it was opened, so they are what the client would have got by asking.
-Whatever is left of them is dropped the moment the tab writes, and nothing is read ahead with
-<code>sharedTabs</code>, where other tabs write to the same store.</p>
+Whatever is left of them is dropped the moment the tab writes. With <code>sharedTabs</code> they serve the
+tab that leads, and are also dropped the moment another tab attaches to it, since that tab writes
+to the same store.</p>
 <div class="code-block-wrapper glass-panel my-6 bg-[#0c0c0e]/80 shadow-glass overflow-hidden group max-w-full"> <div class="relative">  <span class="absolute top-3.5 left-4 font-mono text-xs text-text-muted select-none"> vite.config.ts </span>  <button class="copy-btn absolute top-3 right-3 p-2 rounded-lg bg-white/[0.06] border border-white/10 text-text-muted opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-white/[0.12] hover:text-text-primary focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-brand-500/50 backdrop-blur-md z-10" aria-label="Copy to clipboard" data-code="import { ROWS_PREWARM_SNIPPET } from '@spooky-sync/core';
 
 export default defineConfig({
@@ -454,9 +459,11 @@ page load a query is born holding those rows: the first value <code>useQuery</co
 list it showed last time, not an empty one, and the component renders once where it used to render
 twice. The read that follows is the answer, as always, and replaces the rows when the store says
 otherwise; until then the query reports itself unanswered, as any query still loading does.</p>
-<p>A copy is dropped the moment this tab writes to a table it came from and taken again from the
-query’s next render, so it holds what the query last showed. Not used with <code>sharedTabs</code>. Set
-<code>false</code> to keep nothing in localStorage.</p>
+<p>A copy is dropped the moment a table it came from is written to, and taken again from the
+query’s next render, so it holds what the query last showed. With <code>sharedTabs</code> that holds across
+tabs: every tab keeps its copies in the same place, a write in any tab drops the copies of that
+table for all of them, and a tab that opens next paints from what any of them kept. Set <code>false</code> to
+keep nothing in localStorage.</p>
 <p>By default a provider renders nothing until the client is open, so those rows reach a component
 when its query registers, a moment after startup. A provider’s <code>eager</code> option renders the app at
 once, and the same rows are then what the very first render shows, before the local database is

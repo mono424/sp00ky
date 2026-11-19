@@ -1,0 +1,175 @@
+---
+layout: ../../../layouts/DocsLayout.astro
+title: Room relay
+description: sp00ky-relay is a small WebSocket server that puts the devices of one user into a shared room and forwards their optimistic updates to each other, in memory, without reading them.
+---
+
+import CodeBlock from '../../../components/ui/CodeBlock.astro';
+import Experimental from '../../../components/ui/Experimental.astro';
+import Note from '../../../components/ui/Note.astro';
+import Warning from '../../../components/ui/Warning.astro';
+import CardGrid from '../../../components/ui/CardGrid.astro';
+import LinkCard from '../../../components/ui/LinkCard.astro';
+
+<Experimental>
+  The relay belongs to [sharing with your own devices](/docs/client/channels#your-own-devices), which
+  is experimental. The protocol may change between releases.
+</Experimental>
+
+`sp00ky-relay` is the server a user's devices meet on. A browser signs in to it with its session
+token, lands in the room of that user, and everything it sends there is passed on to the other
+devices in the room. That is how a change made on the phone shows on the laptop before the
+database has seen it.
+
+It is deliberately small:
+
+- **Memory only.** No disk, no database of its own. A restart forgets every room and the clients
+  reconnect.
+- **It does not read what it forwards.** A message is copied to the other members byte for byte.
+- **Nothing depends on it.** A message that gets lost is one the normal sync delivers a moment
+  later, so the relay never retries or stores anything.
+
+## Run it
+
+It is one Rust binary in the repository (`apps/relay`), configured through the environment:
+
+<CodeBlock code={runCode} lang="bash" />
+
+Or as a container. The image is one static binary of about 7 MB:
+
+<CodeBlock code={dockerCode} lang="bash" />
+
+Then point the client at it:
+
+<CodeBlock code={clientCode} lang="ts" />
+
+<Warning title="Put TLS in front of it">
+  The relay speaks plain WebSocket. Run it behind the reverse proxy that already terminates TLS for
+  your other services and give the clients a `wss://` address: the first frame carries a session
+  token.
+</Warning>
+
+`spky dev` and Sp00ky Cloud do not start a relay yet, and no image is published. Until then you
+build and run it yourself.
+
+A room lives in the memory of one process, so all devices of a user have to reach the same
+instance. One instance is enough for a long way: it holds a socket per browser and copies small
+frames.
+
+## Configuration
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `SPKY_DB_URL` | required | The SurrealDB endpoint the relay asks who a token belongs to (`http(s)://` or `ws(s)://`). |
+| `SPKY_DB_NS` | required | Namespace. A token of another namespace is refused. |
+| `SPKY_DB_NAME` | required | Database. A token of another database is refused. |
+| `SPKY_RELAY_LISTEN_ADDR` | `0.0.0.0:8668` | Address to listen on. |
+| `SPKY_RELAY_MAX_ROOM_PEERS` | `16` | Browsers in one room. One more is refused with `room_full`. |
+| `SPKY_RELAY_MAX_FRAME_BYTES` | `65536` | Largest frame. A larger one closes the connection. |
+| `SPKY_RELAY_RATE_BURST` | `400` | Frames a connection may send at once. |
+| `SPKY_RELAY_RATE_PER_SEC` | `200` | Frames per second it may keep sending. Frames above that are dropped. |
+| `SPKY_RELAY_QUEUE_FRAMES` | `256` | Frames waiting for one member. A member that falls further behind is disconnected. |
+| `SPKY_RELAY_SESSION_SECS` | `3600` | Longest one connection lasts. Then the client is told to sign in again and reconnects. |
+| `SPKY_RELAY_ALLOWED_ORIGINS` | any | Comma separated list of origins that may connect. A request without an `Origin` header (a native app) always passes: the token is what protects a room. |
+| `RUST_LOG` | `sp00ky_relay=info,warn` | Log filter. `sp00ky_relay=debug` logs every join and leave. A token is never logged. |
+
+`GET /health` answers `200 ok`.
+
+<Note title="Limit connections in the proxy">
+  Every new connection costs one query to your database before the relay knows who is calling, and
+  the relay does not cap connections per address. Do that in the reverse proxy in front of it.
+</Note>
+
+## Who gets into which room
+
+- **Identity comes from SurrealDB.** On connect the relay asks your database, with the client's
+  session token and as that user, for `$auth.id` and for the namespace and database of the
+  session. An invalid or expired token is refused, and so is a valid token of another database on
+  the same SurrealDB instance. The relay holds no credentials of its own.
+- **On SurrealDB 3.x the user must be able to read its own record**, since `$auth.id` is read with
+  the user's permissions there.
+- **The room is the user.** A connection is put into the room named by that id and nowhere else, so
+  a client cannot ask for somebody else's room. There are no rooms between users yet.
+- **Your permissions are untouched.** The relay only carries what one device of a user tells
+  another device of the same user. Every write still goes to SurrealDB through the normal sync,
+  where your table permissions decide, and a device drops what the server does not confirm.
+
+<Note title="What the relay can see">
+  Messages cross the relay in memory in plain form, like requests cross the SSP. A direct link
+  between two browsers is encrypted end to end between them, a message through the room is not.
+</Note>
+
+## Protocol
+
+One WebSocket at `/room`, JSON text frames. This is what the web client speaks; you only need it to
+write another client.
+
+<CodeBlock code={protocolCode} lang="json" />
+
+1. **`hello`** must be the first frame, within 10 seconds. `peer` is the browser's own id, 1 to 64
+   characters of `A-Z a-z 0-9 _ -`.
+2. **`welcome`** names the user and the browsers already in the room. Everybody else gets `join`.
+3. **`msg`** goes to the members named in `to`, or to all others without it, and arrives with
+   `from` set by the relay. `d` is any JSON value and is not looked at.
+4. **`leave`** tells the others a browser is gone.
+5. **`ping`** is answered with `pong`. The relay also sends WebSocket pings and drops a connection
+   it has heard nothing from for a minute.
+
+`to: []` means nobody, a peer named twice gets the frame once, and the sender never gets its own
+frame back. There is no acknowledgement and no replay.
+
+A refusal is `{"t":"error","code":"..."}` followed by a close:
+
+| Code | Meaning |
+|---|---|
+| `bad_request` | A malformed frame, a bad `peer`, an unknown version. |
+| `unauthorized` | The token is invalid or belongs to no user. |
+| `unavailable` | The relay could not reach the database. |
+| `room_full` | The room has `SPKY_RELAY_MAX_ROOM_PEERS` members. |
+| `replaced` | Another connection joined with the same `peer`. |
+| `rate_limited` | The connection kept sending above its rate. |
+| `reauth` | The session reached `SPKY_RELAY_SESSION_SECS`. Connect again with the current token. |
+
+An idle connection and one that sent an oversized frame are closed without an error frame. A member
+whose queue is full is dropped without a close (a browser reports code 1006). The full contract is
+in `apps/relay/README.md`.
+
+<CardGrid>
+  <LinkCard title="Your own devices" href="/docs/client/channels#your-own-devices" description="What the client shares and how it decides." />
+  <LinkCard title="Client config" href="/docs/reference/client-config#channels" description="channels.relay and channels.share." />
+  <LinkCard title="Self-hosting" href="/docs/self-hosting" description="The other services you run." />
+</CardGrid>
+
+export const runCode = `SPKY_DB_URL=http://localhost:8666 \\
+SPKY_DB_NS=main \\
+SPKY_DB_NAME=main \\
+cargo run --release -p sp00ky-relay
+# listening on 0.0.0.0:8668`;
+
+export const dockerCode = `# from the repository root
+docker build -f apps/relay/Dockerfile -t sp00ky-relay .
+docker run --rm -p 8668:8668 \\
+  -e SPKY_DB_URL=ws://surrealdb:8000 -e SPKY_DB_NS=main -e SPKY_DB_NAME=main \\
+  sp00ky-relay`;
+
+export const clientCode = `const db = new SyncedDb({
+  // ...
+  channels: {
+    relay: 'wss://relay.example.com/room',
+    share: { tables: { game: true } },
+  },
+});`;
+
+export const protocolCode = `// client -> relay
+{ "t": "hello", "v": 1, "token": "<session token>", "peer": "k3J9x" }
+{ "t": "msg", "to": ["p2"], "d": { "any": "json" } }
+{ "t": "msg", "d": { "any": "json" } }
+{ "t": "ping" }
+
+// relay -> client
+{ "t": "welcome", "user": "user:abc", "peer": "k3J9x", "peers": ["p2", "p3"] }
+{ "t": "join", "peer": "p4" }
+{ "t": "leave", "peer": "p2" }
+{ "t": "msg", "from": "p2", "d": { "any": "json" } }
+{ "t": "pong" }
+{ "t": "error", "code": "unauthorized", "message": "..." }`;

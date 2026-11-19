@@ -143,6 +143,8 @@ write) and `db.discardFailedMutation(id)`.
 
 On `-- @channel` tables, `client.channel(query, peers)` opens WebRTC channels to the users listed (both sides must list each other) for the rows the query's `where` matches (checked per row, never registered). Plain `client.update` / `create` / `delete` reach the peers of every open channel whose filter the row matches; the handle's own writes limit that to its peers. `-- @ephemeral` fields go only to peers. Order/limit/select/`.one()` warn unless `.ignoreUnusedArgs()`. Follow status with `ch.subscribe(cb)`, close with `ch.close()`. Config: `channels: { accept, iceServers, transport, confirmTimeoutMs }`. Docs: `/docs/client/channels`.
 
+**Your own devices.** `channels: { relay: 'wss://relay.example.com/room', share: { tables: { game: true, note: (row) => !row.draft } } }` sends the signed-in user's optimistic writes on those tables straight to their other devices (web client only; the tables need no `-- @channel`). `relay` is the address of the `sp00ky-relay` server (`apps/relay`), which puts each socket into the room of the user its session token belongs to. One socket per browser is shared by its tabs; two browsers alone also talk over a direct WebRTC link (`relay: { url, direct: false }` turns that off). A device is only sent writes its open queries can show. `client.shareState()` / `client.subscribeShareState(cb)` report `{ status, peers }`. Off unless `share` is set.
+
 ## Authentication
 
 See [references/auth.md](references/auth.md) for the full auth API.

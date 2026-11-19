@@ -149,6 +149,16 @@ Settings for [peer to peer channels](/docs/client/channels) on `-- @channel` tab
 - `transport`: a `ChannelTransportFactory` that replaces WebRTC (an existing room or relay).
 - `confirmTimeoutMs`: how long a peer's persistent value, create or delete shows without the server
   confirming it. Defaults to `5000`.
+- `share`: send this user's optimistic writes straight to their
+  [other devices](/docs/client/channels#your-own-devices). `share.tables` maps a table to `true`
+  (every row), a function `(row) => boolean` (only the rows it passes) or `false`. Tables left out
+  are not shared, and nothing is shared unless this is set. Needs `relay`.
+- `relay`: the address of the [room relay](/docs/reference/relay) the user's devices meet on
+  (`'wss://relay.example.com/room'`), or `{ url, direct }`, where `direct: false` stops two browsers
+  from also opening a WebRTC link to each other. Each browser keeps one socket to it, shared by its
+  tabs.
+
+`share` and `relay` exist in the web client only for now.
 
 In Dart (`spooky_core`) the same keys live on `ChannelsConfig` (`accept`, `iceServers`, `transport`,
 `confirmTimeoutMs`), plus `rtc`: the peer connection factory, `flutterWebRtc` from `spooky_flutter`.

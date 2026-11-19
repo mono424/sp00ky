@@ -1,7 +1,7 @@
 ---
 layout: ../../../layouts/DocsLayout.astro
 title: Peer to peer channels
-description: Open a channel to other users over the rows of a query with useChannel and their writes reach you over WebRTC in tens of milliseconds, optimistically, with ephemeral fields that never touch the database.
+description: Open a channel to other users over the rows of a query with useChannel and their writes reach you over WebRTC in tens of milliseconds, optimistically, with ephemeral fields that never touch the database. Or share your own writes with your other devices through a room relay.
 ---
 
 import CodeBlock from '../../../components/ui/CodeBlock.astro';
@@ -197,6 +197,67 @@ the row; the channel only makes the peer's writes arrive sooner:
 
 <CodeBlock code={followCode} lang="tsx" />
 
+## Your own devices
+
+A channel connects you to other users. The same machinery can connect your own devices: change
+something on the phone and the laptop shows it before the server has seen the write. It is off
+unless you turn it on, and you choose the tables:
+
+<CodeBlock code={shareCode} lang="ts" />
+
+- **`share.tables`** names what is shared. `true` shares every row of the table, a function only
+  the rows it returns `true` for (asked on the device that writes, and again on the one that
+  receives), `false` or leaving the table out shares nothing. The table needs no `-- @channel`:
+  these writes only ever reach devices signed in as the same user.
+- **`relay`** is the address of the [room relay](/docs/reference/relay), a small server you run
+  next to the others. Without it nothing is shared, and the client says so in a warning.
+
+Nothing else changes: `db.create`, `db.update` and `db.delete` are sent as you make them, and the
+other device treats them like any peer's write (see [Write as usual](#3-write-as-usual) and
+[Creates and deletes](#creates-and-deletes)): shown at once, dropped again unless the normal sync
+confirms them within `confirmTimeoutMs`.
+
+### How the devices reach each other
+
+- **Every browser keeps one socket to the relay**, shared by all its tabs. One tab holds it; when
+  that tab closes, another takes over within a moment.
+- **The relay puts you in the room of your user.** It asks SurrealDB who your session token belongs
+  to, so you can only ever join your own room, and forwards what the members send each other
+  without reading it.
+- **Two browsers alone in the room also open a direct WebRTC link** and use it while it is up. On
+  one network that is a millisecond instead of a trip to the relay. A third browser joining ends
+  that and everybody talks through the room. `relay: { url, direct: false }` turns the direct link
+  off.
+
+### Only what the other device shows
+
+Each tab tells your other devices which rows its open queries can show, and a write nobody shows
+is not sent:
+
+| The other tab has open | It is sent |
+|---|---|
+| no query on the table | nothing of it |
+| `db.query('note').where({ folder })` | writes to rows in that folder, before or after the write |
+| a query with a filter the row alone cannot decide (a record link path, a search operator) | every write to the table |
+| a query that reads the table through `.related()` | every write to the table |
+
+`orderBy`, `limit` and `offset` are not looked at: a row inside the filter and outside the page is
+sent and then simply not shown. A wrong guess costs little either way. Too much is a few bytes; too
+little means that device waits for the normal sync, as it does today.
+
+### Knowing the state
+
+`db.getSp00ky().shareState()` returns `{ status, peers }` like a channel does: `connected` while at
+least one other browser of yours is in the room, `connecting` or `failed` otherwise, `idle` when
+nothing is shared or nobody is signed in. `subscribeShareState(cb)` calls back on every change.
+
+<Note title="What this does not do yet">
+  Rooms are in the web client only. A Flutter or Rust client of the same user is not in the room and
+  gets the change at normal sync speed. Tabs of one browser are not connected to each other this
+  way either. And the direct link exists between your own two browsers only; channels to other
+  users keep their own WebRTC connections.
+</Note>
+
 ## Flutter and Dart
 
 `spooky_core` has the same channels, on the same wire protocol: a Flutter app and a browser tab in
@@ -231,12 +292,15 @@ and Flutter apps. It ships no WebRTC either: adapt one (webrtc-rs, libwebrtc bin
 
 ## Limits
 
-- Mesh topology, so small groups.
+- Mesh topology between users, so small groups.
+- Sharing with your own devices needs the [room relay](/docs/reference/relay) and, for now, the web
+  client.
 
 <CardGrid>
   <LinkCard title="Mutations" href="/docs/client/mutations" description="The optimistic writes channels build on." />
   <LinkCard title="Schema annotations" href="/docs/schema" description="@channel, @ephemeral and the other descriptors." />
-  <LinkCard title="Client config" href="/docs/reference/client-config#channels" description="accept, iceServers, transport, confirmTimeoutMs." />
+  <LinkCard title="Client config" href="/docs/reference/client-config#channels" description="accept, iceServers, transport, confirmTimeoutMs, relay, share." />
+  <LinkCard title="Room relay" href="/docs/reference/relay" description="The small server your own devices meet on." />
 </CardGrid>
 
 export const schemaCode = `-- @channel
@@ -319,6 +383,20 @@ export const iceCode = `channels: {
     { urls: 'turn:turn.example.com:3478', username: 'u', credential: 'p' },
   ],
 }`;
+
+export const shareCode = `const db = new SyncedDb({
+  // ...
+  channels: {
+    relay: 'wss://relay.example.com/room',
+    share: {
+      tables: {
+        game: true,                       // every row
+        note: (row) => row.draft !== true, // only published notes
+        payment: false,                   // never (the default for any table not listed)
+      },
+    },
+  },
+});`;
 
 export const followCode = `// Exactly the call row, while the call is up.
 useChannel(

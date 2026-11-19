@@ -642,6 +642,13 @@ the backup catalog, authenticated with the project's own `SPKY_AUTH_SECRET`.
 Self-hosted schedulers leave them unset and report `cloud_linked: false`.
 </Note>
 
+### Room relay
+
+Only needed for [sharing writes with a user's own devices](/docs/client/channels#your-own-devices).
+`sp00ky-relay` is a separate small binary (`apps/relay`) that reads `SPKY_DB_URL`, `SPKY_DB_NS` and
+`SPKY_DB_NAME` like the others, plus its own `SPKY_RELAY_*` limits. See
+[Room relay](/docs/reference/relay#configuration) for the full list.
+
 ## Next steps
 
 <CardGrid>

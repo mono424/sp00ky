@@ -942,7 +942,7 @@ class _Unsupported implements ChannelTransport {
   @override
   void want(Set<String> users) {}
   @override
-  void send(PeerRef to, ChannelMessage message) {}
+  void send(PeerRef to, ChannelWire message) {}
   @override
   void close() {}
 }

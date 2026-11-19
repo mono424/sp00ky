@@ -281,6 +281,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
             : _firstCheckpointMs));
     await _auth?.publishSession();
     if (_env.hasRemote) _runtime.dispatch(const StartRemote());
+    startSharing();
     _logger.info('Sp00kyClient initialized');
   }
 
@@ -464,7 +465,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
     }
     // Channel values (peer updates, ephemeral fields) are folded into what
     // subscribers see, never into the store.
-    final tap = channels.tap(callback);
+    final tap = channels.tap(callback, queryInterestOf(hash));
     final stop = _runtime.subscribe(hash, tap.feed, immediate: immediate);
     return () {
       stop();
@@ -523,6 +524,7 @@ class InProcessSp00kyClient extends Sp00kyClient {
         subscriber: subscribeStream,
         schema: config.schema,
         logger: _logger,
+        onRegister: noteQuery,
       );
 
   /// Register a query and return a result [Stream] in one call.
@@ -923,17 +925,20 @@ class _OfflineRemote implements RemotePort {
 /// a shared query and subscribe to it.
 class _QueryHost implements QueryHost {
   _QueryHost(this._client);
-  final Sp00kyClient _client;
+  final InProcessSp00kyClient _client;
 
   @override
   Future<String> registerQuery(String table, String surql,
           Map<String, dynamic> params, QueryTimeToLive ttl) =>
       _client.queryRaw(surql, params, ttl: ttl);
 
+  // Straight from the engine, as the TS modules subscribe: their tables are
+  // no channel's, and a subscription nobody described would have the user's
+  // other devices send this one everything (`channels.share`).
   @override
   void Function() subscribe(String hash, QueryUpdateCallback cb,
           {bool immediate = false}) =>
-      _client.subscribe(hash, cb, immediate: immediate);
+      _client._runtime.subscribe(hash, cb, immediate: immediate);
 }
 
 /// Re-export so callers can build ids without importing the surreal layer.

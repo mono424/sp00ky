@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:meta/meta.dart';
 import 'client/worker_client.dart';
 import 'modules/channel/channel.dart';
+import 'modules/channel/room.dart';
 import 'modules/channel/webrtc.dart';
 import 'modules/auth/sp00ky_auth.dart';
 import 'modules/query_builder.dart';
@@ -46,9 +47,9 @@ abstract class Sp00kyClient {
       [Map<String, dynamic>? vars]);
   Future<void> preload(String sql, Map<String, dynamic> params,
       {QueryTimeToLive ttl = defaultTtl});
-  /// A registered query's rows as a broadcast [Stream]. With `@channel` tables
-  /// in the schema, channel peers' values are folded in (output only, never the
-  /// store).
+  /// A registered query's rows as a broadcast [Stream]. With `@channel` or
+  /// shared tables in the schema, channel peers' values are folded in (output
+  /// only, never the store).
   Stream<List<Map<String, dynamic>>> subscribeStream(String hash,
       {bool immediate = true}) {
     final raw = subscribeRecords(hash, immediate: immediate);
@@ -58,7 +59,9 @@ abstract class Sp00kyClient {
     StreamSubscription<List<Map<String, dynamic>>>? sub;
     void Function()? stop;
     controller = StreamController.broadcast(onListen: () {
-      final tap = channels.tap(controller.add);
+      // With `channels.share`, the user's other devices are told what this
+      // query can show, and only send what it has a use for.
+      final tap = channels.tap(controller.add, queryInterestOf(hash));
       stop = tap.stop;
       sub = raw.listen(tap.feed,
           onError: controller.addError, onDone: controller.close);
@@ -102,7 +105,8 @@ abstract class Sp00kyClient {
       schema: config.schema,
       registrar: (sql, params, ttl, relations) =>
           queryRaw(sql, params, ttl: ttl, relations: relations),
-      subscriber: subscribeStream);
+      subscriber: subscribeStream,
+      onRegister: noteQuery);
   Future<Stream<List<Map<String, dynamic>>>> queryStream(
           String sql, Map<String, dynamic> params,
           {QueryTimeToLive ttl = defaultTtl}) async =>
@@ -203,13 +207,73 @@ abstract class Sp00kyClient {
   @protected
   bool get hostsChannels => true;
 
-  /// The channel manager when the schema has `@channel` tables, else null.
+  /// The channel manager when the schema has `@channel` tables or
+  /// `channels.share` names one, else null.
   @protected
   ChannelManager? get activeChannels {
     if (!hostsChannels) return null;
     final channels = _channelManager ??= _buildChannels();
     return channels.enabled ? channels : null;
   }
+
+  /// The link to this user's other devices (`channels.share`): `connected`
+  /// with the user's id in `peers` while at least one other device of theirs
+  /// (a browser tab, another app) is in the room. `idle` when nothing is
+  /// shared or nobody is signed in.
+  ChannelState get shareState =>
+      activeChannels?.ownState ?? const ChannelState(ChannelStatus.idle);
+
+  /// [shareState] at once, then every change.
+  Stream<ChannelState> get shareStates => broadcast(subscribeShareState);
+
+  /// Called at once with [shareState], then on every change.
+  void Function() subscribeShareState(void Function(ChannelState) cb) {
+    final channels = activeChannels;
+    if (channels != null) return channels.subscribeOwn(cb);
+    cb(const ChannelState(ChannelStatus.idle));
+    return () {};
+  }
+
+  /// With `channels.share`, take part from the start: the user's other
+  /// devices see this one, and hear what it shows, without a channel being
+  /// opened first. Both clients call it at the end of `init()`.
+  @protected
+  void startSharing() {
+    final channels = config.channels?.share == null ? null : activeChannels;
+    if (channels != null && channels.sharing) _bindChannelUser(channels);
+  }
+
+  /// What each query registered through a builder can show, by its hash. A
+  /// stream on that hash passes it on to the user's other devices.
+  final Map<String, List<QueryInterest>> _queryInterests = {};
+
+  /// Queries remembered at most; past it the ones registered longest ago are
+  /// forgotten, and a stream on one of those asks for everything again.
+  static const _maxQueryInterests = 1024;
+
+  /// A builder registered [query]: remember what it can show, for the streams
+  /// on its hash. Read now, the builder may change after.
+  @protected
+  void noteQuery(QueryBuilder query, Future<String> hash) {
+    final channels = activeChannels;
+    if (channels == null || !channels.sharing) return;
+    final interest = channels.interestOf(query);
+    if (interest == null) return;
+    unawaited(hash.then((h) {
+      _queryInterests.remove(h);
+      _queryInterests[h] = interest;
+      if (_queryInterests.length > _maxQueryInterests) {
+        _queryInterests.remove(_queryInterests.keys.first);
+      }
+    }, onError: (Object _) {
+      // The registration failed, and its caller hears that.
+    }));
+  }
+
+  /// What the query under [hash] can show, or null when no builder said (a
+  /// raw `queryRaw`): the user's other devices then send this one everything.
+  @protected
+  List<QueryInterest>? queryInterestOf(String hash) => _queryInterests[hash];
 
   /// A channel peer created a row: into the store and the circuit unconfirmed
   /// for [ttlMs] (the `peerCreate` saga). False when refused.
@@ -236,7 +300,32 @@ abstract class Sp00kyClient {
   ChannelManager _buildChannels() {
     final cfg = config.channels;
     final logger = SpookyLogger.root('spooky.channel');
-    return ChannelManager(
+    final relay = cfg?.relay;
+    // Between users: a WebRTC link per pair of devices, signaled through the
+    // database.
+    ChannelTransport mesh(TransportHooks hooks) => webrtcTransport(
+        hooks,
+        WebRtcOptions(
+          signal: channelSignal,
+          rtc: cfg?.rtc,
+          iceServers: cfg?.iceServers,
+          logger: logger,
+        ));
+    // Between the user's own devices: one socket to their room on the relay.
+    final ChannelTransportFactory? room = relay == null
+        ? null
+        : (hooks) => roomTransport(
+            hooks,
+            RoomTransportOptions(
+                link: (linkHooks) => roomLink(
+                    linkHooks,
+                    RoomLinkOptions(
+                      url: relay.url,
+                      token: _sessionToken,
+                      connect: relay.connect,
+                      logger: logger,
+                    ))));
+    final channels = ChannelManager(
       config.schema,
       config: cfg,
       logger: logger,
@@ -245,20 +334,27 @@ abstract class Sp00kyClient {
         delete: (_, id, ttlMs) => peerDelete(id, ttlMs),
         read: readRow,
       ),
-      transport: cfg?.transport ??
-          (hooks) => webrtcTransport(
-              hooks,
-              WebRtcOptions(
-                signal: channelSignal,
-                rtc: cfg?.rtc,
-                iceServers: cfg?.iceServers,
-                logger: logger,
-              )),
+      transport: cfg?.transport ?? splitTransport(room, mesh),
     );
+    if (channels.sharing && relay == null && cfg?.transport == null) {
+      logger.warn('channels.share is set without channels.relay: nothing '
+          'reaches your other devices until a relay address is given');
+    }
+    return channels;
   }
 
-  /// Follow the signed-in user once a channel is open: who this device is to
-  /// its peers.
+  /// The session token the relay proves the user with, or null while there is
+  /// none (signed out, or no endpoint to sign in at).
+  String? _sessionToken() {
+    try {
+      return auth.token;
+    } on StateError {
+      return null;
+    }
+  }
+
+  /// Follow the signed-in user once a channel is open (or from the start with
+  /// `channels.share`): who this device is to its peers.
   void _bindChannelUser(ChannelManager channels) {
     if (_channelUserBound) return;
     _channelUserBound = true;
@@ -501,8 +597,13 @@ class _Host implements QueryHost {
   Future<String> registerQuery(String table, String sql,
           Map<String, dynamic> params, QueryTimeToLive ttl) =>
       client.queryRaw(sql, params, ttl: ttl);
+  // Straight from the engine, as the TS modules subscribe: their tables are
+  // no channel's, and a subscription nobody described would have the user's
+  // other devices send this one everything (`channels.share`).
   @override
   void Function() subscribe(String hash, QueryUpdateCallback cb,
-          {bool immediate = false}) =>
-      client.subscribe(hash, cb, immediate: immediate);
+      {bool immediate = false}) {
+    final sub = client.subscribeRecords(hash, immediate: immediate).listen(cb);
+    return () => unawaited(sub.cancel());
+  }
 }

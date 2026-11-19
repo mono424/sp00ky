@@ -78,6 +78,7 @@ class WorkerSp00kyClient extends Sp00kyClient {
       _worker = await spawnWorker(inbox.sendPort);
       await _ready.future;
       isLocalReady = true;
+      startSharing();
     } catch (e, s) {
       _terminate(e, s);
       rethrow;

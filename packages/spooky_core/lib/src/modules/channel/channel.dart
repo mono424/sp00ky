@@ -3,10 +3,13 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:web_socket_channel/web_socket_channel.dart'
+    show WebSocketChannel;
+
 import '../../services/logger/logger.dart';
 import '../../surreal/value.dart';
 import '../../utils/parser.dart' show ColumnSchema;
-import '../query_builder.dart' show QueryBuilder, QueryOp;
+import '../query_builder.dart' show QueryBuilder, QueryOp, RelationPlan;
 
 /// Peer to peer channels (`-- @channel` tables, `client.channel(query, peers)`).
 ///
@@ -39,6 +42,10 @@ import '../query_builder.dart' show QueryBuilder, QueryOp;
 ///
 /// Update and ephemeral values are folded into subscription output only, never
 /// into the local store.
+///
+/// The same machinery carries a user's own writes to their other devices
+/// ([ChannelsConfig.share]): one internal channel whose only user is whoever
+/// is signed in, over the room relay (`room.dart`) instead of WebRTC.
 
 typedef Row = Map<String, dynamic>;
 
@@ -96,8 +103,15 @@ class PeerRef {
 /// What a message does to its row.
 enum ChannelOpKind { update, create, delete }
 
-/// The one message channels exchange: a write to one row.
-class ChannelMessage {
+/// Everything a transport carries: a write to a row ([ChannelMessage]), or
+/// what a device shows ([InterestMessage]).
+sealed class ChannelWire {
+  /// The JSON a link carries.
+  Map<String, dynamic> toJson();
+}
+
+/// The message channels exchange: a write to one row.
+class ChannelMessage implements ChannelWire {
   const ChannelMessage({
     this.kind = ChannelOpKind.update,
     required this.table,
@@ -117,6 +131,7 @@ class ChannelMessage {
 
   /// The JSON a data channel carries. `kind` is left out for an update, as the
   /// browser client does.
+  @override
   Map<String, dynamic> toJson() => {
         't': 'op',
         if (kind != ChannelOpKind.update) 'kind': kind.name,
@@ -200,12 +215,70 @@ abstract interface class ChannelTransport {
 
   /// Users this device wants connections to: the union over open channels.
   void want(Set<String> users);
-  void send(PeerRef to, ChannelMessage message);
+  void send(PeerRef to, ChannelWire message);
   void close();
+}
+
+/// A transport made of several, each reaching some users and not others. A
+/// channel is then `unsupported` only when none of its users can be reached,
+/// not whenever one half of the transport is missing.
+abstract interface class PerUserSupport {
+  bool supportsUser(String user);
 }
 
 typedef ChannelTransportFactory = ChannelTransport Function(
     TransportHooks hooks);
+
+/// Which rows of a table are shared with the user's own devices: all of them,
+/// or the ones a test passes.
+class ChannelShareRule {
+  const ChannelShareRule._(this.enabled, this.test);
+
+  /// Only the rows [test] returns true for. It is asked on the device that
+  /// writes, and again on the one that receives. A test that throws shares
+  /// nothing.
+  const ChannelShareRule.where(bool Function(Row row) test)
+      : this._(true, test);
+
+  /// Every row of the table.
+  static const all = ChannelShareRule._(true, null);
+
+  /// No row: the same as leaving the table out.
+  static const none = ChannelShareRule._(false, null);
+
+  final bool enabled;
+  final bool Function(Row row)? test;
+}
+
+/// Sharing optimistic writes with the user's own other devices (see
+/// [ChannelsConfig.share]). Needs [ChannelsConfig.relay].
+class ChannelShareConfig {
+  const ChannelShareConfig({required this.tables});
+
+  /// Per table: [ChannelShareRule.all] shares every row,
+  /// [ChannelShareRule.where] only the rows its test passes. A table left out
+  /// (or set to [ChannelShareRule.none]) is never shared. The table needs no
+  /// `-- @channel` mark: these writes only ever reach devices signed in as the
+  /// same user.
+  final Map<String, ChannelShareRule> tables;
+}
+
+/// Where the room relay (`sp00ky-relay`) is, and how to reach it.
+class ChannelRelayConfig {
+  const ChannelRelayConfig(this.url, {this.direct = true, this.connect});
+
+  /// Its WebSocket address, e.g. `wss://relay.example.com/room`.
+  final String url;
+
+  /// Browsers only: two browsers alone in a room also open a direct WebRTC
+  /// link and talk over that while it is up. A Dart client has no such link
+  /// and keeps everything on the relay, whatever this says.
+  final bool direct;
+
+  /// Opens the socket to the relay; `WebSocketChannel.connect` when omitted.
+  /// For tests, or an app that has to set headers or go through a proxy.
+  final WebSocketChannel Function(Uri uri)? connect;
+}
 
 /// Peer to peer channels for `-- @channel` tables (TS `channels` config).
 class ChannelsConfig {
@@ -215,6 +288,8 @@ class ChannelsConfig {
     this.rtc,
     this.transport,
     this.confirmTimeoutMs = 5000,
+    this.relay,
+    this.share,
   });
 
   /// Per table: decide whether to apply a peer's write. Runs after the built-in
@@ -239,6 +314,16 @@ class ChannelsConfig {
   /// How long a peer's persistent value shows without the server confirming
   /// it.
   final int confirmTimeoutMs;
+
+  /// The room relay this user's devices meet on. One socket per client.
+  final ChannelRelayConfig? relay;
+
+  /// Send this user's optimistic writes straight to their other devices, so a
+  /// change made on the phone shows on the laptop before the server has seen
+  /// it. Off unless set, and per table. The devices tell each other which rows
+  /// their open queries can show, and a write nobody shows is not sent. Needs
+  /// [relay].
+  final ChannelShareConfig? share;
 }
 
 /// A session description: `type` is `offer` or `answer`.
@@ -594,25 +679,56 @@ Set<String> peerUsers(Iterable<Object?> peers, String? self) => {
         if (idKey(p) case final key? when key != self) key,
     };
 
+/// One node of a filter: a comparison ([ChannelCondition]), or a group of them
+/// of which one has to pass ([ChannelOr]).
+sealed class ChannelWhereNode {
+  /// The wire form, values tagged as [encodeValue] does.
+  Map<String, dynamic> toJson();
+}
+
 /// One comparison of a channel filter: `field op value`, or `value op field`
 /// when [swap] is set.
-class ChannelCondition {
+class ChannelCondition implements ChannelWhereNode {
   const ChannelCondition(this.field, this.op, this.value, {this.swap = false});
 
   final String field;
   final String op;
   final Object? value;
   final bool swap;
+
+  @override
+  Map<String, dynamic> toJson() => {
+        'field': field,
+        'op': op,
+        'value': encodeValue(value),
+        if (swap) 'swap': true,
+      };
+}
+
+/// A `(c1 OR c2 ...)` group. The Dart query builder has none, but a browser's
+/// `_or` query sends one in what it says it shows.
+class ChannelOr implements ChannelWhereNode {
+  const ChannelOr(this.or);
+
+  final List<ChannelCondition> or;
+
+  @override
+  Map<String, dynamic> toJson() => {
+        'or': [for (final c in or) c.toJson()]
+      };
 }
 
 /// What a channel carries: the rows of one `@channel` table its filter matches.
 class ChannelScope {
-  const ChannelScope(this.table, this.where);
+  const ChannelScope(this.table, this.where, {this.test});
 
   final String table;
 
   /// AND-joined, like the query builder's `where`.
   final List<ChannelCondition> where;
+
+  /// A further test on the row (a share rule given as a function).
+  final bool Function(Row row)? test;
 }
 
 bool _isIn(Object? a, Object? b) => b is List && b.any((x) => _sameKey(a, x));
@@ -696,9 +812,13 @@ bool _matchesCondition(ChannelCondition c, Row row) {
   return c.swap ? op(c.value, field) : op(field, c.value);
 }
 
-/// Whether [row] passes a channel filter (a conjunction of comparisons).
-bool matchesWhere(List<ChannelCondition> where, Row row) =>
-    where.every((c) => _matchesCondition(c, row));
+/// Whether [row] passes a filter (a conjunction of comparisons and OR
+/// groups).
+bool matchesWhere(List<ChannelWhereNode> where, Row row) =>
+    where.every((node) => switch (node) {
+          ChannelCondition c => _matchesCondition(c, row),
+          ChannelOr(:final or) => or.any((c) => _matchesCondition(c, row)),
+        });
 
 /// The parts of a channel query that do nothing there (a channel only reads
 /// the `where`). Not an error, worth a warning unless `.ignoreUnusedArgs()`.
@@ -771,19 +891,259 @@ ChannelScope compileScope(Map<String, dynamic> schema, QueryBuilder q) {
   return ChannelScope(table, where);
 }
 
+// ---- interest: what a device's open queries can show ----------------------------
+
+/// One query's claim on a table: the rows its filter passes, or (null) all of
+/// them.
+class QueryInterest {
+  const QueryInterest(this.table, this.where);
+
+  final String table;
+  final List<ChannelWhereNode>? where;
+}
+
+/// What a device shows of the shared tables, as its open queries add up.
+class Interest {
+  const Interest(this.tables) : all = false;
+
+  /// Everything: the device could not say more.
+  const Interest.all()
+      : tables = const {},
+        all = true;
+
+  final bool all;
+
+  /// Per table: null for every row, else the filters of the queries on it. A
+  /// table left out shows nothing.
+  final Map<String, List<List<ChannelWhereNode>>?> tables;
+}
+
+/// A device telling its user's other devices what it shows, so they do not
+/// send it writes it has no use for. Only ever exchanged between devices of
+/// one user.
+class InterestMessage implements ChannelWire {
+  const InterestMessage(this.interest);
+
+  final Interest interest;
+
+  /// `{"t":"interest","all":true}`, or `{"t":"interest","v":{...}}` with per
+  /// table `true` or a list of filters, their values wire-encoded.
+  @override
+  Map<String, dynamic> toJson() => interest.all
+      ? {'t': 'interest', 'all': true}
+      : {
+          't': 'interest',
+          'v': <String, dynamic>{
+            for (final MapEntry(key: table, value: filters)
+                in interest.tables.entries)
+              table: filters == null
+                  ? true
+                  : [
+                      for (final where in filters)
+                        [for (final node in where) node.toJson()]
+                    ],
+          },
+        };
+}
+
+/// Past this many filters on one table a device just asks for all of it: the
+/// message stays small.
+const _maxInterestFilters = 24;
+
+/// A filter value typed by its column before it goes out, so a browser gets a
+/// record link as a record id and a date as a date (the Dart rows, and the
+/// queries on them, hold both as strings).
+Object? _typedOperand(ColumnSchema? column, bool isId, Object? v) {
+  if (v is List) return [for (final x in v) _typedOperand(column, isId, x)];
+  if (v is! String) return v;
+  if ((isId || (column?.recordId ?? false)) && v.contains(':')) {
+    return RecordId.parse(v);
+  }
+  if (column?.dateTime ?? false) return DateTime.tryParse(v) ?? v;
+  return v;
+}
+
+/// A builder's `where` as a test the row alone decides. Null when it cannot
+/// be one (an operator this file does not evaluate, a path through a record
+/// link, a reference to a variable only the server holds): then the query
+/// counts as showing the whole table, which only costs a few messages too
+/// many.
+List<ChannelWhereNode>? _rowFilter(
+    Map<String, ColumnSchema>? columns, Map<String, Object?> conditions) {
+  final out = <ChannelWhereNode>[];
+  for (final MapEntry(key: field, :value) in conditions.entries) {
+    final op = value is QueryOp ? value.op : '=';
+    final operand = value is QueryOp ? value.value : value;
+    if (!_ops.containsKey(op)) return null;
+    final nested = field.contains('.');
+    final column = columns?[field.split('.').first];
+    if (nested && (column?.recordId ?? false)) return null;
+    // The builder passes a `$name` operand of a QueryOp through as a
+    // reference, and its value is not known here.
+    if (value is QueryOp && operand is String && operand.startsWith(r'$')) {
+      return null;
+    }
+    final typed = _typedOperand(nested ? null : column, field == 'id', operand);
+    // A value the wire cannot carry.
+    if (_json(typed) == null) return null;
+    out.add(ChannelCondition(field, op, typed,
+        swap: value is QueryOp && value.swap));
+  }
+  return out;
+}
+
+/// What a registered query can show: the rows of its own table that pass its
+/// filter, and every row of the tables it reads through `.related()` (which
+/// children it shows depends on the parents, not on the child row alone).
+/// Order, limit and offset are ignored: a row inside the filter and outside
+/// the window is sent and then not shown.
+List<QueryInterest> queryInterest(
+    Map<String, ColumnSchema>? Function(String table) columnsOf,
+    QueryBuilder q) {
+  final out = [
+    QueryInterest(q.table, _rowFilter(columnsOf(q.table), q.conditions))
+  ];
+  void walk(List<RelationPlan> relations) {
+    for (final r in relations) {
+      out.add(QueryInterest(r.table, null));
+      walk(r.relations);
+    }
+  }
+
+  walk(q.relations);
+  return out;
+}
+
+/// The interests of every open subscription as one, for the tables [shared]
+/// names. Everything once one of them is unknown (null). Each filter once and
+/// in a fixed order, so the same set of queries always reads the same.
+Interest mergeInterest(
+    Iterable<List<QueryInterest>?> list, bool Function(String table) shared) {
+  // Per table its filters by their wire form, or null for every row.
+  final tables = <String, Map<String, List<ChannelWhereNode>>?>{};
+  for (final queries in list) {
+    if (queries == null) return const Interest.all();
+    for (final q in queries) {
+      if (!shared(q.table)) continue;
+      final cur = tables[q.table];
+      if (cur == null && tables.containsKey(q.table)) continue;
+      final where = q.where;
+      if (where == null || where.isEmpty) {
+        tables[q.table] = null;
+        continue;
+      }
+      final filters = cur ?? {};
+      filters[jsonEncode([for (final node in where) node.toJson()])] = where;
+      tables[q.table] = filters.length > _maxInterestFilters ? null : filters;
+    }
+  }
+  return Interest({
+    for (final table in tables.keys.toList()..sort())
+      table: switch (tables[table]) {
+        null => null,
+        final filters => [
+            for (final key in filters.keys.toList()..sort()) filters[key]!
+          ],
+      },
+  });
+}
+
+/// The message that says [interest] (TS `encodeInterest`).
+InterestMessage encodeInterest(Interest interest) => InterestMessage(interest);
+
+/// A wire value of a filter. Unlike a row's field ([decodeValue]) a date stays
+/// a [DateTime]: it is only ever compared, and by the instant, whatever
+/// precision the row's own string spells.
+Object? _decodeOperand(Object? v) {
+  if (v is List) return [for (final x in v) _decodeOperand(x)];
+  if (v is Map && v.length == 1) {
+    final date = v[r'$date'];
+    if (date is String) return DateTime.tryParse(date) ?? date;
+  }
+  return decodeValue(v);
+}
+
+ChannelCondition? _decodeComparison(Object? raw) {
+  if (raw is! Map) return null;
+  final field = raw['field'];
+  final op = raw['op'];
+  if (field is! String || op is! String || !_ops.containsKey(op)) return null;
+  return ChannelCondition(field, op, _decodeOperand(raw['value']),
+      swap: raw['swap'] == true);
+}
+
+/// The filters of one table, or null when one of them cannot be read.
+List<List<ChannelWhereNode>>? _decodeFilters(List<Object?> filters) {
+  if (filters.length > _maxInterestFilters) return null;
+  final decoded = <List<ChannelWhereNode>>[];
+  for (final where in filters) {
+    if (where is! List) return null;
+    final nodes = <ChannelWhereNode>[];
+    for (final node in where) {
+      final or = node is Map ? node['or'] : null;
+      final group = or is List ? or : null;
+      final list = [
+        for (final c in group ?? [node]) _decodeComparison(c)
+      ];
+      if (list.isEmpty || list.contains(null)) return null;
+      nodes.add(group == null
+          ? list.first!
+          : ChannelOr(list.cast<ChannelCondition>()));
+    }
+    decoded.add(nodes);
+  }
+  return decoded;
+}
+
+/// A peer's interest message, or null when it is not one. A filter this side
+/// cannot read turns its table into "all of it": never into less than the
+/// peer asked for.
+Interest? decodeInterest(Object? raw) {
+  if (raw is! Map || raw['t'] != 'interest') return null;
+  if (raw['all'] == true) return const Interest.all();
+  final v = raw['v'];
+  if (v is! Map) return null;
+  final out = <String, List<List<ChannelWhereNode>>?>{};
+  for (final MapEntry(key: table, value: filters) in v.entries) {
+    if (filters is List) {
+      out['$table'] = _decodeFilters(filters);
+    } else if (filters == true) {
+      out['$table'] = null;
+    }
+  }
+  return Interest(out);
+}
+
+/// Whether a device with this interest can show one of [rows] (a row before
+/// and after a write) of [table].
+bool showsRow(Interest interest, String table, List<Row> rows) {
+  if (interest.all) return true;
+  if (!interest.tables.containsKey(table)) return false;
+  final filters = interest.tables[table];
+  return filters == null ||
+      filters.any((where) => rows.any((r) => matchesWhere(where, r)));
+}
+
 // ---- manager --------------------------------------------------------------------
 
 class _Tap {
-  _Tap(this.cb);
+  _Tap(this.cb, this.interest);
   final void Function(List<Row> rows) cb;
   List<Row>? raw;
 
   /// Every record id in [raw], computed on first need.
   Set<String>? ids;
+
+  /// What its query can show, or null when nobody said.
+  final List<QueryInterest>? interest;
 }
 
 class _Channel {
-  _Channel(this.scopes, this.listed, this.users);
+  _Channel(this.scopes, this.listed, this.users, {this.own = false});
+
+  /// The one channel to the user's own other devices
+  /// ([ChannelsConfig.share]): its only user is whoever is signed in.
+  final bool own;
 
   List<ChannelScope> scopes;
 
@@ -890,6 +1250,27 @@ class ChannelManager {
         _confirmMs = max(0, config?.confirmTimeoutMs ?? 5000) {
     _peerId = _randomPeerId(random ?? Random.secure());
     _clock = Hlc(0, 0, _peerId);
+    final share = config?.share?.tables ?? const <String, ChannelShareRule>{};
+    for (final MapEntry(key: table, value: rule) in share.entries) {
+      if (!rule.enabled) continue;
+      if (!_isTable(_schema, table)) {
+        logger?.warn("channels.share names '$table', which is not a table of "
+            'the schema');
+        continue;
+      }
+      _shared[table] = rule;
+    }
+    final own = _ownChannel = _shared.isEmpty
+        ? null
+        : _Channel([
+            for (final MapEntry(key: table, value: rule) in _shared.entries)
+              ChannelScope(table, const [],
+                  test: switch (rule.test) {
+                    null => null,
+                    final test => _safeTest(test),
+                  }),
+          ], const [], {}, own: true);
+    if (own != null) _channels.add(own);
   }
 
   final Map<String, dynamic> _schema;
@@ -911,6 +1292,19 @@ class ChannelManager {
   /// Unused-argument warnings already given, so a rebuilt query does not
   /// repeat them.
   final Set<String> _warnedUnused = {};
+
+  /// `channels.share`: the rule per shared table, and the channel that
+  /// carries them to the user's own devices.
+  final Map<String, ChannelShareRule> _shared = {};
+  late final _Channel? _ownChannel;
+
+  /// What each of the user's other devices said it shows, by [PeerRef.key]. A
+  /// device that said nothing gets everything.
+  final Map<String, Interest> _interest = {};
+
+  /// The interest message last sent, so an unchanged one is not sent again.
+  String? _announced;
+  bool _announcing = false;
   late final String _peerId;
   late Hlc _clock;
   String? _user;
@@ -922,12 +1316,45 @@ class ChannelManager {
   /// This device's peer id (random per client instance).
   String get peerId => _peerId;
 
-  /// True when any table is a channel table; otherwise the client skips all of
-  /// this.
-  late final bool enabled = _schema.keys.any((t) => isChannelTable(_schema, t));
+  /// True when any table is a channel table or shared; otherwise the client
+  /// skips all of this.
+  late final bool enabled =
+      _shared.isNotEmpty || _schema.keys.any((t) => isChannelTable(_schema, t));
 
+  /// Whether the user's own devices are part of this (`channels.share` names
+  /// a table).
+  bool get sharing => _ownChannel != null;
+
+  /// How the link to the user's own devices is doing: `idle` when nothing is
+  /// shared or nobody is signed in.
+  ChannelState get ownState =>
+      _ownChannel?.state ?? const ChannelState(ChannelStatus.idle);
+
+  /// Called at once with [ownState], then on every change.
+  void Function() subscribeOwn(void Function(ChannelState) cb) {
+    final ch = _ownChannel;
+    cb(ownState);
+    if (ch == null || ch.closed) return () {};
+    ch.listeners.add(cb);
+    return () => ch.listeners.remove(cb);
+  }
+
+  /// What a registered query can show, as [tap] takes it.
+  List<QueryInterest>? interestOf(QueryBuilder? query) =>
+      query == null ? null : queryInterest(_tableColumns, query);
+
+  Map<String, ColumnSchema>? _tableColumns(String table) =>
+      _isTable(_schema, table)
+          ? _columnCache[table] ??= _columnsOf(_schema, table)
+          : null;
+
+  /// The columns of a table that takes peer writes: a `@channel` one, or a
+  /// shared one. A shared table needs no mark in the schema, its writes only
+  /// reach devices of the same user.
   Map<String, ColumnSchema>? _channelColumns(String table) {
-    if (!isChannelTable(_schema, table)) return null;
+    if (!isChannelTable(_schema, table) && !_shared.containsKey(table)) {
+      return null;
+    }
     return _columnCache[table] ??= _columnsOf(_schema, table);
   }
 
@@ -940,10 +1367,12 @@ class ChannelManager {
     _transport = null;
     _connected.clear();
     _userStatus.clear();
+    _interest.clear();
+    _announced = null;
     final touched = _overlay.keys.toSet();
     _overlay.clear();
     for (final ch in _channels) {
-      ch.users = peerUsers(ch.listed, user);
+      ch.users = ch.own ? {if (user != null) user} : peerUsers(ch.listed, user);
     }
     _syncWanted();
     _emitFor(touched);
@@ -994,17 +1423,23 @@ class ChannelManager {
 
   /// Follow a subscription: `feed` it the raw rows, and [cb] gets them with the
   /// overlay folded in, again whenever the overlay changes for its rows.
+  /// [interest] is what its query can show ([interestOf]); without one the
+  /// user's other devices send this one everything.
   ({void Function(List<Row> rows) feed, void Function() stop}) tap(
-      void Function(List<Row> rows) cb) {
-    final tap = _Tap(cb);
+      void Function(List<Row> rows) cb,
+      [List<QueryInterest>? interest]) {
+    final tap = _Tap(cb, interest);
     _taps.add(tap);
+    _announceSoon();
     return (
       feed: (rows) {
         tap.raw = rows;
         tap.ids = null;
         _emit(tap);
       },
-      stop: () => _taps.remove(tap),
+      stop: () {
+        if (_taps.remove(tap)) _announceSoon();
+      },
     );
   }
 
@@ -1056,8 +1491,9 @@ class ChannelManager {
         ...(row ?? {'id': rid}),
         ...patch
       };
-      _send(_targets(table, row == null ? [after] : [row, after], scope), table,
-          rid, _typed(columns, patch), hlc, ChannelOpKind.update);
+      final rows = row == null ? [after] : [row, after];
+      _send(_targets(table, rows, scope), table, rid, _typed(columns, patch),
+          hlc, ChannelOpKind.update, rows);
     }));
   }
 
@@ -1086,18 +1522,11 @@ class ChannelManager {
       _overlay[rid] = map;
       _emitFor({rid});
     }
-    _send(
-        _targets(
-            table,
-            [
-              {...full, 'id': rid}
-            ],
-            scope),
-        table,
-        rid,
-        _typed(columns, full),
-        hlc,
-        ChannelOpKind.create);
+    final rows = [
+      {...full, 'id': rid}
+    ];
+    _send(_targets(table, rows, scope), table, rid, _typed(columns, full), hlc,
+        ChannelOpKind.create, rows);
   }
 
   /// An own delete: the peers hide the row at once. Completes once it is sent;
@@ -1111,7 +1540,7 @@ class ChannelManager {
       final row = await _rowFor(rid);
       if (row != null) {
         _send(_targets(table, [row], scope), table, rid, const {}, hlc,
-            ChannelOpKind.delete);
+            ChannelOpKind.delete, [row]);
       }
     }
     if (_overlay.remove(rid) != null) _emitFor({rid});
@@ -1120,6 +1549,9 @@ class ChannelManager {
   /// A transport delivered a message from [from].
   void receive(PeerRef from, Object? raw) {
     if (_closed) return;
+    if (raw is Map && raw['t'] == 'interest') {
+      return _receiveInterest(from, raw);
+    }
     final msg = parseMessage(raw);
     if (msg == null) return _drop(from, 'malformed message');
     _observe(msg.hlc);
@@ -1281,6 +1713,17 @@ class ChannelManager {
     }
   }
 
+  /// One of the user's own devices said what it shows. Anybody else's word on
+  /// that is ignored.
+  void _receiveInterest(PeerRef from, Object? raw) {
+    if (from.user != _user || _ownChannel == null) {
+      return _drop(from, 'interest from another user');
+    }
+    final interest = decodeInterest(raw);
+    if (interest == null) return _drop(from, 'malformed interest');
+    _interest[from.key] = interest;
+  }
+
   bool _accepts(ChannelOp op) {
     final rule = _config?.accept[op.table];
     if (rule == null) return true;
@@ -1299,9 +1742,13 @@ class ChannelManager {
     if (up) {
       _connected[key] = peer;
       _userStatus[peer.user] = PeerLinkStatus.connected;
+      if (_ownChannel != null && peer.user == _user) {
+        _transport?.send(peer, encodeInterest(_ownInterest()));
+      }
       _sendSnapshot(peer);
     } else {
       _connected.remove(key);
+      _interest.remove(key);
       final touched = <String>{};
       for (final MapEntry(key: rid, value: fields) in _overlay.entries) {
         fields.removeWhere((_, e) {
@@ -1356,10 +1803,14 @@ class ChannelManager {
     transport.want(wanted);
   }
 
-  /// Whether an own write on [table] could reach anyone: a transport is up and
-  /// an open channel carries the table. Skips the row read otherwise.
+  /// Whether an own write on [table] could reach anyone: a transport is up,
+  /// somebody is connected and an open channel carries the table. Skips the
+  /// row read otherwise, which a shared table would pay on every write of a
+  /// user with one device.
   bool _canSend(String table) =>
-      _transport != null && _channels.any((ch) => ch.tables.contains(table));
+      _transport != null &&
+      _connected.isNotEmpty &&
+      _channels.any((ch) => ch.tables.contains(table));
 
   /// Some open channel lists [user] and has a query on [table] (the cheap check
   /// before any read).
@@ -1376,7 +1827,10 @@ class ChannelManager {
   /// of one conversation away from the participants of another.
   Set<String> _targets(String table, List<Row> rows, ChannelHandle? scope) {
     final users = <String>{};
-    final pick = scope == null ? _channels : [scope._channel];
+    final own = _ownChannel;
+    // A write made through one channel still reaches the user's own devices.
+    final pick =
+        scope == null ? _channels : [scope._channel, if (own != null) own];
     for (final ch in pick) {
       if (ch.closed || !_carries(ch, table, rows)) continue;
       users.addAll(ch.users);
@@ -1398,7 +1852,7 @@ class ChannelManager {
   }
 
   void _send(Set<String> users, String table, String rid, Row patch, Hlc hlc,
-      ChannelOpKind kind) {
+      ChannelOpKind kind, List<Row> rows) {
     final transport = _transport;
     if (transport == null || users.isEmpty) return;
     final message = ChannelMessage(
@@ -1408,9 +1862,39 @@ class ChannelManager {
       patch: {for (final e in patch.entries) e.key: encodeValue(e.value)},
       hlc: hlc,
     );
-    for (final peer in _connected.values) {
-      if (users.contains(peer.user)) transport.send(peer, message);
+    for (final MapEntry(:key, value: peer) in _connected.entries.toList()) {
+      if (!users.contains(peer.user)) continue;
+      // One of the user's own devices that said what it shows, and it is not
+      // this row: it has no use for the write, and the server brings it
+      // anyway.
+      final interest = peer.user == _user ? _interest[key] : null;
+      if (interest != null && !showsRow(interest, table, rows)) continue;
+      transport.send(peer, message);
     }
+  }
+
+  /// What this device's subscriptions show of the shared tables.
+  Interest _ownInterest() =>
+      mergeInterest(_taps.map((t) => t.interest), _shared.containsKey);
+
+  /// Tell the user's other devices what this one shows, once the
+  /// subscriptions of this turn are all in.
+  void _announceSoon() {
+    if (_ownChannel == null || _announcing || _closed) return;
+    _announcing = true;
+    scheduleMicrotask(() {
+      _announcing = false;
+      final transport = _transport;
+      final user = _user;
+      if (_closed || transport == null || user == null) return;
+      final message = encodeInterest(_ownInterest());
+      final text = jsonEncode(message.toJson());
+      if (text == _announced) return;
+      _announced = text;
+      for (final peer in _connected.values.toList()) {
+        if (peer.user == user) transport.send(peer, message);
+      }
+    });
   }
 
   /// Own ephemeral values of rows inside a channel a newly connected peer is
@@ -1529,7 +2013,7 @@ class ChannelManager {
     final users = ch.users.toList();
     if (users.isEmpty) return const ChannelState(ChannelStatus.idle);
     final transport = _transport;
-    if (transport != null && !transport.supported) {
+    if (transport != null && users.every((u) => !_reaches(transport, u))) {
       return const ChannelState(ChannelStatus.unsupported);
     }
     final up = [
@@ -1584,8 +2068,34 @@ class _Hooks implements TransportHooks {
 }
 
 /// Whether a channel has a query on [table] that one of [rows] matches.
-bool _carries(_Channel ch, String table, List<Row> rows) => ch.scopes.any(
-    (sc) => sc.table == table && rows.any((r) => matchesWhere(sc.where, r)));
+bool _carries(_Channel ch, String table, List<Row> rows) =>
+    ch.scopes.any((sc) =>
+        sc.table == table &&
+        rows.any(
+            (r) => matchesWhere(sc.where, r) && (sc.test?.call(r) ?? true)));
+
+/// Whether [transport] can connect to [user] at all.
+bool _reaches(ChannelTransport transport, String user) {
+  final Object t = transport;
+  return t is PerUserSupport ? t.supportsUser(user) : transport.supported;
+}
+
+/// A share rule that never throws: a rule that does shares nothing.
+bool Function(Row row) _safeTest(bool Function(Row row) rule) => (row) {
+      try {
+        return rule(row);
+      } catch (_) {
+        return false;
+      }
+    };
+
+/// Whether the schema map has [table] (its other keys describe access,
+/// backends and relationships).
+bool _isTable(Map<String, dynamic> schema, String table) =>
+    schema[table] is Map &&
+    table != 'access' &&
+    table != 'backends' &&
+    table != 'relationships';
 
 /// The fields of [row] the table has as columns (no id, no nulls).
 Row _pickColumns(Map<String, ColumnSchema> columns, Row row) => {

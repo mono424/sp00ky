@@ -40,17 +40,23 @@ export 'src/modules/feature_flag/feature_flag.dart'
 export 'src/modules/app_release/app_release.dart'
     show AppReleaseModule, AppReleaseHandle, AppReleaseSnapshot;
 export 'src/modules/query_builder.dart'
-    show QueryBuilder, QueryOp, RelationPlan;
+    show QueryBuilder, QueryOp, QueryObserver, RelationPlan;
 export 'src/modules/relationships.dart' show SchemaRelationship;
 export 'src/modules/channel/channel.dart'
     show
         ChannelsConfig,
+        ChannelShareConfig,
+        ChannelShareRule,
+        ChannelRelayConfig,
         ChannelState,
         ChannelStatus,
         ChannelOp,
         ChannelOpKind,
         ChannelAcceptRule,
+        ChannelWire,
         ChannelMessage,
+        InterestMessage,
+        Interest,
         ChannelTransport,
         ChannelTransportFactory,
         TransportHooks,
@@ -58,12 +64,26 @@ export 'src/modules/channel/channel.dart'
         PeerLinkStatus,
         Hlc,
         ChannelScope,
+        ChannelWhereNode,
         ChannelCondition,
+        ChannelOr,
         matchesWhere,
         RtcPeerConnection,
         RtcPeerConnectionFactory,
         RtcDataChannel,
         RtcDescription;
+export 'src/modules/channel/room.dart'
+    show
+        roomLink,
+        RoomLink,
+        RoomLinkFactory,
+        RoomLinkHooks,
+        RoomLinkOptions,
+        RoomTimer,
+        roomTransport,
+        RoomTransportOptions,
+        splitTransport,
+        sameUser;
 export 'src/modules/channel/webrtc.dart'
     show
         webrtcTransport,

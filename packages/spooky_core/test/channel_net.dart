@@ -9,6 +9,13 @@ class MemoryNet {
   /// Every message as it went over the wire.
   final wire = <String>[];
 
+  /// The same messages decoded, with the two ends ([PeerRef.key]).
+  final sent = <({String from, String to, Map<String, dynamic> message})>[];
+
+  /// The writes among [sent] (the rest say what a device shows).
+  List<({String from, String to, Map<String, dynamic> message})> get ops =>
+      [...sent.where((s) => s.message['t'] == 'op')];
+
   void _reconcile() {
     for (final a in nodes.values.toList()) {
       for (final b in nodes.values.toList()) {
@@ -52,10 +59,15 @@ class _Node implements ChannelTransport {
   }
 
   @override
-  void send(PeerRef to, ChannelMessage message) {
+  void send(PeerRef to, ChannelWire message) {
     if (!links.contains(to.key)) return;
     final json = jsonEncode(message.toJson());
     net.wire.add(json);
+    net.sent.add((
+      from: self.key,
+      to: to.key,
+      message: (jsonDecode(json) as Map).cast<String, dynamic>()
+    ));
     net.nodes[to.key]?.hooks.onMessage(self, jsonDecode(json));
   }
 

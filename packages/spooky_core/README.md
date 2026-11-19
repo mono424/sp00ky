@@ -171,6 +171,52 @@ the connections stay on the caller's isolate; signaling rows and peers'
 creates/deletes (`peerCreate`/`peerDelete` sagas) cross to the worker. Filters
 take the dynamic builder's `where` map (no `_or` groups).
 
+Sharing with the user's own devices (`channels.share`, needs `channels.relay`)
+is ported on the browser's wire protocol too, so a write on the phone shows in
+the user's browser tabs before the server has it, and the other way around:
+
+```dart
+channels: ChannelsConfig(
+  relay: ChannelRelayConfig('wss://relay.example.com/room'),
+  share: ChannelShareConfig(tables: {
+    'game': ChannelShareRule.all,
+    'note': ChannelShareRule.where((row) => row['draft'] != true),
+  }),
+),
+```
+
+The tables need no `-- @channel` mark: these writes only reach devices signed
+in as the same user, which take them like any peer's write. The channel manager
+keeps one internal channel whose only user is the signed-in one
+(`client.shareState`, `client.shareStates`, `client.subscribeShareState`), and
+`splitTransport` routes that user to the room and everybody else to the WebRTC
+mesh. The room (`lib/src/modules/channel/room.dart`) is one WebSocket to
+`sp00ky-relay` (protocol in `apps/relay/README.md`): hello with the session
+token, a ping every 20 s, reconnect with backoff. It needs no WebRTC, so it
+works without `rtc`, and with the background client it lives on the caller's
+isolate next to the channel manager. A browser multiplexes its tabs over its
+socket (`hub.ts`); a Dart client speaks the same envelope as a hub with one tab,
+which is what makes the two peers of each other. The direct WebRTC link two
+browsers open through the relay is not ported: its signaling is ignored, the
+browser stays on the relay, and `ChannelRelayConfig.direct` does nothing here.
+
+One thing the Dart client does that the browser client does not (yet). The
+relay tells nobody when it hands a seat back to its peer id because the old
+socket still looked alive, which is what a phone changing networks produces:
+the device is welcomed, but the others never re-announce their tabs to it. So
+a member that names the same tabs again is told this device's tab again and
+treated as having left and joined, and a device that lost its socket and is not
+told everybody's tabs within 3 s of being back leaves and joins once more, for
+all to see (`roomTransport`). Both use only frames the protocol already has.
+
+Each device tells the user's other devices what its query streams can show,
+and a write none of them shows is not sent. A query built with
+`client.query(...)` or the typed facade is described by its `where` (and counts
+as the whole table for every table it reads through `.related()`); a stream on
+raw SurrealQL (`queryStream`, `queryRaw`) cannot be described, so while one is
+listened to the device asks for every shared row. The client's own modules
+(feature flags, app releases) take no part in this.
+
 The blob cache is ported with files on disk in place of OPFS
 (`Sp00kyConfig.blobCache.directory`; in-memory without one). Its manifest is
 rebuilt from a directory walk at start rather than kept in a `_00_blob` table,
@@ -286,3 +332,9 @@ SURREAL_IT_ENDPOINT=ws://127.0.0.1:18011 dart test --tags integration
 ```
 
 Validated against SurrealDB v2.1.4 and v3.1.2.
+
+`test/integration/relay_room_test.dart` joins a room on a real `sp00ky-relay`
+(`apps/relay`). It is skipped unless `SPKY_RELAY_IT_URL` names a running relay
+and `SPKY_RELAY_IT_TOKEN` holds a session token of a user of its database; the
+file's header shows a setup. The default run covers the same protocol against
+an in-memory relay and one on a loopback port.

@@ -181,7 +181,7 @@ class _WebRtcTransport implements ChannelTransport {
   }
 
   @override
-  void send(PeerRef to, ChannelMessage message) {
+  void send(PeerRef to, ChannelWire message) {
     final link = _links[to.key];
     final dc = link?.dc;
     if (link == null || !link.open || dc == null || !dc.isOpen) return;

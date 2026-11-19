@@ -146,12 +146,14 @@ class Sp00kyConfig {
   /// peers)`): the app's `accept` rules per table, and the WebRTC setup. In
   /// Flutter pass `ChannelsConfig(rtc: flutterWebRtc)` from `spooky_flutter`;
   /// without a peer connection factory (or a custom `transport`) channels
-  /// report `unsupported`. See [ChannelsConfig].
+  /// report `unsupported`. Also sharing the user's own optimistic writes with
+  /// their other devices (`share`, over the room relay named by `relay`),
+  /// which needs no WebRTC. See [ChannelsConfig].
   final ChannelsConfig? channels;
 
   /// This config minus [channels]: what the sync worker gets. Channels live
-  /// on the caller's isolate, and the accept rules are app closures that have
-  /// no business crossing over.
+  /// on the caller's isolate, and the accept and share rules are app closures
+  /// that have no business crossing over.
   Sp00kyConfig withoutChannels() => channels == null
       ? this
       : Sp00kyConfig(

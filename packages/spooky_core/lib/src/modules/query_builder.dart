@@ -64,6 +64,11 @@ class RelationPlan {
 typedef QuerySubscriber = Stream<List<Map<String, dynamic>>> Function(
     String hash);
 
+/// Told about a query the moment it is registered: the builder as it stands,
+/// and the hash it registers under once that is known. The client reads what
+/// the query can show from it (`channels.share`).
+typedef QueryObserver = void Function(QueryBuilder query, Future<String> hash);
+
 /// Fluent SURQL query builder. Produces the same SURQL shape as the JS
 /// `buildQueryFromOptions` for select/where/orderBy/limit/offset/one, including
 /// `.related()` subquery projections.
@@ -74,15 +79,18 @@ class QueryBuilder {
     QuerySubscriber? subscriber,
     Map<String, dynamic> schema = const {},
     SpookyLogger? logger,
+    QueryObserver? onRegister,
   })  : _registrar = registrar,
         _subscriber = subscriber,
         _relationships = relationshipsOf(schema),
         _schema = schema,
-        _logger = logger;
+        _logger = logger,
+        _onRegister = onRegister;
 
   final String _table;
   final QueryRegistrar? _registrar;
   final QuerySubscriber? _subscriber;
+  final QueryObserver? _onRegister;
   final Map<String, dynamic> _schema;
   final List<SchemaRelationship> _relationships;
   final SpookyLogger? _logger;
@@ -310,7 +318,9 @@ class QueryBuilder {
       throw StateError('QueryBuilder has no registrar (build-only)');
     }
     final (sql, vars) = build();
-    return registrar(sql, vars, ttl, relations);
+    final hash = registrar(sql, vars, ttl, relations);
+    _onRegister?.call(this, hash);
+    return hash;
   }
 
   /// Register the query and return a result Stream (consume with StreamBuilder).

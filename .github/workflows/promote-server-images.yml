@@ -39,3 +39,11 @@ jobs:
             docker buildx imagetools create \
               -t "mono424/spooky-$role:canary" "mono424/spooky-$role:$IMAGE_VERSION"
           done
+          # The room relay follows when this tag has one: tags built before
+          # the relay existed do not, and that must not fail the promotion.
+          if docker buildx imagetools inspect "mono424/spooky-relay:$IMAGE_VERSION" > /dev/null 2>&1; then
+            docker buildx imagetools create \
+              -t "mono424/spooky-relay:canary" "mono424/spooky-relay:$IMAGE_VERSION"
+          else
+            echo "::notice::mono424/spooky-relay:$IMAGE_VERSION was never published, left as it is"
+          fi

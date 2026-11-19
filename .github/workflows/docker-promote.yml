@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        image: [mono424/spooky-ssp, mono424/spooky-scheduler, mono424/spooky-agent]
+        image: [mono424/spooky-ssp, mono424/spooky-scheduler, mono424/spooky-agent, mono424/spooky-relay]
     steps:
       - name: Validate version
         env:
@@ -47,5 +47,11 @@ jobs:
           VERSION: ${{ inputs.version }}
           CHANNEL: ${{ inputs.channel }}
         run: |
+          # Releases from before the room relay existed have no relay image:
+          # moving a channel onto one of those leaves the relay where it is.
+          if [[ "$IMAGE" == */spooky-relay ]] && ! docker buildx imagetools inspect "$IMAGE:$VERSION" > /dev/null 2>&1; then
+            echo "::notice::$IMAGE:$VERSION was never published, left as it is"
+            exit 0
+          fi
           docker buildx imagetools create -t "$IMAGE:$CHANNEL" "$IMAGE:$VERSION"
           docker buildx imagetools inspect "$IMAGE:$CHANNEL" | head -3

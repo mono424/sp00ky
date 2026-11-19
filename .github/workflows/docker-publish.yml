@@ -104,6 +104,24 @@ jobs:
             cache_scope: spooky-agent
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+          # The room relay: one static binary built from its own crate alone,
+          # published under the same tag as the SSP so `relay: true` in
+          # sp00ky.yml finds an image for every release. Its own cache scope,
+          # for the reason the agent has one.
+          - image: mono424/spooky-relay
+            short: relay
+            dockerfile: apps/relay/Dockerfile
+            target: ""
+            cache_scope: spooky-relay
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - image: mono424/spooky-relay
+            short: relay
+            dockerfile: apps/relay/Dockerfile
+            target: ""
+            cache_scope: spooky-relay
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -161,6 +179,8 @@ jobs:
             artifact_prefix: scheduler
           - image: mono424/spooky-agent
             artifact_prefix: agent
+          - image: mono424/spooky-relay
+            artifact_prefix: relay
     steps:
       - name: Download amd64 digest
         uses: actions/download-artifact@v4

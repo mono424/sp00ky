@@ -16,9 +16,9 @@ import LinkCard from '../../../components/ui/LinkCard.astro';
   is experimental. The protocol may change between releases.
 </Experimental>
 
-`sp00ky-relay` is the server a user's devices meet on. A browser signs in to it with its session
-token, lands in the room of that user, and everything it sends there is passed on to the other
-devices in the room. That is how a change made on the phone shows on the laptop before the
+`sp00ky-relay` is the server a user's devices meet on. A client (a browser, a Flutter app, a Rust
+app) signs in to it with its session token, lands in the room of that user, and everything it sends
+there is passed on to the other devices in the room. That is how a change made on the phone shows on the laptop before the
 database has seen it.
 
 It is deliberately small:
@@ -136,7 +136,7 @@ A refusal is `{"t":"error","code":"..."}` followed by a close:
 | `unauthorized` | The token is invalid or belongs to no user. |
 | `unavailable` | The relay could not reach the database. |
 | `room_full` | The room has `SPKY_RELAY_MAX_ROOM_PEERS` members. |
-| `replaced` | Another connection joined with the same `peer`. |
+| `replaced` | Another connection joined with the same `peer` and took its place. The others see that peer `leave` and `join`. |
 | `rate_limited` | The connection kept sending above its rate. |
 | `reauth` | The session reached `SPKY_RELAY_SESSION_SECS`. Connect again with the current token. |
 

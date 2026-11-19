@@ -309,6 +309,28 @@ travel between peers and never reach the database. The channel closes when dropp
 `channel.set_peers(..)` and `channel.set_queries(..)` change it in place. See
 [Peer to peer channels](/docs/client/channels) for the model, accept rules and TURN servers.
 
+### Your own devices
+
+`ChannelsConfig::share` sends this user's optimistic writes straight to their other devices through
+the [room relay](/docs/reference/relay), whatever those run: a Rust app, a browser tab and a Flutter
+app of one user sit in one room. It needs no `-- @channel` mark and no WebRTC stack, only the
+default `remote` feature.
+
+<CodeBlock code={shareCode} lang="rust" />
+
+- `share("note")` shares every row of the table, `share_rows("task", |row| ..)` only the rows the
+  test passes (asked on the device that writes and on the one that receives). A table not named is
+  not shared.
+- A device is only sent writes its live queries can show. Prefer `live(query)` over `live_raw`: raw
+  SurrealQL counts as showing every shared row.
+- `client.share_state()` and `share_state_watch()` report the link: `Connected` while another device
+  of the user is in the room, `Connecting` while alone, `Failed` when the relay refuses or cannot be
+  reached, `Unsupported` without `relay` or without the `remote` feature.
+- A native client always talks through the relay. The direct link two browsers open between
+  themselves is for browsers.
+
+See [Your own devices](/docs/client/channels#your-own-devices) for what is sent and why.
+
 ## Native push
 
 <Experimental>
@@ -747,6 +769,17 @@ fn main() {
     println!("cargo:rerun-if-changed=schema/src/schema.surql");
     println!("cargo:rerun-if-changed=api/openapi.yml");
 }`;
+
+export const shareCode = `use spooky_core::modules::channel::ChannelsConfig;
+use spooky_core::Value;
+
+let mut config = db::config(database);
+config.channels = Some(
+    ChannelsConfig::default()
+        .share("note")
+        .share_rows("task", |row| row.get("draft") != Some(&Value::Bool(true)))
+        .relay("wss://relay.example.com/room"),
+);`;
 
 export const channelsConfigCode = `use std::rc::Rc;
 use std::sync::Arc;

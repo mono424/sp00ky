@@ -253,11 +253,21 @@ little means that device waits for the normal sync, as it does today.
 least one other browser of yours is in the room, `connecting` or `failed` otherwise, `idle` when
 nothing is shared or nobody is signed in. `subscribeShareState(cb)` calls back on every change.
 
-<Note title="What this does not do yet">
-  Rooms are in the web client only. A Flutter or Rust client of the same user is not in the room and
-  gets the change at normal sync speed. Tabs of one browser are not connected to each other this
-  way either. And the direct link exists between your own two browsers only; channels to other
-  users keep their own WebRTC connections.
+### Every kind of client
+
+Browsers, Flutter apps and Rust apps of one user sit in the same room and understand each other.
+A native app is one member with one socket; it needs no WebRTC for this and always talks through the
+relay (the direct link is between two browsers). Configure it the same way:
+
+<CodeBlock code={dartShareCode} lang="dart" />
+
+`client.shareState` and the `client.shareStates` stream report the link in Dart. For Rust see
+[the Rust guide](/docs/guide/rust#your-own-devices).
+
+<Note title="What this does not do">
+  Tabs of one browser are not connected to each other this way: they may share one local store. And
+  a room holds one user's devices only. To reach other users, open a channel to them as described
+  above; those keep their own WebRTC connections.
 </Note>
 
 ## Flutter and Dart
@@ -295,8 +305,7 @@ and Flutter apps. It ships no WebRTC either: adapt one (webrtc-rs, libwebrtc bin
 ## Limits
 
 - Mesh topology between users, so small groups.
-- Sharing with your own devices needs the [room relay](/docs/reference/relay) and, for now, the web
-  client.
+- Sharing with your own devices needs the [room relay](/docs/reference/relay).
 
 <CardGrid>
   <LinkCard title="Mutations" href="/docs/client/mutations" description="The optimistic writes channels build on." />
@@ -399,6 +408,17 @@ export const shareCode = `const db = new SyncedDb({
     },
   },
 });`;
+
+export const dartShareCode = `final client = Sp00kyClient(Sp00kyConfig(
+  // ...
+  channels: ChannelsConfig(
+    relay: ChannelRelayConfig('wss://relay.example.com/room'),
+    share: ChannelShareConfig(tables: {
+      'game': ChannelShareRule.all,
+      'note': ChannelShareRule.where((row) => row['draft'] != true),
+    }),
+  ),
+));`;
 
 export const followCode = `// Exactly the call row, while the call is up.
 useChannel(

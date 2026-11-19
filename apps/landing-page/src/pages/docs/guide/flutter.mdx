@@ -404,6 +404,20 @@ milliseconds instead of after a sync round. Pass `spooky_flutter`'s
 `flutterWebRtc` as `ChannelsConfig(rtc: ...)` and open one with
 `client.channel(query, peers)`. See [Peer to peer channels](/docs/client/channels#flutter-and-dart).
 
+### Your own devices
+
+`ChannelsConfig(share: ...)` sends this user's optimistic writes straight to their other devices
+through the [room relay](/docs/reference/relay): a change made in the Flutter app shows in the
+browser, and the other way round, before the server has it. It needs no WebRTC, so `rtc` can stay
+unset for this.
+
+<CodeBlock code={shareCode} lang="dart" />
+
+`client.shareState` and the `client.shareStates` stream report the link (`connected` while another
+device of the user is in the room). Queries built with `client.query(...)` tell the other devices
+what this one shows; a stream on raw SurrealQL asks for every shared write. See
+[Your own devices](/docs/client/channels#your-own-devices).
+
 ## Push notifications
 
 The `spooky_push` plugin adds native push: APNs on iOS, FCM on Android, from the
@@ -440,3 +454,14 @@ same `push:` rules as the web, with no Firebase setup in the app. `db.push` in
 </CardGrid>
 
 Pair this with a state-management solution such as Riverpod for reactive data binding.
+
+export const shareCode = `final client = Sp00kyClient(Sp00kyConfig(
+  // ...
+  channels: ChannelsConfig(
+    relay: ChannelRelayConfig('wss://relay.example.com/room'),
+    share: ChannelShareConfig(tables: {
+      'game': ChannelShareRule.all,
+      'note': ChannelShareRule.where((row) => row['draft'] != true),
+    }),
+  ),
+));`;

@@ -158,7 +158,10 @@ Settings for [peer to peer channels](/docs/client/channels) on `-- @channel` tab
   from also opening a WebRTC link to each other. Each browser keeps one socket to it, shared by its
   tabs.
 
-`share` and `relay` exist in the web client only for now.
+Dart and Rust have both: `ChannelsConfig(relay: ChannelRelayConfig(url), share:
+ChannelShareConfig(tables: {'game': ChannelShareRule.all, 'note': ChannelShareRule.where(test)}))`
+in Dart, `ChannelsConfig::default().share("game").share_rows("note", test).relay(url)` in Rust. A
+native client always talks through the relay, so `direct` does nothing there.
 
 In Dart (`spooky_core`) the same keys live on `ChannelsConfig` (`accept`, `iceServers`, `transport`,
 `confirmTimeoutMs`), plus `rtc`: the peer connection factory, `flutterWebRtc` from `spooky_flutter`.

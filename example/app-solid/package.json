@@ -1,6 +1,6 @@
 {
   "name": "@example/app-solid",
-  "version": "1.0.0-beta.8",
+  "version": "1.0.0-beta.9",
   "description": "Solid.js Thread Application with Authentication",
   "type": "module",
   "scripts": {

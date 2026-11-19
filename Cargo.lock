@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "maintenance"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5780,7 +5780,7 @@ dependencies = [
 
 [[package]]
 name = "push-core"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -6934,7 +6934,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7508,7 +7508,7 @@ dependencies = [
 
 [[package]]
 name = "sp00ky-cli"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7546,7 +7546,7 @@ dependencies = [
 
 [[package]]
 name = "sp00ky-relay"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -7612,7 +7612,7 @@ dependencies = [
 
 [[package]]
 name = "spooky-core"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -7645,7 +7645,7 @@ dependencies = [
 
 [[package]]
 name = "ssp"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -7673,7 +7673,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-ffi"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "libc",
@@ -7684,7 +7684,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-node"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7712,7 +7712,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-portable"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7735,7 +7735,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-protocol"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -7746,7 +7746,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-server"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7784,7 +7784,7 @@ dependencies = [
 
 [[package]]
 name = "ssp-wasm"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",

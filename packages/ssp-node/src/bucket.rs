@@ -234,8 +234,15 @@ impl BucketService {
             format!("Bearer {token}"),
         );
         let target_expr = if target.is_some() { "type::file($bucket, $target)" } else { "NONE" };
+        // The session's namespace and database come back with the verdict and
+        // are compared with this node's own before the verdict counts.
+        // SurrealDB takes them from the TOKEN, not from the `surreal-ns` and
+        // `surreal-db` headers this request carries: a token of another
+        // database on the same instance runs the statement THERE, where
+        // `fn::_00_bucket::<bucket>` is whatever that database's owner
+        // defined, an always-true function included. Seen on 3.3.5 and 4.0.1.
         let surql = format!(
-            "RETURN fn::_00_bucket::{bucket}($action, type::file($bucket, $key), {target_expr});"
+            "RETURN [session::ns(), session::db(), fn::_00_bucket::{bucket}($action, type::file($bucket, $key), {target_expr})];"
         );
         let mut binds = vec![
             ("bucket", json!(bucket)),
@@ -246,8 +253,14 @@ impl BucketService {
             binds.push(("target", json!(target)));
         }
         match db.query(&surql, &binds).await {
-            Ok(rows) if rows.first() == Some(&Value::Bool(true)) => Ok(()),
-            Ok(_) => Err(error(403, "not allowed")),
+            Ok(rows) => match verdict(rows.first(), &self.ns, &self.db) {
+                Verdict::Allowed => Ok(()),
+                Verdict::Denied => Err(error(403, "not allowed")),
+                Verdict::Foreign => {
+                    tracing::warn!(bucket, action = action.name(), "refused a bucket request made with a token of another database");
+                    Err(error(401, "invalid or expired token"))
+                }
+            },
             Err(DbError::Auth(_)) => Err(error(401, "invalid or expired token")),
             Err(DbError::Query(msg)) if msg.contains("does not exist") => {
                 Err(error(404, "no such bucket"))
@@ -263,6 +276,32 @@ impl BucketService {
                 Err(error(502, "permission check failed"))
             }
         }
+    }
+}
+
+/// What the permission call concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Allowed,
+    Denied,
+    /// The token is valid, but for another database of the instance: what its
+    /// function answered says nothing about this bucket.
+    Foreign,
+}
+
+/// Read `[session::ns(), session::db(), <the function's answer>]`. Only a
+/// literal `true` from the function of THIS namespace and database allows.
+fn verdict(answer: Option<&Value>, ns: &str, db: &str) -> Verdict {
+    let Some([session_ns, session_db, allowed]) = answer.and_then(Value::as_array).map(Vec::as_slice) else {
+        return Verdict::Denied;
+    };
+    if session_ns.as_str() != Some(ns) || session_db.as_str() != Some(db) {
+        return Verdict::Foreign;
+    }
+    if allowed == &Value::Bool(true) {
+        Verdict::Allowed
+    } else {
+        Verdict::Denied
     }
 }
 
@@ -432,6 +471,12 @@ mod tests {
                 results.push(statement);
                 json!({ "id": 1, "result": results }).to_string()
             };
+            // A token of another database on the same instance: SurrealDB runs
+            // the statement there, whatever the headers say, and that
+            // database's own function allows everything.
+            if auth == "Bearer foreign" {
+                return Ok(OutboundResponse { status: 200, body: answer(json!({ "status": "OK", "result": ["evil", "evil", true] })) });
+            }
             if auth != "Bearer good" {
                 return Ok(OutboundResponse { status: 401, body: "InvalidToken".into() });
             }
@@ -440,7 +485,7 @@ mod tests {
                 return Ok(OutboundResponse { status: 200, body: answer(json!({ "status": "ERR", "result": msg })) });
             }
             let allowed = vars["action"] != "delete";
-            Ok(OutboundResponse { status: 200, body: answer(json!({ "status": "OK", "result": allowed })) })
+            Ok(OutboundResponse { status: 200, body: answer(json!({ "status": "OK", "result": ["ns", "db", allowed] })) })
         }
     }
 
@@ -503,6 +548,42 @@ mod tests {
         // A bucket without a permission function is not an r2 bucket.
         assert_eq!(service.handle(req(Method::Get, "/bucket/nope/a.png", Some("good"), b"")).await.status, 404);
         assert_eq!(service.handle(req(Method::Get, "/bucket/pics/missing.png", Some("good"), b"")).await.status, 404);
+    }
+
+    #[tokio::test]
+    async fn a_token_of_another_database_is_refused_whatever_its_function_says() {
+        let (service, store, db) = service();
+        store.put("pics/a.png", Bytes::from_static(b"secret"), "image/png").await.unwrap();
+        // The statement ran in the token's own database, whose function said
+        // yes. Reading, writing, deleting and the JSON operations all stop.
+        let get = service.handle(req(Method::Get, "/bucket/pics/a.png", Some("foreign"), b"")).await;
+        assert_eq!(get.status, 401);
+        assert!(!matches!(get.body, ApiBody::Bytes { .. }), "the file must not be served");
+        assert_eq!(service.handle(req(Method::Put, "/bucket/pics/b.png", Some("foreign"), b"mine")).await.status, 401);
+        assert_eq!(service.handle(req(Method::Delete, "/bucket/pics/a.png", Some("foreign"), b"")).await.status, 401);
+        let exists = service.handle(req(Method::Post, "/bucket/pics/a.png", Some("foreign"), br#"{"op":"exists"}"#)).await;
+        assert_eq!(exists.status, 401);
+        assert_eq!(store.keys(), vec!["pics/a.png".to_string()]);
+        // The question itself names where it was answered.
+        assert!(db.calls.lock().unwrap()[0].0.contains("session::ns(), session::db()"));
+    }
+
+    #[test]
+    fn only_true_from_the_own_database_allows() {
+        let own = |allowed: Value| json!(["ns", "db", allowed]);
+        assert_eq!(verdict(Some(&own(json!(true))), "ns", "db"), Verdict::Allowed);
+        for no in [json!(false), json!(null), json!("true"), json!(1)] {
+            assert_eq!(verdict(Some(&own(no)), "ns", "db"), Verdict::Denied);
+        }
+        assert_eq!(verdict(Some(&json!(["other", "db", true])), "ns", "db"), Verdict::Foreign);
+        assert_eq!(verdict(Some(&json!(["ns", "other", true])), "ns", "db"), Verdict::Foreign);
+        assert_eq!(verdict(Some(&json!([null, null, true])), "ns", "db"), Verdict::Foreign);
+        // Anything that is not the three answers allows nothing: a bare
+        // `true`, as an older statement returned it, least of all.
+        for odd in [json!(true), json!([true]), json!(["ns", "db"]), json!(["ns", "db", true, true]), json!({})] {
+            assert_eq!(verdict(Some(&odd), "ns", "db"), Verdict::Denied);
+        }
+        assert_eq!(verdict(None, "ns", "db"), Verdict::Denied);
     }
 
     #[tokio::test]

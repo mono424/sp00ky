@@ -61,10 +61,10 @@ docker run --rm -p 8668:8668 \
 <div class="relative overflow-hidden rounded-glass border p-4 my-6 flex items-start gap-3 shadow-glass-inset border-amber-500/20 bg-amber-500/[0.07]"> <div class="shrink-0 mt-0.5 text-amber-500"> <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"> <path fill-rule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003ZM12 8.25a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-1.5 0V9a.75.75 0 0 1 .75-.75Zm0 8.25a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" clip-rule="evenodd"></path> </svg> </div> <div class="text-sm leading-relaxed [&#38;>p]:my-2 [&#38;>:first-child]:mt-0 [&#38;>:last-child]:mb-0 text-amber-200/70"> <strong class="block mb-1 text-sm font-medium text-amber-500">Put TLS in front of it</strong> <p>The relay speaks plain WebSocket. Run it behind the reverse proxy that already terminates TLS for
 your other services and give the clients a <code>wss://</code> address: the first frame carries a session
 token.</p> </div> </div>
-<p>The image <code>mono424/spooky-relay</code> is published with every release, under the same tags as the SSP
-and the scheduler, starting with the first release after 1.0.0-beta.8. Until that release is out,
-build it yourself and name it in <code>relay.image</code> (<code>spky dev</code> runs a local image; a deploy pulls it,
-so push it to a registry first). Cloudflare projects cannot run it yet.</p>
+<p>The image <code>mono424/spooky-relay</code> is published with every release since 1.0.0-beta.9, under the
+same tags as the SSP and the scheduler. To run a build of your own, name it in <code>relay.image</code>
+(<code>spky dev</code> runs a local image; a deploy pulls it, so push it to a registry first). Cloudflare
+projects cannot run it yet.</p>
 <p>A room lives in the memory of one process, so all devices of a user have to reach the same
 instance. One instance is enough for a long way: it holds a socket per browser and copies small
 frames.</p>

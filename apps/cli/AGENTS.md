@@ -114,6 +114,10 @@ DEFINE TABLE audit_log SCHEMALESS;
 
 A descriptor must sit directly above its statement (no blank line between). One that attaches to nothing is warned about, not silently dropped (`annotations::warn_unattached_annotations`). A descriptor is the marker alone plus at most one value token (`-- @crdt text`); a longer comment that merely starts with a marker name is prose, not an annotation, and `-- @nosync true` is refused with a warning.
 
+## Room relay (`relay:` in `sp00ky.yml`)
+
+`relay: true` (or `relay: { image: ... }`, on unless `enabled: false`) runs the room relay (`apps/relay`, image `mono424/spooky-relay` at the tag of this CLI's release channel) for the client's `channels.share`. It is not a service of its own in the CLI: `Sp00kyConfig::expand_relay` (`backend.rs`, called by `parse_config_with_includes`) turns the key into a `type: docker` app named `relay` (`RELAY_APP`) with port 8668, `healthcheck: /health`, `deploy: { expose: true }` and, for dev, `SPKY_DB_URL=http://surrealdb:8000`. So every path that walks docker apps handles it unchanged: `spky dev` starts container `sp00ky-dev-relay` with the other docker apps, `spky deploy` pulls the image and ships it as an exposed backend at `{slug}-relay.<domain>`. Added on top: `SPKY_RELAY_URL` / `VITE_SPKY_RELAY_URL` (`ws://localhost:8668/room`) in the dev env of every app and a "Relay" row in the ready banner (`dev.rs`), `VITE_SPKY_RELAY_URL=wss://{slug}-relay.<domain>/room` as a frontend build arg on deploy (`derive_relay_ws_endpoint` in `cloud.rs`; a user value wins), and a warning plus skip on a Cloudflare project, which runs no containers. An app of the user's own named `relay` is an error while `relay:` is on. The cloud's git-linked builder does the same expansion (`spooky-cloud` `internal/linking/relay.go`): keep the two in step. Docs: `/docs/reference/config#relay`, `/docs/reference/relay`.
+
 ## Docker dev apps (`type: docker`)
 
 Besides `backend`/`frontend` apps, `sp00ky.yml` can declare `type: docker` apps —

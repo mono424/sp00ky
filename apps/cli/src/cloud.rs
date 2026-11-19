@@ -154,6 +154,16 @@ fn derive_db_ws_endpoint(api_url: &str, slug: &str) -> Option<String> {
     }
 }
 
+/// The room relay of a project (`relay: true`), which the control plane
+/// exposes like any backend named `relay`.
+/// api-stg.sp00ky.cloud → wss://{slug}-relay.stg.spky.cloud/room
+/// api.sp00ky.cloud → wss://{slug}-relay.spky.cloud/room
+fn derive_relay_ws_endpoint(api_url: &str, slug: &str) -> Option<String> {
+    let db = derive_db_ws_endpoint(api_url, slug)?;
+    let host = db.strip_prefix(&format!("wss://{}-db.", slug))?.strip_suffix("/rpc")?;
+    Some(format!("wss://{}-{}.{}{}", slug, backend::RELAY_APP, host, backend::RELAY_PATH))
+}
+
 /// The free plan's SSP Worker, where the client reads and writes `r2` bucket
 /// files (the control plane attaches it as `{slug}.db.<app domain>`).
 /// api-stg.sp00ky.cloud → https://{slug}.db.stg.spky.cloud
@@ -3139,6 +3149,15 @@ pub fn deploy(
             println!("  Skipping devOnly docker app '{}' (local dev only)", name);
             continue;
         }
+        // `relay: true` is a long-lived WebSocket container, and a Cloudflare
+        // project runs none: say so instead of failing the deploy on it.
+        if name == backend::RELAY_APP && config.relay_enabled() && platform == "cloudflare" {
+            crate::ui::warn(
+                "`relay:` is set, but a Cloudflare project cannot run the room relay yet; \
+                 it is skipped here. Run it elsewhere and give the client its address.",
+            );
+            continue;
+        }
         // --only: skip docker apps not in the selected subset.
         if let Some(ref f) = only_filter {
             if !f.contains(name) {
@@ -3575,6 +3594,15 @@ pub fn deploy(
             build_args.push("--build-arg".to_string());
             build_args.push(format!("VITE_DB_ENDPOINT={}", endpoint));
             println!("  DB endpoint: {}", endpoint);
+        }
+        // `relay: true`: the address the client's `channels.relay` connects
+        // to. Before the user's env, so a value of theirs wins.
+        if config.relay_enabled() && platform != "cloudflare" {
+            if let Some(endpoint) = derive_relay_ws_endpoint(&client.base_url, &slug) {
+                build_args.push("--build-arg".to_string());
+                build_args.push(format!("VITE_SPKY_RELAY_URL={}", endpoint));
+                println!("  Relay endpoint: {}", endpoint);
+            }
         }
         // Frontend env (sp00ky.yml env.vault whitelist, e.g. VITE_GOOGLE_CLIENT_ID,
         // VITE_TWITCH_CLIENT_ID) must reach the build as --build-arg: a static SPA
@@ -4404,6 +4432,19 @@ mod version_skew_tests {
             Some("https://app.db.spky.cloud")
         );
         assert_eq!(derive_cf_ssp_url("http://localhost:8080", "app"), None);
+    }
+
+    #[test]
+    fn the_relay_endpoint_follows_the_api_host() {
+        assert_eq!(
+            derive_relay_ws_endpoint("https://api-stg.sp00ky.cloud", "demo").as_deref(),
+            Some("wss://demo-relay.stg.spky.cloud/room")
+        );
+        assert_eq!(
+            derive_relay_ws_endpoint("https://api.sp00ky.cloud/", "demo").as_deref(),
+            Some("wss://demo-relay.spky.cloud/room")
+        );
+        assert_eq!(derive_relay_ws_endpoint("http://localhost:8080", "demo"), None);
     }
 
     #[test]

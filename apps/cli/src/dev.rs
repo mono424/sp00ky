@@ -1569,6 +1569,9 @@ fn print_ready_banner(
     if *mode == DeployMode::Cluster {
         rows.push(BoxRow::dim("Scheduler", format!("http://localhost:{}", SCHEDULER_PORT)));
     }
+    if config.relay_enabled() {
+        rows.push(BoxRow::dim("Relay", dev_relay_url()));
+    }
 
     let mut backend_rows: Vec<BoxRow> = Vec::new();
     for (name, app) in config.backends() {
@@ -2562,6 +2565,7 @@ fn remove_pool_machines() {
 
 /// Build the auto-injected SPKY_* environment variables for dev mode.
 fn build_spky_dev_vars(
+    config: &Sp00kyConfig,
     resolved_surreal: &ResolvedSurrealDb,
     mode: &DeployMode,
 ) -> Vec<(String, String)> {
@@ -2593,7 +2597,19 @@ fn build_spky_dev_vars(
             format!("http://localhost:{}", SCHEDULER_PORT),
         ));
     }
+    // `relay: true`: where the client's `channels.relay` connects. Twice, as
+    // for the files endpoint: Vite only shows the browser what starts `VITE_`.
+    if config.relay_enabled() {
+        let url = dev_relay_url();
+        vars.push(("SPKY_RELAY_URL".into(), url.clone()));
+        vars.push(("VITE_SPKY_RELAY_URL".into(), url));
+    }
     vars
+}
+
+/// The room relay as a browser on this machine reaches it.
+fn dev_relay_url() -> String {
+    format!("ws://localhost:{}{}", backend::RELAY_PORT, backend::RELAY_PATH)
 }
 
 /// Merge SPKY auto-injected vars with user-provided vars. User vars take precedence.
@@ -2644,7 +2660,7 @@ fn spawn_frontend_dev(
     if let Some((name, frontend)) = config.frontend().filter(|(_, fe)| fe.runs_in_dev()) {
         step.set_message(format!("starting {}…", name));
         warn_frontend_vault_no_whitelist(name, &frontend.env);
-        let spky_vars = build_spky_dev_vars(resolved_surreal, mode);
+        let spky_vars = build_spky_dev_vars(config, resolved_surreal, mode);
         let user_envs = resolve_env_for_dev(&frontend.env, project_dir);
         let envs = merge_spky_with_user_env(&spky_vars, user_envs);
         // Use the same dev config dispatch as backends
@@ -2786,7 +2802,7 @@ fn spawn_backend_dev_commands(
     mode: &DeployMode,
     step: &ui::Step,
 ) -> Vec<LogTailGuard> {
-    let spky_vars = build_spky_dev_vars(resolved_surreal, mode);
+    let spky_vars = build_spky_dev_vars(config, resolved_surreal, mode);
     let mut guards = Vec::new();
     let mut color_idx = 0;
     for (name, app) in config.backends() {
@@ -2889,7 +2905,7 @@ fn spawn_docker_app_devs(
     step: &ui::Step,
 ) -> Vec<LogTailGuard> {
     use std::collections::BTreeMap;
-    let spky_vars = build_spky_dev_vars(resolved_surreal, mode);
+    let spky_vars = build_spky_dev_vars(config, resolved_surreal, mode);
     let mut guards = Vec::new();
     let mut color_idx = 0;
 

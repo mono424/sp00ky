@@ -556,6 +556,11 @@ pub struct Sp00kyConfig {
     /// when off, every deploy removes the access method and functions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub impersonation: Option<ImpersonationConfig>,
+    /// The room relay (`relay: true`): the small server a user's devices meet
+    /// on to send each other optimistic writes (`channels.share` in the
+    /// client). Off unless set. See [`RelayConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayConfig>,
     /// Web Push rules (`push:`): which row changes notify which users. The
     /// types and their validation live in `push-core`, shared with the engine
     /// that reads them back from `_00_push_config:default`. May be a path to a
@@ -626,6 +631,110 @@ impl Sp00kyConfig {
     /// `impersonation:` with defaults filled in.
     pub fn impersonation(&self) -> ImpersonationConfig {
         self.impersonation.clone().unwrap_or_default()
+    }
+
+    /// Whether `relay:` asks for the room relay.
+    pub fn relay_enabled(&self) -> bool {
+        self.relay.as_ref().is_some_and(RelayConfig::enabled)
+    }
+
+    /// Turn `relay:` into the app that runs it.
+    ///
+    /// The relay is one container with one port, which is exactly what a
+    /// `type: docker` app is, so it becomes one named [`RELAY_APP`]: `spky dev`
+    /// starts it with the other docker apps (network, health wait, logs,
+    /// cleanup) and `spky deploy` ships it as an exposed backend, reachable at
+    /// `{slug}-relay.<domain>`. Called once, by the canonical parse.
+    pub fn expand_relay(&mut self) -> Result<()> {
+        let Some(relay) = self.relay.clone().filter(RelayConfig::enabled) else {
+            return Ok(());
+        };
+        if self.apps.contains_key(RELAY_APP) {
+            bail!(
+                "`relay:` is on, and `apps.{RELAY_APP}` exists already: `relay:` runs the room relay as an                  app of that name. Rename your app, or drop `relay:` if that app is your own relay."
+            );
+        }
+        // Inside the dev network the database is `surrealdb:8000`, not the
+        // `localhost` the auto-injected variable names (that one is for
+        // processes on the host). An external database keeps what it was given.
+        let dev_env = if self.resolved_surrealdb().hosting == HostingMode::External {
+            String::new()
+        } else {
+            "env:\n  dev:\n    SPKY_DB_URL: http://surrealdb:8000\n".to_string()
+        };
+        let yaml = format!(
+            "type: docker\n\
+             image: '{image}'\n\
+             ports: [{port}]\n\
+             healthcheck: /health\n\
+             {dev_env}\
+             deploy:\n  port: {port}\n  expose: true\n  healthcheck: /health\n  \
+             resources: {{ vcpus: 1, memory: 256, disk: 1 }}\n",
+            image = relay.image(),
+            port = RELAY_PORT,
+        );
+        let app: AppConfig = serde_yaml::from_str(&yaml).context("building the relay app")?;
+        self.apps.insert(RELAY_APP.to_string(), app);
+        Ok(())
+    }
+}
+
+/// The app name `relay:` runs the room relay under, and so its container
+/// (`sp00ky-dev-relay`) and its public host (`{slug}-relay.<domain>`).
+pub const RELAY_APP: &str = "relay";
+/// The port the relay listens on.
+pub const RELAY_PORT: u16 = 8668;
+/// The path of its WebSocket.
+pub const RELAY_PATH: &str = "/room";
+/// Its image, published under the same tags as the SSP and the scheduler.
+pub const RELAY_IMAGE: &str = "mono424/spooky-relay";
+
+/// `relay:` in sp00ky.yml.
+///
+/// ```yaml
+/// relay: true
+/// # or, to name the image yourself (a locally built one, a pinned tag):
+/// relay:
+///   image: mono424/spooky-relay:1.0.0
+/// ```
+///
+/// Runs `sp00ky-relay` next to the other services: in `spky dev` as a
+/// container on port 8668, in the cloud as a public `wss://` endpoint. The
+/// frontend gets its address as `VITE_SPKY_RELAY_URL`, to hand to the client's
+/// `channels.relay`.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum RelayConfig {
+    /// `relay: true` / `relay: false`.
+    Switch(bool),
+    /// `relay: { ... }`, which is on unless it says `enabled: false`.
+    Options(RelayOptions),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The image to run instead of the one of this CLI's release channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+impl RelayConfig {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Switch(on) => *on,
+            Self::Options(options) => options.enabled.unwrap_or(true),
+        }
+    }
+
+    /// The image to run: the one named, else this release channel's.
+    pub fn image(&self) -> String {
+        match self {
+            Self::Options(RelayOptions { image: Some(image), .. }) if !image.trim().is_empty() => image.trim().to_string(),
+            _ => format!("{RELAY_IMAGE}:{DEFAULT_VERSION_CHANNEL}"),
+        }
     }
 }
 
@@ -2929,7 +3038,10 @@ pub fn parse_config_with_includes(content: &str, base_dir: &Path) -> Result<Sp00
         serde_yaml::from_str(content).context("failed to parse sp00ky manifest")?;
     resolve_app_includes(&mut root, base_dir)?;
     resolve_linked_definitions(&mut root, base_dir)?;
-    serde_yaml::from_value(root).context("failed to interpret sp00ky manifest")
+    let mut config: Sp00kyConfig =
+        serde_yaml::from_value(root).context("failed to interpret sp00ky manifest")?;
+    config.expand_relay()?;
+    Ok(config)
 }
 
 /// Sections whose entries may be linked to an external YAML file instead of
@@ -4666,5 +4778,83 @@ apps:
         ));
         let (_, warnings) = vm.worker_lint(root);
         assert!(warnings.iter().any(|w| w.contains("only a Cloudflare project")), "{warnings:?}");
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn parse(yaml: &str) -> Result<Sp00kyConfig> {
+        parse_config_with_includes(yaml, Path::new("."))
+    }
+
+    #[test]
+    fn off_unless_asked_for() {
+        for yaml in ["{}", "relay: false", "relay:\n  enabled: false\n  image: x:y"] {
+            let config = parse(yaml).unwrap();
+            assert!(!config.relay_enabled(), "{yaml}");
+            assert!(config.apps.is_empty(), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn becomes_a_docker_app_that_dev_runs_and_the_cloud_exposes() {
+        let config = parse("relay: true").unwrap();
+        assert!(config.relay_enabled());
+        let app = &config.apps[RELAY_APP];
+        assert_eq!(app.app_type, AppType::Docker);
+        assert_eq!(app.image.as_deref(), Some(format!("{RELAY_IMAGE}:{DEFAULT_VERSION_CHANNEL}").as_str()));
+        assert_eq!(app.ports.first().and_then(|p| p.host_port()), Some(RELAY_PORT));
+        assert_eq!(app.healthcheck.as_deref(), Some("/health"));
+        assert!(app.runs_in_dev() && app.deploys());
+        let deploy = app.deploy.as_ref().unwrap();
+        assert_eq!(deploy.port, Some(RELAY_PORT));
+        assert!(deploy.expose);
+        assert_eq!(deploy.healthcheck.as_deref(), Some("/health"));
+        assert_eq!(app.deploy_port(), RELAY_PORT);
+        // Listed with the other docker apps, which is what dev and deploy walk.
+        assert!(config.docker_apps().any(|(name, _)| name == RELAY_APP));
+        // And it passes the checks `spky lint` and `spky deploy` run.
+        config.validate_manifest().unwrap();
+    }
+
+    #[test]
+    fn reaches_the_dev_database_by_its_network_name() {
+        let config = parse("relay: true").unwrap();
+        let env = crate::dev::resolve_env_for_dev(&config.apps[RELAY_APP].env, Path::new("."));
+        assert_eq!(env, vec![("SPKY_DB_URL".to_string(), "http://surrealdb:8000".to_string())]);
+        // An external database keeps the address it was given.
+        let external = parse(
+            "relay: true\nsurrealdb:\n  hosting: external\n  endpoint: wss://db.example.com\n",
+        )
+        .unwrap();
+        assert!(external.apps[RELAY_APP].env.is_none());
+    }
+
+    #[test]
+    fn an_options_block_is_on_and_may_name_the_image() {
+        let config = parse("relay:\n  image: ' sp00ky-relay:dev '\n").unwrap();
+        assert!(config.relay_enabled());
+        assert_eq!(config.apps[RELAY_APP].image.as_deref(), Some("sp00ky-relay:dev"));
+        let registry = parse("relay:\n  enabled: true\n  image: localhost:5000/team/relay:1.2\n").unwrap();
+        assert_eq!(registry.apps[RELAY_APP].image.as_deref(), Some("localhost:5000/team/relay:1.2"));
+        assert!(parse("relay: {}").unwrap().relay_enabled());
+    }
+
+    #[test]
+    fn a_typo_or_a_taken_name_is_an_error() {
+        assert!(parse("relay:\n  imgae: x\n").is_err());
+        assert!(parse("relay: maybe").is_err());
+        let err = parse("relay: true\napps:\n  relay:\n    type: docker\n    image: mine:1\n").unwrap_err();
+        assert!(format!("{err:#}").contains("apps.relay"), "{err:#}");
+        // With `relay:` off, an app of that name is nobody's business.
+        assert!(parse("relay: false\napps:\n  relay:\n    type: docker\n    image: mine:1\n").is_ok());
+    }
+
+    #[test]
+    fn stays_out_of_a_manifest_written_back() {
+        let yaml = serde_yaml::to_string(&Sp00kyConfig::default()).unwrap();
+        assert!(!yaml.contains("relay"), "{yaml}");
     }
 }

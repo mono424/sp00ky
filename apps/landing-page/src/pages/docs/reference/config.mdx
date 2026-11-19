@@ -42,6 +42,7 @@ For a fully annotated reference covering every option, see [`example/sp00ky.yml`
 | `refMode` | `dedicated` \| `single` | `dedicated` | Storage layout for the SSP's `_00_list_ref` table. `dedicated` gives each user their own table and works around a SurrealDB v3 LIVE-permission gap. |
 | `sync` | object | `{ transport: http, queryAllowlist: off }` | How row changes reach the scheduler: `transport` (`http` or `changefeed`) and `changefeedRetention`, see [Sync transport](#sync-transport); and whether the SSP refuses query shapes the app does not ship: `queryAllowlist`, see [Query allowlist](#query-allowlist). |
 | `impersonation` | object | `{ enabled: false }` | Lets admins act as other users from the DevTools. See [Impersonation](#impersonation). |
+| `relay` | boolean \| object | `false` | Runs the [room relay](/docs/reference/relay), the server a user's devices meet on for `channels.share`. See [Relay](#relay). |
 | `sessionGuard` | string | (none) | SurrealQL expression over `$auth` and `$token` that decides whether a signed-in session may still sync, so an open WebSocket from before a password reset stops syncing. Applied by `spky migrate`. See [Ending sessions](/docs/client/auth#ending-sessions-session-guard). |
 | `apps` | map | `{}` | Your frontend and backend services. See [Apps](#apps) below. |
 | `pools` | map | `{}` | Machine pools: machines that run one backend's jobs while there is work. See [Machine pools](#machine-pools). |
@@ -203,6 +204,34 @@ What it changes elsewhere: the SSP receives `SPKY_SSP_QUERY_ALLOWLIST` (cloud: m
 | `searchFields` | identifier[] | `[username, email, name]` | Fields the DevTools user picker searches and shows. Missing fields are ignored. |
 
 What it changes elsewhere: the SSP and scheduler receive `SPKY_IMPERSONATION=on` (cloud: merged into both roles' `deployment.env`; `spky dev`: injected into the containers). The generated TypeScript `schema` carries `policy: { impersonation }`, which the DevTools read to decide whether to offer the feature. Only `singlenode` and `cluster` modes support it. Usage, the security model and the audit tables are in [Admin impersonation](/docs/client/impersonation).
+
+## Relay
+
+`relay: true` runs the [room relay](/docs/reference/relay) next to your other services, so the
+client can [share writes with a user's own devices](/docs/client/channels#your-own-devices). Off by
+default.
+
+<CodeBlock code={ymlRelay} lang="yaml" fileName="sp00ky.yml" />
+
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` in a mapping | `relay: true` and `relay: false` are the short form. A mapping is on unless it says `enabled: false`. |
+| `image` | string | `mono424/spooky-relay:<channel of your CLI>` | The image to run: a pinned tag, or one you built yourself. |
+
+What it does:
+
+- **`spky dev`** starts it as a container on port `8668`, with its log lines among the others. Your
+  apps get `SPKY_RELAY_URL` and `VITE_SPKY_RELAY_URL` (`ws://localhost:8668/room`).
+- **`spky deploy` and git-linked pushes** deploy it like an exposed backend named `relay`, at
+  `wss://{slug}-relay.<domain>/room`, and build your frontend with that address in
+  `VITE_SPKY_RELAY_URL` (declare `ARG VITE_SPKY_RELAY_URL` in its Dockerfile, as for
+  `VITE_DB_ENDPOINT`). A value you set yourself wins.
+- **Cloudflare projects** run no containers, so the relay is skipped there with a warning.
+
+It is an app like any other underneath, so an app of your own named `relay` cannot exist beside it.
+Hand the address to the client:
+
+<CodeBlock code={relayClient} lang="ts" />
 
 ## Retention
 
@@ -645,3 +674,17 @@ apps:
       cloud:
         vault:
           - 'API_AUTH_TOKEN'`;
+
+export const ymlRelay = `relay: true
+
+# or name the image yourself
+relay:
+  image: mono424/spooky-relay:1.0.0`;
+
+export const relayClient = `const db = new SyncedDb({
+  // ...
+  channels: {
+    relay: import.meta.env.VITE_SPKY_RELAY_URL,
+    share: { tables: { game: true } },
+  },
+});`;

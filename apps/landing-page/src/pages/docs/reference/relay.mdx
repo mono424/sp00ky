@@ -31,7 +31,15 @@ It is deliberately small:
 
 ## Run it
 
-It is one Rust binary in the repository (`apps/relay`), configured through the environment:
+With the CLI it is one line in `sp00ky.yml`:
+
+<CodeBlock code={ymlCode} lang="yaml" fileName="sp00ky.yml" />
+
+`spky dev` then starts it on port `8668`, and `spky deploy` (or a git-linked push) puts it at
+`wss://{slug}-relay.<domain>/room`. Either way your frontend gets the address as
+`VITE_SPKY_RELAY_URL`. See [`relay` in sp00ky.yml](/docs/reference/config#relay).
+
+On your own servers it is one Rust binary (`apps/relay`), configured through the environment:
 
 <CodeBlock code={runCode} lang="bash" />
 
@@ -49,8 +57,10 @@ Then point the client at it:
   token.
 </Warning>
 
-`spky dev` and Sp00ky Cloud do not start a relay yet, and no image is published. Until then you
-build and run it yourself.
+The image `mono424/spooky-relay` is published with every release, under the same tags as the SSP
+and the scheduler, starting with the first release after 1.0.0-beta.8. Until that release is out,
+build it yourself and name it in `relay.image` (`spky dev` runs a local image; a deploy pulls it,
+so push it to a registry first). Cloudflare projects cannot run it yet.
 
 A room lives in the memory of one process, so all devices of a user have to reach the same
 instance. One instance is enough for a long way: it holds a socket per browser and copies small
@@ -140,6 +150,8 @@ in `apps/relay/README.md`.
   <LinkCard title="Self-hosting" href="/docs/self-hosting" description="The other services you run." />
 </CardGrid>
 
+export const ymlCode = `relay: true`;
+
 export const runCode = `SPKY_DB_URL=http://localhost:8666 \\
 SPKY_DB_NS=main \\
 SPKY_DB_NAME=main \\
@@ -155,7 +167,8 @@ docker run --rm -p 8668:8668 \\
 export const clientCode = `const db = new SyncedDb({
   // ...
   channels: {
-    relay: 'wss://relay.example.com/room',
+    // set by spky dev and spky deploy with relay: true; else your own address
+    relay: import.meta.env.VITE_SPKY_RELAY_URL,
     share: { tables: { game: true } },
   },
 });`;

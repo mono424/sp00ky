@@ -209,8 +209,10 @@ unless you turn it on, and you choose the tables:
   the rows it returns `true` for (asked on the device that writes, and again on the one that
   receives), `false` or leaving the table out shares nothing. The table needs no `-- @channel`:
   these writes only ever reach devices signed in as the same user.
-- **`relay`** is the address of the [room relay](/docs/reference/relay), a small server you run
-  next to the others. Without it nothing is shared, and the client says so in a warning.
+- **`relay`** is the address of the [room relay](/docs/reference/relay), a small server next to
+  the others. Put [`relay: true`](/docs/reference/config#relay) in `sp00ky.yml` and `spky dev` and
+  `spky deploy` start it and hand your frontend its address as `VITE_SPKY_RELAY_URL`. Without an
+  address nothing is shared, and the client says so in a warning.
 
 Nothing else changes: `db.create`, `db.update` and `db.delete` are sent as you make them, and the
 other device treats them like any peer's write (see [Write as usual](#3-write-as-usual) and
@@ -387,7 +389,7 @@ export const iceCode = `channels: {
 export const shareCode = `const db = new SyncedDb({
   // ...
   channels: {
-    relay: 'wss://relay.example.com/room',
+    relay: import.meta.env.VITE_SPKY_RELAY_URL, // from relay: true in sp00ky.yml
     share: {
       tables: {
         game: true,                       // every row

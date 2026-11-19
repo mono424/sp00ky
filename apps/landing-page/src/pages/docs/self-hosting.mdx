@@ -645,9 +645,13 @@ Self-hosted schedulers leave them unset and report `cloud_linked: false`.
 ### Room relay
 
 Only needed for [sharing writes with a user's own devices](/docs/client/channels#your-own-devices).
-`sp00ky-relay` is a separate small binary (`apps/relay`) that reads `SPKY_DB_URL`, `SPKY_DB_NS` and
-`SPKY_DB_NAME` like the others, plus its own `SPKY_RELAY_*` limits. See
-[Room relay](/docs/reference/relay#configuration) for the full list.
+`sp00ky-relay` is a separate small service (`apps/relay`, image `mono424/spooky-relay`) that reads
+`SPKY_DB_URL`, `SPKY_DB_NS` and `SPKY_DB_NAME` like the others, plus its own `SPKY_RELAY_*` limits.
+Add it to the compose file and put it behind your TLS proxy:
+
+<CodeBlock code={composeRelay} lang="yaml" fileName="docker-compose.yml" />
+
+See [Room relay](/docs/reference/relay#configuration) for the full list.
 
 ## Next steps
 
@@ -673,3 +677,15 @@ Only needed for [sharing writes with a user's own devices](/docs/client/channels
     description="Let an AI assistant read and operate the deployment."
   />
 </CardGrid>
+
+export const composeRelay = `  relay:
+    image: mono424/spooky-relay:latest
+    restart: unless-stopped
+    ports:
+      - "8668:8668"
+    environment:
+      SPKY_DB_URL: http://surrealdb:8000
+      SPKY_DB_NS: main
+      SPKY_DB_NAME: main
+    depends_on:
+      - surrealdb`;

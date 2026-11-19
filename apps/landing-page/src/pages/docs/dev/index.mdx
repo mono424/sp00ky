@@ -23,6 +23,7 @@ down.
 | SurrealDB | `http://localhost:8666` | The database. Your client connects here. |
 | SSP | `http://localhost:8667` | Incremental view maintenance and the job runner. |
 | Scheduler | `http://localhost:9667` | Cluster coordinator. Only in `mode: cluster`. |
+| Relay | `ws://localhost:8668/room` | The [room relay](/docs/reference/relay). Only with [`relay: true`](/docs/reference/config#relay). |
 
 Any app in `sp00ky.yml` with a `dev` block starts too. See
 [Dev servers & sidecars](/docs/dev/servers).
@@ -76,8 +77,8 @@ With `spky dev` running:
   [`spky jobs`](/docs/jobs) or [`spky logs`](/docs/cloud/logs) depending on what's stuck.
 
 <Note>
-  Ports 8666, 8667 and 9667 must be free. `spky dev` checks them up front and tells you which
-  process is holding one.
+  Ports 8666, 8667 and 9667 must be free (and 8668 with `relay: true`). `spky dev` checks them up
+  front and tells you which process is holding one.
 </Note>
 
 ## Next

@@ -221,6 +221,20 @@
       "description": "SurrealQL expression over `$auth` and `$token` that says whether a signed-in session may still sync, e.g. `$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch`. Becomes `fn::sp00ky::session_live()`, which sp00ky's edge tables, `_00_query` and `fn::query::register` ask, so a WebSocket that signed in before a password reset stops syncing without reconnecting. Unset: every session is live.",
       "examples": ["$auth.session_epoch = NONE OR ($token.iat ?? 0) >= $auth.session_epoch"]
     },
+    "relay": {
+      "description": "Run the room relay (sp00ky-relay), the server a user's devices meet on for the client's channels.share. spky dev starts it on port 8668, deploys expose it at {slug}-relay.<domain>.",
+      "oneOf": [
+        { "type": "boolean" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "description": "A mapping is on unless this is false." },
+            "image": { "type": "string", "description": "Image to run instead of mono424/spooky-relay at the tag of this CLI's release channel." }
+          }
+        }
+      ]
+    },
     "sync": {
       "$ref": "#/$defs/syncConfig"
     },

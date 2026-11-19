@@ -371,7 +371,9 @@ are not shared, and nothing is shared unless this is set. Needs <code>relay</cod
 from also opening a WebRTC link to each other. Each browser keeps one socket to it, shared by its
 tabs.</li>
 </ul>
-<p><code>share</code> and <code>relay</code> exist in the web client only for now.</p>
+<p>Dart and Rust have both: <code>ChannelsConfig(relay: ChannelRelayConfig(url), share: ChannelShareConfig(tables: {&#39;game&#39;: ChannelShareRule.all, &#39;note&#39;: ChannelShareRule.where(test)}))</code>
+in Dart, <code>ChannelsConfig::default().share(&quot;game&quot;).share_rows(&quot;note&quot;, test).relay(url)</code> in Rust. A
+native client always talks through the relay, so <code>direct</code> does nothing there.</p>
 <p>In Dart (<code>spooky_core</code>) the same keys live on <code>ChannelsConfig</code> (<code>accept</code>, <code>iceServers</code>, <code>transport</code>,
 <code>confirmTimeoutMs</code>), plus <code>rtc</code>: the peer connection factory, <code>flutterWebRtc</code> from <code>spooky_flutter</code>.
 Without <code>rtc</code> or <code>transport</code>, channels report <code>unsupported</code>. Rust (<code>spooky-core</code>) has the same

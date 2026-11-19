@@ -271,7 +271,7 @@ impl Drop for Membership {
         let mut rooms = lock(&self.shared.rooms);
         let mut members = lock(&self.room.members);
         // A replaced connection no longer owns its peer id: the entry is its
-        // successor's, and nobody is told that anything happened.
+        // successor's, whose hello already told the others.
         if members
             .get(&self.peer)
             .is_some_and(|member| member.conn == self.conn)
@@ -332,18 +332,25 @@ fn join(
         tx: tx.clone(),
         kick: Some(kick),
     };
-    match members.insert(peer.to_owned(), member) {
-        // Same peer id again (a reload, a reconnect that raced its old
-        // socket): the new connection takes the seat and the others see
-        // neither a leave nor a join.
-        Some(mut old) => old.kick(Kick::Replaced),
-        None => {
-            let joined = text(&ServerFrame::Join { peer });
-            for (other, member) in members.iter_mut() {
-                if other != peer {
-                    member.deliver(Out::Text(Arc::clone(&joined)));
-                }
+    // Same peer id again (a reconnect that raced its old socket, as when a
+    // phone changes networks): the new connection takes the seat. The others
+    // are told it left and came back. Without that they would keep what they
+    // knew of the old connection and never greet the new one, which starts out
+    // knowing nothing: clients tell a member what they have when it joins.
+    let replaced = members.insert(peer.to_owned(), member);
+    if let Some(mut old) = replaced {
+        old.kick(Kick::Replaced);
+        let left = text(&ServerFrame::Leave { peer });
+        for (other, member) in members.iter_mut() {
+            if other != peer {
+                member.deliver(Out::Text(Arc::clone(&left)));
             }
+        }
+    }
+    let joined = text(&ServerFrame::Join { peer });
+    for (other, member) in members.iter_mut() {
+        if other != peer {
+            member.deliver(Out::Text(Arc::clone(&joined)));
         }
     }
     drop(members);

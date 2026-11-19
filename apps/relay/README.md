@@ -117,9 +117,11 @@ connection.
 
 **Replacement.** A hello whose `peer` is already in the room replaces the old
 connection: the old one gets `{"t":"error","code":"replaced",...}` and is
-closed, the new one gets its welcome, and the others see neither a `leave` nor
-a `join`. Replacing a member of a full room is not an extra member and is not
-refused.
+closed, the new one gets its welcome, and the others get a `leave` and then a
+`join` for that peer. They have to: a client that reconnects before the relay
+noticed its old socket was dead (a phone changing networks) starts out knowing
+nothing, and the others only tell a member what they have when it joins.
+Replacing a member of a full room is not an extra member and is not refused.
 
 ### 2. After the welcome
 

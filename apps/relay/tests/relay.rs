@@ -466,8 +466,11 @@ async fn the_same_peer_id_again_replaces_the_old_connection() {
     sleep(Duration::from_millis(100)).await;
     holds(&relay, 1, 2).await;
 
-    // b saw neither a leave nor a join: the next frame it gets is a message
-    // from the new connection.
+    // b is told the peer left and came back, in that order and before
+    // anything the new connection sends: that is what makes it greet the new
+    // connection, which knows nothing of what the old one was told.
+    assert_eq!(next(&mut b).await, json!({"t": "leave", "peer": "a"}));
+    assert_eq!(next(&mut b).await, json!({"t": "join", "peer": "a"}));
     send(&mut new, json!({"t": "msg", "d": "new a"})).await;
     assert_eq!(next(&mut b).await, msg("a", json!("new a")));
     send(&mut b, json!({"t": "msg", "to": ["a"], "d": "to a"})).await;
@@ -504,7 +507,10 @@ async fn a_full_room_refuses_a_new_peer_but_not_a_replacement() {
     assert_eq!(welcome["peers"], json!(["b"]));
     refused(&mut a, "replaced").await;
 
-    // b heard nothing of the refused hello or the replacement.
+    // b heard nothing of the refused hello, and of the replacement a leave
+    // and a join.
+    assert_eq!(next(&mut b).await, json!({"t": "leave", "peer": "a"}));
+    assert_eq!(next(&mut b).await, json!({"t": "join", "peer": "a"}));
     send(&mut a2, json!({"t": "msg", "d": 1})).await;
     assert_eq!(next(&mut b).await, msg("a", json!(1)));
 

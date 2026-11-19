@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { ChannelWire, TransportHooks } from './index';
 import { hubTransport, type HubOptions } from './hub';
-import { fakeBrowser, memoryRoom, settle } from './rooms.fixture';
+import { roomLink } from './room';
+import { FakeRelay, fakeBrowser, memoryRoom, settle } from './rooms.fixture';
 
 type Browser = ReturnType<typeof fakeBrowser>;
 type Room = ReturnType<typeof memoryRoom>;
@@ -168,6 +169,36 @@ describe('hubTransport', () => {
     a1.t.close();
     await settle();
     expect(a2.events).toEqual(['up a1', 'down a1']);
+  });
+
+  it('knows the other browser\'s tabs again after its socket was replaced', async () => {
+    // Over the real link and a relay: a socket that died where only the
+    // client could tell comes back under the same id.
+    const relay = new FakeRelay();
+    const viaRelay = (hooks: Parameters<typeof roomLink>[0]) =>
+      roomLink(hooks, { url: 'ws://relay.test/room', token: () => 't-ann', WebSocket: relay.WebSocket, direct: false });
+    const room = { link: viaRelay } as unknown as Room;
+    const a1 = tab(fakeBrowser(), room, 'a1');
+    const right = fakeBrowser();
+    const b1 = tab(right, room, 'b1');
+    const b2 = tab(right, room, 'b2');
+    for (const t of [a1, b1, b2]) t.join();
+    await settle();
+    expect([...a1.events].sort()).toEqual(['up b1', 'up b2']);
+
+    relay.sockets[0].sever();
+    await new Promise((r) => setTimeout(r, 900));
+    await settle();
+    expect(a1.status.at(-1)).toBe('connected');
+    // Down with the socket, and up again once the other hub said its tabs anew.
+    expect(a1.events.slice(2).sort()).toEqual(['down b1', 'down b2', 'up b1', 'up b2']);
+    expect(b1.events).toEqual(['up a1', 'down a1', 'up a1']);
+    a1.t.send(a1.to('b2')[0], op(11));
+    b1.t.send(b1.to('a1')[0], op(12));
+    await settle();
+    expect(b2.messages).toEqual([['a1', op(11)]]);
+    expect(a1.messages).toEqual([['b1', op(12)]]);
+    for (const t of [a1, b1, b2]) t.t.close();
   });
 
   it('takes a message only from a tab its browser speaks for', async () => {

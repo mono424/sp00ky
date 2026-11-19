@@ -67,6 +67,17 @@ export class FakeSocket {
     this.relay.left(this);
     queueMicrotask(() => this.onclose?.());
   }
+
+  /**
+   * The connection dies where only the client can tell (a phone changing
+   * networks): the relay still holds the seat, until it times the socket out
+   * or the same peer says hello again.
+   */
+  sever(): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    queueMicrotask(() => this.onclose?.());
+  }
 }
 
 export class FakeRelay {
@@ -107,6 +118,15 @@ export class FakeRelay {
       const member: Member = { socket, user, peer };
       socket.member = member;
       socket.push({ t: 'welcome', user, peer, peers: [...room.keys()].filter((p) => p !== peer) });
+      // The same peer again takes the seat: the old connection is told, and
+      // the others hear it left and came back.
+      const old = room.get(peer);
+      if (old) {
+        old.socket.push({ t: 'error', code: 'replaced' });
+        old.socket.member = null;
+        if (old.socket.readyState !== 3) queueMicrotask(() => old.socket.drop());
+        for (const other of room.values()) if (other.peer !== peer) other.socket.push({ t: 'leave', peer });
+      }
       for (const other of room.values()) if (other.peer !== peer) other.socket.push({ t: 'join', peer });
       room.set(peer, member);
       return;

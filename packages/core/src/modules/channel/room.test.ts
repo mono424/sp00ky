@@ -111,6 +111,33 @@ describe('roomLink', () => {
     b.link.close();
   });
 
+  it('is greeted again after reconnecting faster than the relay noticed it was gone', async () => {
+    vi.useFakeTimers();
+    const relay = new FakeRelay();
+    const a = browser(relay, 'ann', 'a');
+    const b = browser(relay, 'ann', 'b');
+    await advance(1);
+    // Only a notices: to the relay, and so to b, a is still there.
+    relay.sockets[0].sever();
+    await advance(1);
+    expect(a.events).toEqual(['up b', 'down b']);
+    expect(b.events).toEqual(['up a']);
+    await advance(2_000);
+    // Back under the same id. b is told a left and returned, which is what
+    // makes it tell a what it knows again.
+    expect(a.status.at(-1)).toBe('connected');
+    expect(a.events).toEqual(['up b', 'down b', 'up b']);
+    expect(b.events).toEqual(['up a', 'down a', 'up a']);
+    a.link.send(null, { n: 1 });
+    b.link.send(['a'], { n: 2 });
+    await advance(1);
+    expect(b.messages).toEqual([['a', { n: 1 }]]);
+    expect(a.messages).toEqual([['b', { n: 2 }]]);
+    expect(relay.rooms.get('user:ann')?.size).toBe(2);
+    a.link.close();
+    b.link.close();
+  });
+
   it('is refused without a valid token, and asks again later', async () => {
     vi.useFakeTimers();
     const relay = new FakeRelay();

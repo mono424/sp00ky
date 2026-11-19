@@ -57,10 +57,10 @@ Then point the client at it:
   token.
 </Warning>
 
-The image `mono424/spooky-relay` is published with every release, under the same tags as the SSP
-and the scheduler, starting with the first release after 1.0.0-beta.8. Until that release is out,
-build it yourself and name it in `relay.image` (`spky dev` runs a local image; a deploy pulls it,
-so push it to a registry first). Cloudflare projects cannot run it yet.
+The image `mono424/spooky-relay` is published with every release since 1.0.0-beta.9, under the
+same tags as the SSP and the scheduler. To run a build of your own, name it in `relay.image`
+(`spky dev` runs a local image; a deploy pulls it, so push it to a registry first). Cloudflare
+projects cannot run it yet.
 
 A room lives in the memory of one process, so all devices of a user have to reach the same
 instance. One instance is enough for a long way: it holds a socket per browser and copies small

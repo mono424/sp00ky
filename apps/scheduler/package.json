@@ -1,6 +1,6 @@
 {
   "name": "scheduler",
-  "version": "1.0.0-beta.10",
+  "version": "1.0.0-beta.11",
   "private": true,
   "scripts": {
     "build": "docker buildx build --target scheduler -t mono424/spooky-scheduler:dev -f ../../Dockerfile ../..",

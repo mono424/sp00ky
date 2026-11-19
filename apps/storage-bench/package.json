@@ -1,6 +1,6 @@
 {
   "name": "@spooky-sync/storage-bench",
-  "version": "1.0.0-beta.10",
+  "version": "1.0.0-beta.11",
   "description": "Browser benchmark of the local cache backends: IndexedDB, the SQLite engine and the row store",
   "private": true,
   "type": "module",

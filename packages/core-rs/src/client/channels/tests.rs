@@ -15,8 +15,8 @@ use super::*;
 use crate::client::engine::QueryOptions;
 use crate::modules::channel::tests::MemoryNet;
 use crate::modules::channel::{
-    id_key, ChannelMessage, ChannelStatus, ChannelTransport, ChannelsConfig, PeerLinkStatus,
-    SignalKind, TransportHooks,
+    decode_interest, id_key, query_interest, ChannelStatus, ChannelTransport, ChannelWire,
+    ChannelsConfig, Interest, PeerLinkStatus, SignalKind, TransportHooks,
 };
 use crate::testing::{row, run_local};
 use crate::types::{ColumnSchema, DatabaseConfig, PersistenceConfig, Schema, Sp00kyConfig};
@@ -391,7 +391,7 @@ impl ChannelTransport for Recorder {
         }
     }
 
-    fn send(&self, _to: &PeerRef, message: &ChannelMessage) {
+    fn send(&self, _to: &PeerRef, message: &ChannelWire) {
         self.sent
             .lock()
             .unwrap()
@@ -503,5 +503,220 @@ async fn the_client_opens_a_channel_and_writes_to_its_peers() {
         .await
         .unwrap());
     assert!(client.peer_delete("msg:9", 60_000).await.unwrap());
+    client.close().await.unwrap();
+}
+
+// ---- sharing with the user's own devices ----------------------------------------------------
+
+fn sharing(net: &MemoryNet) -> ChannelsConfig {
+    ChannelsConfig {
+        transport: Some(net.config_factory()),
+        ..Default::default()
+    }
+    .share("msg")
+}
+
+/// What the user's other device was last told this one shows.
+fn told(device: &Rc<Engine>) -> Option<Interest> {
+    let manager = device.channel_manager().unwrap();
+    manager.peer_interests().into_values().next()
+}
+
+fn interest(v: serde_json::Value) -> Option<Interest> {
+    decode_interest(&json!({"t": "interest", "v": v}))
+}
+
+#[tokio::test]
+async fn a_device_says_what_its_queries_show_as_exactly_as_it_knows() {
+    run_local(async {
+        let net = MemoryNet::new();
+        let open = || async {
+            let engine = Engine::open(config(sharing(&net))).await.unwrap();
+            engine.channel_manager().unwrap().set_user(Some("user:a"));
+            engine
+        };
+        let (phone, laptop) = (open().await, open().await);
+        // Nothing is on screen: nothing is asked for.
+        eventually(|| told(&phone), |t| *t == interest(json!({}))).await;
+
+        // A query from the builder: its filter.
+        let in_c1 = laptop.query("msg").where_eq("convo", "c1");
+        let rows: Rc<RefCell<Arc<Vec<Row>>>> = Rc::default();
+        let r = rows.clone();
+        let list = in_c1
+            .subscribe("10m", move |next| *r.borrow_mut() = next.clone())
+            .await
+            .unwrap();
+        let convo = |c: &str| json!({"msg": [[{"field": "convo", "op": "=", "value": c}]]});
+        eventually(|| told(&phone), |t| *t == interest(convo("c1"))).await;
+        // Its filter is also what the phone sends by. Messages arrive in
+        // order: had the first been sent, it would be there before the second.
+        phone
+            .create("msg:2", data(json!({"convo": "c2", "text": "out"})))
+            .await
+            .unwrap();
+        phone
+            .create("msg:1", data(json!({"convo": "c1", "text": "in"})))
+            .await
+            .unwrap();
+        eventually(|| find(&rows.borrow(), "msg:1"), Option::is_some).await;
+        assert!(laptop.read_row("msg:2").await.unwrap().is_none());
+
+        // A module registers SurrealQL and names the table it reads: all of
+        // that table, and nothing else.
+        let host = laptop.query_host().unwrap();
+        let hash = host
+            .register_query(
+                "msg",
+                "SELECT * FROM msg WHERE convo = $convo",
+                data(json!({"convo": "c9"})),
+                "10m",
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let module = host.subscribe(&hash, Rc::new(|_: &Arc<Vec<Row>>| {}), true);
+        eventually(|| told(&phone), |t| *t == interest(json!({"msg": true}))).await;
+        drop(module);
+        eventually(|| told(&phone), |t| *t == interest(convo("c1"))).await;
+
+        // Raw SurrealQL nobody described may read anything: everything.
+        let hash = laptop
+            .query_raw("SELECT * FROM msg", Object::new(), QueryOptions::default())
+            .await
+            .unwrap();
+        let raw = laptop.subscribe(&hash, |_| {}, true);
+        eventually(|| told(&phone), |t| *t == Some(Interest::All)).await;
+        drop(raw);
+        eventually(|| told(&phone), |t| *t == interest(convo("c1"))).await;
+        // Unless somebody says what it shows.
+        let in_c7 = laptop.query("msg").where_eq("convo", "c7");
+        laptop.describe_query(&hash, query_interest(laptop.schema(), &in_c7));
+        let described = laptop.subscribe(&hash, |_| {}, true);
+        drop(list);
+        eventually(|| told(&phone), |t| *t == interest(convo("c7"))).await;
+        drop(described);
+        eventually(|| told(&phone), |t| *t == interest(json!({}))).await;
+
+        phone.close().await;
+        laptop.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sharing_needs_a_room_and_looks_for_it_once_a_relay_is_named() {
+    run_local(async {
+        let alone = Engine::open(config(ChannelsConfig::default().share("msg")))
+            .await
+            .unwrap();
+        let states: Rc<RefCell<Vec<ChannelStatus>>> = Rc::default();
+        let s = states.clone();
+        let _sub = alone.subscribe_share_state(move |state| s.borrow_mut().push(state.status));
+        assert_eq!(alone.share_state().status, ChannelStatus::Idle);
+        alone.channel_manager().unwrap().set_user(Some("user:a"));
+        // No relay: nothing reaches the user's other devices, and it says so.
+        assert_eq!(alone.share_state().status, ChannelStatus::Unsupported);
+        assert_eq!(
+            *states.borrow(),
+            vec![ChannelStatus::Idle, ChannelStatus::Unsupported]
+        );
+        alone.close().await;
+
+        // Nothing is shared: there is no link to speak of.
+        let plain = Engine::open(config(ChannelsConfig::default()))
+            .await
+            .unwrap();
+        plain.channel_manager().unwrap().set_user(Some("user:a"));
+        assert_eq!(plain.share_state(), ChannelState::default());
+        plain.close().await;
+
+        #[cfg(feature = "remote")]
+        {
+            // Nobody listens there, which is the relay's business: the room
+            // is being looked for.
+            let relay = ChannelRelayConfig::new("ws://127.0.0.1:9/room").token(|| Some("t".into()));
+            let channels = ChannelsConfig::default().share("msg").relay(relay);
+            let roomed = Engine::open(config(channels)).await.unwrap();
+            roomed.channel_manager().unwrap().set_user(Some("user:a"));
+            assert_eq!(roomed.share_state().status, ChannelStatus::Connecting);
+            roomed.close().await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_client_reports_the_link_to_the_own_devices_and_says_what_a_live_query_shows() {
+    let sent: Arc<Mutex<Vec<String>>> = Arc::default();
+    let s = sent.clone();
+    let channels = ChannelsConfig {
+        transport: Some(Arc::new(move |hooks| {
+            Rc::new(Recorder {
+                hooks,
+                sent: s.clone(),
+                up: RefCell::default(),
+            }) as Rc<dyn ChannelTransport>
+        })),
+        ..Default::default()
+    }
+    .share("msg");
+    let client = Sp00kyClient::open(config(channels)).await.unwrap();
+    assert_eq!(client.share_state(), ChannelState::default());
+    let mut share = client.share_state_watch();
+    let sign_in = |user: Option<&'static str>| {
+        client.call(move |w| async move {
+            w.engine.channel_manager().unwrap().set_user(user);
+            Ok(())
+        })
+    };
+    sign_in(Some("user:a")).await.unwrap();
+    // The recorder answers for one other device of whoever is wanted.
+    let state = tokio::time::timeout(
+        Duration::from_secs(5),
+        share.wait_for(|s| !s.peers.is_empty()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .clone();
+    assert_eq!(state.status, ChannelStatus::Connected);
+    assert_eq!(client.share_state().peers, vec!["user:a".to_string()]);
+
+    let said = |text: &'static str| {
+        let sent = sent.clone();
+        async move {
+            eventually(
+                || sent.lock().unwrap().last().cloned(),
+                |last| last.as_deref() == Some(text),
+            )
+            .await;
+        }
+    };
+    said(r#"{"t":"interest","v":{}}"#).await;
+    let live = client
+        .live(client.query("msg").where_eq("convo", "c1"))
+        .await
+        .unwrap();
+    said(r#"{"t":"interest","v":{"msg":[[{"field":"convo","op":"=","value":"c1"}]]}}"#).await;
+    let raw = client
+        .live_raw("SELECT * FROM msg", Object::new(), QueryOptions::default())
+        .await
+        .unwrap();
+    said(r#"{"all":true,"t":"interest"}"#).await;
+    drop(raw);
+    drop(live);
+    said(r#"{"t":"interest","v":{}}"#).await;
+
+    sign_in(None).await.unwrap();
+    let state = tokio::time::timeout(
+        Duration::from_secs(5),
+        share.wait_for(|s| s.status == ChannelStatus::Idle),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .clone();
+    assert!(state.peers.is_empty());
     client.close().await.unwrap();
 }

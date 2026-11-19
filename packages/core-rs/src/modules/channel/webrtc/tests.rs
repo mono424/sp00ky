@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use super::*;
 use crate::modules::channel::{
-    ChannelMessage, ChannelOpKind, ChannelTransport, Hlc, PeerLinkStatus, PeerRef,
+    ChannelMessage, ChannelOpKind, ChannelTransport, ChannelWire, Hlc, PeerLinkStatus, PeerRef,
 };
 use crate::surreal::rpc::LiveMessage;
 use crate::testing::run_local;
@@ -393,13 +393,13 @@ async fn connects_two_devices_that_want_each_other_whichever_starts_first() {
         patch.insert("view_pos".into(), json!("1"));
         a.t.send(
             &PeerRef::new("user:b", "pb"),
-            &ChannelMessage {
+            &ChannelWire::Op(ChannelMessage {
                 kind: ChannelOpKind::Update,
                 table: "call".into(),
                 id: "call:1".into(),
                 patch,
                 hlc: Hlc::new(1, 0, "pa"),
-            },
+            }),
         );
         settle().await;
         assert_eq!(

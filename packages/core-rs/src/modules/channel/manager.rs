@@ -19,11 +19,13 @@ use async_trait::async_trait;
 use serde_json::{Map as JsonMap, Value as Json};
 
 use super::{
-    apply_overlay, apply_overlay_row, carries, check_patch, collect_ids, decode_row, encode_row,
-    find_row, is_channel_table, normalize_id, parse_message, peer_users, pick_columns,
-    prepare_scope, same_value, typed, ChannelAcceptRule, ChannelMessage, ChannelOp, ChannelOpKind,
-    ChannelScope, ChannelState, ChannelStatus, ChannelTransport, ChannelsConfig, Hlc, Overlay,
-    OverlayEntry, PeerLinkStatus, PeerRef, PreparedScope, TransportHooks,
+    apply_overlay, apply_overlay_row, carries, check_patch, collect_ids, decode_interest,
+    decode_row, encode_row, find_row, is_channel_table, merge_interest, normalize_id,
+    parse_message, peer_users, pick_columns, prepare_scope, query_interest, same_value, shows_row,
+    typed, ChannelAcceptRule, ChannelMessage, ChannelOp, ChannelOpKind, ChannelScope,
+    ChannelShareRule, ChannelState, ChannelStatus, ChannelTransport, ChannelWire, ChannelsConfig,
+    Hlc, Interest, Overlay, OverlayEntry, PeerLinkStatus, PeerRef, PreparedScope, QueryInterest,
+    TransportHooks,
 };
 use crate::error::{Error, Result};
 use crate::kernel::events::LogLevel;
@@ -57,8 +59,9 @@ pub type ChannelLogger = Rc<dyn Fn(LogLevel, &str)>;
 /// leaves the device.
 #[derive(Default)]
 pub struct ManagerOptions {
-    /// Accept rules and the confirm timeout (`rtc`, `ice_servers` and
-    /// `transport` are the caller's to turn into `transport`).
+    /// Accept rules, the confirm timeout and what is shared (`rtc`,
+    /// `ice_servers`, `relay` and `transport` are the caller's to turn into
+    /// `transport`).
     pub config: Option<ChannelsConfig>,
     pub rows: Option<Rc<dyn ChannelRows>>,
     pub transport: Option<LocalTransportFactory>,
@@ -80,6 +83,8 @@ struct Tap {
     raw: Option<Arc<Vec<Row>>>,
     /// Every record id in `raw`, computed on first need.
     ids: Option<BTreeSet<String>>,
+    /// What its query can show, or `None` when nobody said.
+    interest: Option<Vec<QueryInterest>>,
 }
 
 impl Tap {
@@ -99,6 +104,9 @@ struct ChannelData {
     next_listener: u64,
     state: ChannelState,
     closed: bool,
+    /// The one channel to the user's own other devices (`channels.share`): its
+    /// only user is whoever is signed in.
+    own: bool,
 }
 
 impl ChannelData {
@@ -127,12 +135,27 @@ struct State {
     user: Option<String>,
     transport: Option<Rc<dyn ChannelTransport>>,
     sweep: Option<tokio::task::JoinHandle<()>>,
+    /// What each of the user's other devices said it shows, by
+    /// [`PeerRef::key`]. A device that said nothing gets everything.
+    interest: BTreeMap<String, Interest>,
+    /// The interest message last sent, so an unchanged one is not sent again.
+    announced: Option<String>,
+    /// Sends this device's interest once the subscriptions of a turn are all
+    /// in; lives as long as the transport.
+    announcer: Option<tokio::task::JoinHandle<()>>,
     closed: bool,
 }
 
 struct Inner {
     schema: Arc<Schema>,
     accept: BTreeMap<String, ChannelAcceptRule>,
+    /// `channels.share`: the rule per shared table, and the channel that
+    /// carries them to the user's own devices.
+    shared: BTreeMap<String, ChannelShareRule>,
+    own: Option<ChannelCell>,
+    /// Wakes the announcer. A plain flag to raise, so a subscription may end
+    /// (and say so) from anywhere, a destructor included.
+    announce: Rc<tokio::sync::Notify>,
     rows: Option<Rc<dyn ChannelRows>>,
     transport_factory: Option<LocalTransportFactory>,
     now: Rc<dyn Fn() -> i64>,
@@ -155,11 +178,56 @@ fn wall_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// To `logger`, or to `tracing` (target `spooky.channel`) without one.
+pub(super) fn log_to(logger: &Option<ChannelLogger>, level: LogLevel, message: &str) {
+    match logger {
+        Some(log) => log(level, message),
+        None => match level {
+            LogLevel::Debug => tracing::debug!(target: "spooky.channel", "{message}"),
+            LogLevel::Info => tracing::info!(target: "spooky.channel", "{message}"),
+            LogLevel::Warn => tracing::warn!(target: "spooky.channel", "{message}"),
+            LogLevel::Error => tracing::error!(target: "spooky.channel", "{message}"),
+        },
+    }
+}
+
 impl ChannelManager {
     pub fn new(schema: Arc<Schema>, options: ManagerOptions) -> ChannelManager {
         let peer_id = options.peer_id.unwrap_or_else(random_peer_id);
         let config = options.config.unwrap_or_default();
-        let enabled = schema.tables.values().any(|t| t.channel);
+        let mut shared = BTreeMap::new();
+        for (table, rule) in config.share.map(|s| s.tables).unwrap_or_default() {
+            if schema.tables.contains_key(&table) {
+                shared.insert(table, rule);
+            } else {
+                log_to(
+                    &options.logger,
+                    LogLevel::Warn,
+                    &format!("channels.share names '{table}', which is not a table of the schema"),
+                );
+            }
+        }
+        // A shared table takes peer writes like a `@channel` one. It needs no
+        // mark in the schema: its writes only reach devices of the same user.
+        let enabled = !shared.is_empty() || schema.tables.values().any(|t| t.channel);
+        let own = (!shared.is_empty()).then(|| {
+            Rc::new(RefCell::new(ChannelData {
+                scopes: shared
+                    .keys()
+                    .map(|table| ChannelScope {
+                        table: table.clone(),
+                        where_: Vec::new(),
+                    })
+                    .collect(),
+                listed: Vec::new(),
+                users: BTreeSet::new(),
+                listeners: Vec::new(),
+                next_listener: 0,
+                state: ChannelState::default(),
+                closed: false,
+                own: true,
+            }))
+        });
         ChannelManager(Rc::new(Inner {
             accept: config.accept,
             confirm_ms: config.confirm_timeout_ms.min(i64::MAX as u64) as i64,
@@ -173,7 +241,7 @@ impl ChannelManager {
                 overlay: Overlay::new(),
                 taps: BTreeMap::new(),
                 next_tap: 0,
-                channels: Vec::new(),
+                channels: own.iter().cloned().collect(),
                 connected: BTreeMap::new(),
                 user_status: HashMap::new(),
                 warned_unused: HashSet::new(),
@@ -181,8 +249,14 @@ impl ChannelManager {
                 user: None,
                 transport: None,
                 sweep: None,
+                interest: BTreeMap::new(),
+                announced: None,
+                announcer: None,
                 closed: false,
             }),
+            shared,
+            own,
+            announce: Rc::new(tokio::sync::Notify::new()),
             peer_id,
         }))
     }
@@ -192,10 +266,47 @@ impl ChannelManager {
         &self.0.peer_id
     }
 
-    /// True when any table is a channel table; otherwise the client skips all
-    /// of this.
+    /// True when any table is a channel table or shared; otherwise the client
+    /// skips all of this.
     pub fn enabled(&self) -> bool {
         self.0.enabled
+    }
+
+    /// Whether the user's own devices are part of this (`channels.share` names
+    /// a table).
+    pub fn sharing(&self) -> bool {
+        self.0.own.is_some()
+    }
+
+    /// How the user's own devices are doing (`channels.share`): `Idle` when
+    /// nothing is shared or nobody is signed in.
+    pub fn own_state(&self) -> ChannelState {
+        match &self.0.own {
+            Some(ch) => ch.borrow().state.clone(),
+            None => ChannelState::default(),
+        }
+    }
+
+    /// Called at once with the state of the link to the user's own devices,
+    /// then on every change, until the returned subscription is dropped.
+    pub fn subscribe_own(&self, cb: impl Fn(&ChannelState) + 'static) -> Subscription {
+        match &self.0.own {
+            Some(ch) => ChannelHandle {
+                manager: Rc::downgrade(&self.0),
+                channel: ch.clone(),
+            }
+            .subscribe(cb),
+            None => {
+                cb(&ChannelState::default());
+                Subscription::noop()
+            }
+        }
+    }
+
+    /// What a registered query can show, as [`ChannelManager::tap_showing`]
+    /// takes it.
+    pub fn interest_of(&self, q: &QueryBuilder) -> Vec<QueryInterest> {
+        query_interest(&self.0.schema, q)
     }
 
     /// The signed-in user, as the channels know it.
@@ -213,6 +324,9 @@ impl ChannelManager {
                 return;
             }
             st.user = user.map(str::to_string);
+            if let Some(announcer) = st.announcer.take() {
+                announcer.abort();
+            }
             st.transport.take()
         };
         if let Some(t) = transport {
@@ -222,11 +336,17 @@ impl ChannelManager {
             let mut st = inner.st.borrow_mut();
             st.connected.clear();
             st.user_status.clear();
+            st.interest.clear();
+            st.announced = None;
             let touched = std::mem::take(&mut st.overlay).into_keys().collect();
             let me = st.user.clone();
             for ch in &st.channels {
                 let mut ch = ch.borrow_mut();
-                ch.users = peer_users(&ch.listed, me.as_deref());
+                ch.users = if ch.own {
+                    me.iter().cloned().collect()
+                } else {
+                    peer_users(&ch.listed, me.as_deref())
+                };
             }
             touched
         };
@@ -276,6 +396,7 @@ impl ChannelManager {
             next_listener: 0,
             state: ChannelState::default(),
             closed: false,
+            own: false,
         }));
         self.0.st.borrow_mut().channels.push(ch.clone());
         self.0.sync_wanted();
@@ -308,17 +429,35 @@ impl ChannelManager {
     /// gets them with the overlay folded in, again whenever the overlay
     /// changes for its rows. Stops when the handle is dropped.
     pub fn tap(&self, cb: impl Fn(&Arc<Vec<Row>>) + 'static) -> TapHandle {
-        let mut st = self.0.st.borrow_mut();
-        st.next_tap += 1;
-        let id = st.next_tap;
-        st.taps.insert(
-            id,
-            Tap {
-                cb: Rc::new(cb),
-                raw: None,
-                ids: None,
-            },
-        );
+        self.tap_showing(cb, None)
+    }
+
+    /// [`ChannelManager::tap`] for a subscription whose query is known:
+    /// `interest` is what it can show (see [`ChannelManager::interest_of`]),
+    /// which the user's other devices are told so they only send what it has a
+    /// use for. `None` when nobody can say: the device then asks for
+    /// everything.
+    pub fn tap_showing(
+        &self,
+        cb: impl Fn(&Arc<Vec<Row>>) + 'static,
+        interest: Option<Vec<QueryInterest>>,
+    ) -> TapHandle {
+        let id = {
+            let mut st = self.0.st.borrow_mut();
+            st.next_tap += 1;
+            let id = st.next_tap;
+            st.taps.insert(
+                id,
+                Tap {
+                    cb: Rc::new(cb),
+                    raw: None,
+                    ids: None,
+                    interest,
+                },
+            );
+            id
+        };
+        self.0.announce_soon();
         TapHandle {
             manager: Rc::downgrade(&self.0),
             id,
@@ -412,7 +551,15 @@ impl ChannelManager {
                 None => vec![after],
             };
             let targets = inner.targets(&table, &rows, scope.as_ref());
-            inner.send(&targets, &table, &rid, &wire, hlc, ChannelOpKind::Update);
+            inner.send(
+                &targets,
+                &table,
+                &rid,
+                &wire,
+                hlc,
+                ChannelOpKind::Update,
+                &rows,
+            );
         });
     }
 
@@ -454,7 +601,8 @@ impl ChannelManager {
         }
         let mut shown = full.clone();
         shown.insert("id".into(), Value::from(rid.clone()));
-        let targets = inner.targets(table, &[shown], scope.map(|s| &s.channel));
+        let rows = [shown];
+        let targets = inner.targets(table, &rows, scope.map(|s| &s.channel));
         inner.send(
             &targets,
             table,
@@ -462,6 +610,7 @@ impl ChannelManager {
             &typed(columns, &full),
             hlc,
             ChannelOpKind::Create,
+            &rows,
         );
     }
 
@@ -477,7 +626,8 @@ impl ChannelManager {
         let hlc = inner.tick();
         if inner.can_send(table) {
             if let Some(row) = inner.row_for(&rid).await {
-                let targets = inner.targets(table, &[row], scope.map(|s| &s.channel));
+                let rows = [row];
+                let targets = inner.targets(table, &rows, scope.map(|s| &s.channel));
                 inner.send(
                     &targets,
                     table,
@@ -485,6 +635,7 @@ impl ChannelManager {
                     &Row::new(),
                     hlc,
                     ChannelOpKind::Delete,
+                    &rows,
                 );
             }
         }
@@ -515,6 +666,9 @@ impl ChannelManager {
         let transport = {
             let mut st = inner.st.borrow_mut();
             st.closed = true;
+            if let Some(announcer) = st.announcer.take() {
+                announcer.abort();
+            }
             st.transport.take()
         };
         if let Some(t) = transport {
@@ -524,6 +678,7 @@ impl ChannelManager {
         if let Some(sweep) = st.sweep.take() {
             sweep.abort();
         }
+        st.interest.clear();
         st.taps.clear();
         for ch in std::mem::take(&mut st.channels) {
             let mut ch = ch.borrow_mut();
@@ -537,19 +692,18 @@ impl ChannelManager {
     pub fn overlay(&self) -> Overlay {
         self.0.st.borrow().overlay.clone()
     }
+
+    /// What each of the user's other devices said it shows, by
+    /// [`PeerRef::key`] (diagnostics and tests). A device missing here said
+    /// nothing yet and gets every shared write.
+    pub fn peer_interests(&self) -> BTreeMap<String, Interest> {
+        self.0.st.borrow().interest.clone()
+    }
 }
 
 impl Inner {
     fn log(&self, level: LogLevel, message: &str) {
-        match &self.logger {
-            Some(log) => log(level, message),
-            None => match level {
-                LogLevel::Debug => tracing::debug!(target: "spooky.channel", "{message}"),
-                LogLevel::Info => tracing::info!(target: "spooky.channel", "{message}"),
-                LogLevel::Warn => tracing::warn!(target: "spooky.channel", "{message}"),
-                LogLevel::Error => tracing::error!(target: "spooky.channel", "{message}"),
-            },
-        }
+        log_to(&self.logger, level, message);
     }
 
     fn drop_msg(&self, from: &PeerRef, reason: &str) {
@@ -559,11 +713,42 @@ impl Inner {
         );
     }
 
+    /// The columns of a table that takes peer writes: one marked `@channel`, or
+    /// one `channels.share` names.
     fn channel_columns(&self, table: &str) -> Option<&BTreeMap<String, ColumnSchema>> {
-        if !is_channel_table(&self.schema, table) {
+        if !is_channel_table(&self.schema, table) && !self.shared.contains_key(table) {
             return None;
         }
         self.schema.columns(table)
+    }
+
+    /// Whether a channel has a query on `table` that one of `rows` matches.
+    /// The channel to the user's own devices asks the table's share rule
+    /// instead of a filter. The rule is the app's code: it runs with no borrow
+    /// held.
+    fn carries(&self, ch: &ChannelCell, table: &str, rows: &[Row]) -> bool {
+        {
+            let ch = ch.borrow();
+            if !ch.own {
+                return carries(&ch.scopes, table, rows);
+            }
+        }
+        match self.shared.get(table) {
+            None => false,
+            Some(ChannelShareRule::All) => !rows.is_empty(),
+            Some(ChannelShareRule::Rows(test)) => rows.iter().any(|row| {
+                // A rule that panics shares nothing.
+                catch_unwind(AssertUnwindSafe(|| test(row))).unwrap_or_else(|_| {
+                    self.log(
+                        LogLevel::Warn,
+                        &format!(
+                            "channels.share rule for '{table}' panicked; the row is not shared"
+                        ),
+                    );
+                    false
+                })
+            }),
+        }
     }
 
     fn is_closed(&self) -> bool {
@@ -596,17 +781,84 @@ impl Inner {
                 let hooks: Rc<dyn TransportHooks> = Rc::new(Hooks(Rc::downgrade(self)));
                 let t = factory(hooks);
                 self.st.borrow_mut().transport = Some(t.clone());
+                self.start_announcer();
                 t
             }
         };
         transport.want(&wanted);
     }
 
-    /// Whether an own write on `table` could reach anyone: a transport is up
-    /// and an open channel carries the table. Skips the row read otherwise.
+    /// What this device's subscriptions show of the shared tables.
+    fn own_interest(&self, st: &State) -> Interest {
+        merge_interest(st.taps.values().map(|t| t.interest.as_deref()), |table| {
+            self.shared.contains_key(table)
+        })
+    }
+
+    /// Tell the user's other devices what this one shows, once the
+    /// subscriptions of this turn are all in.
+    fn announce_soon(&self) {
+        if self.own.is_some() {
+            self.announce.notify_one();
+        }
+    }
+
+    /// The task behind [`Inner::announce_soon`], started with the transport
+    /// (nothing can be said before there is one).
+    fn start_announcer(self: &Rc<Self>) {
+        if self.own.is_none() {
+            return;
+        }
+        let (weak, wake) = (Rc::downgrade(self), self.announce.clone());
+        let task = tokio::task::spawn_local(async move {
+            loop {
+                wake.notified().await;
+                let Some(inner) = weak.upgrade() else { return };
+                inner.announce_now();
+            }
+        });
+        if let Some(old) = self.st.borrow_mut().announcer.replace(task) {
+            old.abort();
+        }
+    }
+
+    fn announce_now(&self) {
+        let (transport, peers, message) = {
+            let mut st = self.st.borrow_mut();
+            if st.closed {
+                return;
+            }
+            let (Some(transport), Some(user)) = (st.transport.clone(), st.user.clone()) else {
+                return;
+            };
+            let message = ChannelWire::Interest(self.own_interest(&st));
+            let text = message.to_json().to_string();
+            if st.announced.as_deref() == Some(text.as_str()) {
+                return;
+            }
+            st.announced = Some(text);
+            let peers: Vec<PeerRef> = st
+                .connected
+                .values()
+                .filter(|p| p.user == user)
+                .cloned()
+                .collect();
+            (transport, peers, message)
+        };
+        for peer in peers {
+            transport.send(&peer, &message);
+        }
+    }
+
+    /// Whether an own write on `table` could reach anyone: a transport is up,
+    /// somebody is connected and an open channel carries the table. Skips the
+    /// row read otherwise, which with `channels.share` is every write of a
+    /// user with one device.
     fn can_send(&self, table: &str) -> bool {
         let st = self.st.borrow();
-        st.transport.is_some() && st.channels.iter().any(|ch| ch.borrow().has_table(table))
+        st.transport.is_some()
+            && !st.connected.is_empty()
+            && st.channels.iter().any(|ch| ch.borrow().has_table(table))
     }
 
     /// Some open channel lists `user` and has a query on `table` (the cheap
@@ -621,9 +873,10 @@ impl Inner {
     /// Some open channel listing `user` has a query on `table` one of `rows`
     /// matches.
     fn matches_for(&self, table: &str, rows: &[Row], user: &str) -> bool {
-        self.st.borrow().channels.iter().any(|ch| {
-            let ch = ch.borrow();
-            ch.users.contains(user) && carries(&ch.scopes, table, rows)
+        let channels = self.st.borrow().channels.clone();
+        channels.iter().any(|ch| {
+            let listed = ch.borrow().users.contains(user);
+            listed && self.carries(ch, table, rows)
         })
     }
 
@@ -632,16 +885,20 @@ impl Inner {
     /// message of one conversation away from the participants of another.
     fn targets(&self, table: &str, rows: &[Row], scope: Option<&ChannelCell>) -> BTreeSet<String> {
         let pick: Vec<ChannelCell> = match scope {
-            Some(ch) => vec![ch.clone()],
+            // A write made through one channel still reaches the user's own
+            // devices.
+            Some(ch) => std::iter::once(ch.clone())
+                .chain(self.own.clone())
+                .collect(),
             None => self.st.borrow().channels.clone(),
         };
         let mut users = BTreeSet::new();
         for ch in pick {
-            let ch = ch.borrow();
-            if ch.closed || !carries(&ch.scopes, table, rows) {
+            let closed = ch.borrow().closed;
+            if closed || !self.carries(&ch, table, rows) {
                 continue;
             }
-            users.extend(ch.users.iter().cloned());
+            users.extend(ch.borrow().users.iter().cloned());
         }
         users
     }
@@ -672,6 +929,10 @@ impl Inner {
         None
     }
 
+    /// Send a write to the connected devices of `users`. `rows` is the row
+    /// before and after it, which is what a device's interest is checked
+    /// against.
+    #[allow(clippy::too_many_arguments)]
     fn send(
         &self,
         users: &BTreeSet<String>,
@@ -680,6 +941,7 @@ impl Inner {
         patch: &Row,
         hlc: Hlc,
         kind: ChannelOpKind,
+        rows: &[Row],
     ) {
         let (transport, peers) = {
             let st = self.st.borrow();
@@ -691,27 +953,53 @@ impl Inner {
             }
             let peers: Vec<PeerRef> = st
                 .connected
-                .values()
-                .filter(|p| users.contains(&p.user))
-                .cloned()
+                .iter()
+                .filter(|(_, p)| users.contains(&p.user))
+                // One of the user's own devices that said what it shows, and
+                // it is not this row: it has no use for the write, and the
+                // server brings it anyway.
+                .filter(|(key, p)| {
+                    st.user.as_deref() != Some(p.user.as_str())
+                        || st
+                            .interest
+                            .get(*key)
+                            .is_none_or(|interest| shows_row(interest, table, rows))
+                })
+                .map(|(_, p)| p.clone())
                 .collect();
             (t, peers)
         };
-        let message = ChannelMessage {
+        let message = ChannelWire::Op(ChannelMessage {
             kind,
             table: table.to_string(),
             id: rid.to_string(),
             patch: encode_row(patch),
             hlc,
-        };
+        });
         for peer in peers {
             transport.send(&peer, &message);
         }
     }
 
+    /// One of the user's own devices said what it shows. Anybody else's word
+    /// on that is ignored.
+    fn receive_interest(&self, from: &PeerRef, raw: &Json) {
+        let mine = self.own.is_some() && self.st.borrow().user.as_deref() == Some(&from.user);
+        if !mine {
+            return self.drop_msg(from, "interest from another user");
+        }
+        let Some(interest) = decode_interest(raw) else {
+            return self.drop_msg(from, "malformed interest");
+        };
+        self.st.borrow_mut().interest.insert(from.key(), interest);
+    }
+
     fn receive(self: Rc<Self>, from: &PeerRef, raw: &Json) {
         if self.is_closed() {
             return;
+        }
+        if raw.get("t").and_then(Json::as_str) == Some("interest") {
+            return self.receive_interest(from, raw);
         }
         let Some(msg) = parse_message(raw) else {
             return self.drop_msg(from, "malformed message");
@@ -953,17 +1241,28 @@ impl Inner {
     fn peer_changed(self: Rc<Self>, peer: &PeerRef, up: bool) {
         let key = peer.key();
         if up {
-            {
+            let interest = {
                 let mut st = self.st.borrow_mut();
                 st.connected.insert(key, peer.clone());
                 st.user_status
                     .insert(peer.user.clone(), PeerLinkStatus::Connected);
+                // One of the user's own devices: it learns what this one
+                // shows before anything else.
+                let mine = self.own.is_some() && st.user.as_deref() == Some(&peer.user);
+                st.transport
+                    .clone()
+                    .filter(|_| mine)
+                    .map(|t| (t, ChannelWire::Interest(self.own_interest(&st))))
+            };
+            if let Some((transport, message)) = interest {
+                transport.send(peer, &message);
             }
             self.send_snapshot(peer);
         } else {
             let touched = {
                 let mut st = self.st.borrow_mut();
                 st.connected.remove(&key);
+                st.interest.remove(&key);
                 let mut touched = BTreeSet::new();
                 for (rid, fields) in st.overlay.iter_mut() {
                     fields.retain(|_, e| {
@@ -1036,13 +1335,13 @@ impl Inner {
                 if let Some(t) = transport {
                     t.send(
                         &peer,
-                        &ChannelMessage {
+                        &ChannelWire::Op(ChannelMessage {
                             kind: ChannelOpKind::Update,
                             table,
                             id: rid,
                             patch,
                             hlc,
-                        },
+                        }),
                     );
                 }
             });
@@ -1161,8 +1460,11 @@ impl Inner {
         if ch.users.is_empty() {
             return ChannelState::new(ChannelStatus::Idle);
         }
-        if st.transport.as_ref().is_some_and(|t| !t.supported()) {
-            return ChannelState::new(ChannelStatus::Unsupported);
+        // Unsupported when the transport can reach none of them.
+        if let Some(t) = &st.transport {
+            if !ch.users.iter().any(|u| t.supports(u)) {
+                return ChannelState::new(ChannelStatus::Unsupported);
+            }
         }
         let up: Vec<String> = ch
             .users
@@ -1205,6 +1507,15 @@ impl Inner {
         let channels = self.st.borrow().channels.clone();
         for ch in channels {
             self.notify(&ch);
+        }
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The announcer waits on a wake that would never come again.
+        if let Some(announcer) = self.st.get_mut().announcer.take() {
+            announcer.abort();
         }
     }
 }
@@ -1378,7 +1689,11 @@ impl TapHandle {
 
     pub fn stop(&self) {
         if let Some(inner) = self.manager.upgrade() {
-            inner.st.borrow_mut().taps.remove(&self.id);
+            let removed = inner.st.borrow_mut().taps.remove(&self.id).is_some();
+            // The query goes away: so does its claim.
+            if removed {
+                inner.announce_soon();
+            }
         }
     }
 }

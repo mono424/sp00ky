@@ -24,6 +24,7 @@ use crate::client::engine::{Engine, QueryOptions};
 use crate::error::{Error, Result};
 use crate::kernel::events::OutEvent;
 use crate::modules::app_release::AppReleaseSnapshot;
+use crate::modules::channel::{query_interest, ChannelState};
 use crate::modules::feature_flag::FeatureFlagSnapshot;
 use crate::modules::query_builder::QueryBuilder;
 use crate::mutation::rows::FailedMutationRow;
@@ -90,6 +91,7 @@ struct Observed {
     fetching: watch::Receiver<usize>,
     failed: watch::Receiver<usize>,
     unsynced: watch::Receiver<BTreeSet<String>>,
+    share: watch::Receiver<ChannelState>,
 }
 
 struct Shared {
@@ -441,6 +443,19 @@ impl Sp00kyClient {
         self.shared.observed.unsynced.clone()
     }
 
+    /// The link to this user's other devices (`channels.share`): `Connected`
+    /// with the user's id in `peers` while at least one other device of
+    /// theirs is in the room. `Idle` when nothing is shared or nobody is
+    /// signed in.
+    pub fn share_state(&self) -> ChannelState {
+        self.shared.observed.share.borrow().clone()
+    }
+
+    /// [`Sp00kyClient::share_state`]: current value now, every change after.
+    pub fn share_state_watch(&self) -> watch::Receiver<ChannelState> {
+        self.shared.observed.share.clone()
+    }
+
     // ---- auth ------------------------------------------------------------------------------
 
     /// Sign in through `DEFINE ACCESS <access>` with its declared params.
@@ -547,10 +562,19 @@ impl Sp00kyClient {
         ttl: Option<&str>,
     ) -> impl Future<Output = Result<LiveQuery>> + Send + 'static {
         let built = Self::built(&query, ttl);
+        // Read off the builder here: it cannot cross to the engine thread.
+        let shows = query_interest(self.schema(), &query);
         let client = self.clone();
         async move {
             let (sql, params, options) = built?;
-            client.live_raw(&sql, params, options).await
+            let hash = client
+                .call(move |w| async move {
+                    let hash = w.engine.query_raw(&sql, params, options).await?;
+                    w.engine.describe_query(&hash, shows);
+                    Ok(hash)
+                })
+                .await?;
+            client.subscribe(&hash).await
         }
     }
 
@@ -673,6 +697,17 @@ fn observe(engine: &Rc<Engine>) -> (Observed, Vec<Subscription>) {
     let (fetching_tx, fetching) = watch::channel(engine.fetching_query_count());
     let (failed_tx, failed) = watch::channel(engine.failed_mutation_count());
     let (unsynced_tx, unsynced) = watch::channel(engine.unsynced_record_ids());
+    let (share_tx, share) = watch::channel(engine.share_state());
+    // The first call repeats the current state: not a change.
+    keep.push(engine.subscribe_share_state(move |s| {
+        share_tx.send_if_modified(|current| {
+            let changed = current != s;
+            if changed {
+                *current = s.clone();
+            }
+            changed
+        });
+    }));
     let sub = engine.on("*", move |e| match e {
         OutEvent::HealthChanged { health } => {
             health_tx.send_replace(health.clone());
@@ -700,6 +735,7 @@ fn observe(engine: &Rc<Engine>) -> (Observed, Vec<Subscription>) {
             fetching,
             failed,
             unsynced,
+            share,
         },
         keep,
     )

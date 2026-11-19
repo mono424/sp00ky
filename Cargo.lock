@@ -7615,6 +7615,7 @@ name = "spooky-core"
 version = "1.0.0-beta.8"
 dependencies = [
  "async-trait",
+ "axum 0.7.9",
  "base64 0.22.1",
  "chrono",
  "ciborium",
@@ -7629,6 +7630,7 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "sha2 0.10.9",
+ "sp00ky-relay",
  "ssp",
  "syn 2.0.117",
  "tempfile",

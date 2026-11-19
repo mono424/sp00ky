@@ -30,10 +30,21 @@
 //!
 //! Update and ephemeral values are folded into subscription output only, never
 //! into the local store.
+//!
+//! Sharing with the user's own devices ([`ChannelsConfig::share`]) rides the
+//! same machinery: one internal channel whose only user is the signed-in one,
+//! reached through the room relay ([`ChannelsConfig::relay`], `room.rs`)
+//! instead of WebRTC, and narrowed by what each device says it shows
+//! (`interest.rs`).
 
+mod interest;
 mod manager;
+#[cfg(feature = "remote")]
+pub mod room;
 pub mod webrtc;
 
+#[cfg(test)]
+mod share_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -52,9 +63,18 @@ use crate::types::{ColumnSchema, Schema};
 use crate::utils::parse_datetime;
 use crate::value::{Object, Row, Value};
 
+pub use interest::{
+    decode_interest, encode_interest, matches_nodes, merge_interest, query_interest,
+    related_interest, shows_row, Interest, QueryInterest, TableInterest, WhereNode,
+    MAX_INTEREST_FILTERS,
+};
 pub use manager::{
     ChannelHandle, ChannelLogger, ChannelManager, ChannelRows, LocalTransportFactory,
     ManagerOptions, TapHandle,
+};
+#[cfg(feature = "remote")]
+pub use room::{
+    room_transport, same_user, ws_connector, RoomConnector, RoomOptions, RoomSocket, RoomToken,
 };
 pub use webrtc::{
     surreal_signal, webrtc_transport, ConnectionStateCallback, DataChannelCallback,
@@ -162,6 +182,30 @@ impl ChannelMessage {
     }
 }
 
+/// Everything a transport carries: a write to one row, or what a device's
+/// subscriptions can show (only ever between the devices of one user).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChannelWire {
+    Op(ChannelMessage),
+    Interest(Interest),
+}
+
+impl ChannelWire {
+    /// The JSON that goes over the wire.
+    pub fn to_json(&self) -> Json {
+        match self {
+            ChannelWire::Op(message) => message.to_json(),
+            ChannelWire::Interest(interest) => encode_interest(interest),
+        }
+    }
+}
+
+impl From<ChannelMessage> for ChannelWire {
+    fn from(message: ChannelMessage) -> Self {
+        ChannelWire::Op(message)
+    }
+}
+
 /// How a channel is doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ChannelStatus {
@@ -233,9 +277,15 @@ pub trait TransportHooks {
 /// is fire and forget.
 pub trait ChannelTransport {
     fn supported(&self) -> bool;
+    /// Whether this transport can reach `user` at all. A transport made of two
+    /// ([`split_transport`]) answers per user: the room may be there while
+    /// WebRTC is not, or the other way round.
+    fn supports(&self, _user: &str) -> bool {
+        self.supported()
+    }
     /// Users this device wants connections to: the union over open channels.
     fn want(&self, users: &BTreeSet<String>);
-    fn send(&self, to: &PeerRef, message: &ChannelMessage);
+    fn send(&self, to: &PeerRef, message: &ChannelWire);
     fn close(&self);
 }
 
@@ -243,6 +293,159 @@ pub trait ChannelTransport {
 /// the transport it returns stays there.
 pub type ChannelTransportFactory =
     Arc<dyn Fn(Rc<dyn TransportHooks>) -> Rc<dyn ChannelTransport> + Send + Sync>;
+
+struct SplitTransport {
+    hooks: Rc<dyn TransportHooks>,
+    room: Option<Rc<dyn ChannelTransport>>,
+    mesh: Rc<dyn ChannelTransport>,
+}
+
+impl SplitTransport {
+    fn own_user(&self) -> Option<String> {
+        self.hooks.self_ref().map(|me| me.user)
+    }
+}
+
+impl ChannelTransport for SplitTransport {
+    fn supported(&self) -> bool {
+        self.mesh.supported() || self.room.as_ref().is_some_and(|r| r.supported())
+    }
+
+    fn supports(&self, user: &str) -> bool {
+        if self.own_user().as_deref() == Some(user) {
+            self.room.as_ref().is_some_and(|r| r.supported())
+        } else {
+            self.mesh.supported()
+        }
+    }
+
+    fn want(&self, users: &BTreeSet<String>) {
+        let me = self.own_user();
+        let mut rest = users.clone();
+        let mine = me.as_ref().filter(|me| rest.remove(*me));
+        if let Some(room) = &self.room {
+            room.want(&mine.into_iter().cloned().collect());
+        }
+        self.mesh.want(&rest);
+    }
+
+    fn send(&self, to: &PeerRef, message: &ChannelWire) {
+        match &self.room {
+            Some(room) if self.own_user().as_deref() == Some(to.user.as_str()) => {
+                room.send(to, message)
+            }
+            _ => self.mesh.send(to, message),
+        }
+    }
+
+    fn close(&self) {
+        if let Some(room) = &self.room {
+            room.close();
+        }
+        self.mesh.close();
+    }
+}
+
+/// One transport out of two: the user's own devices are reached through `own`
+/// (the room), everybody else through `others` (the mesh between users, whose
+/// wire format this leaves alone). Without `own`, the user's own devices are
+/// simply never reached.
+pub fn split_transport(
+    own: Option<LocalTransportFactory>,
+    others: LocalTransportFactory,
+) -> LocalTransportFactory {
+    Rc::new(move |hooks: Rc<dyn TransportHooks>| {
+        let mesh = others(hooks.clone());
+        let room = own.as_ref().map(|own| own(hooks.clone()));
+        Rc::new(SplitTransport { hooks, room, mesh }) as Rc<dyn ChannelTransport>
+    })
+}
+
+/// Decides whether a row of a shared table goes to the user's other devices.
+pub type ChannelShareTest = Arc<dyn Fn(&Row) -> bool + Send + Sync>;
+
+/// Which rows of a table are shared: all of them, or the ones a test passes.
+#[derive(Clone)]
+pub enum ChannelShareRule {
+    /// Every row.
+    All,
+    /// Only the rows the test returns true for, asked on the device that
+    /// writes and again on the one that receives. A test that panics shares
+    /// nothing.
+    Rows(ChannelShareTest),
+}
+
+impl std::fmt::Debug for ChannelShareRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ChannelShareRule::All => "All",
+            ChannelShareRule::Rows(_) => "Rows(..)",
+        })
+    }
+}
+
+/// Sharing optimistic writes with the user's own other devices (see
+/// [`ChannelsConfig::share`]). Needs [`ChannelsConfig::relay`].
+#[derive(Clone, Debug, Default)]
+pub struct ChannelShareConfig {
+    /// Per table. A table left out is never shared. The table needs no
+    /// `-- @channel` mark: these writes only ever reach devices signed in as
+    /// the same user.
+    pub tables: BTreeMap<String, ChannelShareRule>,
+}
+
+/// Hands out the token the relay proves the user with, or `None` while there
+/// is none.
+pub type ChannelRelayToken = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Where the room relay (`sp00ky-relay`) is, and how to use it.
+#[derive(Clone)]
+pub struct ChannelRelayConfig {
+    /// Its WebSocket address, e.g. `wss://relay.example.com/room`.
+    pub url: String,
+    /// The token the relay proves the user with. The session token of the
+    /// signed-in user when not set, which is what a relay that asks the
+    /// database wants. Set it for a client with no endpoint (its user comes
+    /// from [`ChannelManager::set_user`]) or a relay with a verifier of its
+    /// own.
+    pub token: Option<ChannelRelayToken>,
+}
+
+impl ChannelRelayConfig {
+    pub fn new(url: impl Into<String>) -> Self {
+        ChannelRelayConfig {
+            url: url.into(),
+            token: None,
+        }
+    }
+
+    /// Builder: where the token comes from.
+    pub fn token(mut self, token: impl Fn() -> Option<String> + Send + Sync + 'static) -> Self {
+        self.token = Some(Arc::new(token));
+        self
+    }
+}
+
+impl std::fmt::Debug for ChannelRelayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelRelayConfig")
+            .field("url", &self.url)
+            .field("token", &self.token.is_some())
+            .finish()
+    }
+}
+
+impl From<&str> for ChannelRelayConfig {
+    fn from(url: &str) -> Self {
+        ChannelRelayConfig::new(url)
+    }
+}
+
+impl From<String> for ChannelRelayConfig {
+    fn from(url: String) -> Self {
+        ChannelRelayConfig::new(url)
+    }
+}
 
 /// Peer to peer channels for `-- @channel` tables (TS `channels` config).
 ///
@@ -271,6 +474,16 @@ pub struct ChannelsConfig {
     /// How long a peer's persistent value shows without the server confirming
     /// it.
     pub confirm_timeout_ms: u64,
+    /// The room relay this user's devices meet on. One WebSocket per client,
+    /// held while somebody is signed in and something is shared. Needs the
+    /// `remote` feature.
+    pub relay: Option<ChannelRelayConfig>,
+    /// Send this user's optimistic writes straight to their other devices, so
+    /// a change made on the phone shows on the laptop before the server has
+    /// seen it. Off unless set, and per table. The devices tell each other
+    /// which rows their open queries can show, and a write nobody shows is not
+    /// sent.
+    pub share: Option<ChannelShareConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -281,6 +494,8 @@ impl Default for ChannelsConfig {
             rtc: None,
             transport: None,
             confirm_timeout_ms: 5000,
+            relay: None,
+            share: None,
         }
     }
 }
@@ -295,6 +510,35 @@ impl ChannelsConfig {
         self.accept.insert(table.into(), Arc::new(rule));
         self
     }
+
+    /// Builder: the room relay's WebSocket address (or a
+    /// [`ChannelRelayConfig`]).
+    pub fn relay(mut self, relay: impl Into<ChannelRelayConfig>) -> Self {
+        self.relay = Some(relay.into());
+        self
+    }
+
+    /// Builder: share every row of `table` with the user's own devices.
+    pub fn share(self, table: impl Into<String>) -> Self {
+        self.share_rule(table, ChannelShareRule::All)
+    }
+
+    /// Builder: share the rows of `table` that `test` passes.
+    pub fn share_rows(
+        self,
+        table: impl Into<String>,
+        test: impl Fn(&Row) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.share_rule(table, ChannelShareRule::Rows(Arc::new(test)))
+    }
+
+    fn share_rule(mut self, table: impl Into<String>, rule: ChannelShareRule) -> Self {
+        self.share
+            .get_or_insert_with(Default::default)
+            .tables
+            .insert(table.into(), rule);
+        self
+    }
 }
 
 impl std::fmt::Debug for ChannelsConfig {
@@ -305,6 +549,8 @@ impl std::fmt::Debug for ChannelsConfig {
             .field("rtc", &self.rtc.is_some())
             .field("transport", &self.transport.is_some())
             .field("confirm_timeout_ms", &self.confirm_timeout_ms)
+            .field("relay", &self.relay)
+            .field("share", &self.share)
             .finish()
     }
 }

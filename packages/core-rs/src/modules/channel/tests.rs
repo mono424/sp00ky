@@ -35,6 +35,16 @@ pub(crate) struct NetState {
     nodes: RefCell<BTreeMap<String, Rc<Node>>>,
     /// Every message as it went over the wire.
     wire: RefCell<Vec<String>>,
+    /// The same, with who sent it to whom ([`PeerRef::key`]).
+    sent: RefCell<Vec<Sent>>,
+}
+
+/// One message on the in-memory net.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Sent {
+    pub from: String,
+    pub to: String,
+    pub message: Json,
 }
 
 struct Node {
@@ -52,6 +62,7 @@ impl MemoryNet {
         let state = Rc::new(NetState {
             nodes: RefCell::new(BTreeMap::new()),
             wire: RefCell::new(Vec::new()),
+            sent: RefCell::new(Vec::new()),
         });
         MemoryNet(state)
     }
@@ -90,6 +101,22 @@ impl MemoryNet {
 
     pub(crate) fn wire(&self) -> Vec<String> {
         self.0.wire.borrow().clone()
+    }
+
+    pub(crate) fn sent(&self) -> Vec<Sent> {
+        self.0.sent.borrow().clone()
+    }
+
+    /// The messages of kind `t` (`op`, `interest`) so far.
+    pub(crate) fn sent_of(&self, t: &str) -> Vec<Sent> {
+        let of_kind = |s: &&Sent| s.message.get("t").and_then(Json::as_str) == Some(t);
+        self.0
+            .sent
+            .borrow()
+            .iter()
+            .filter(of_kind)
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn node_count(&self) -> usize {
@@ -135,7 +162,7 @@ impl ChannelTransport for NodeTransport {
         }
     }
 
-    fn send(&self, to: &PeerRef, message: &ChannelMessage) {
+    fn send(&self, to: &PeerRef, message: &ChannelWire) {
         if !self.0.links.borrow().contains(&to.key()) {
             return;
         }
@@ -144,6 +171,11 @@ impl ChannelTransport for NodeTransport {
         };
         let text = message.to_json().to_string();
         net.wire.borrow_mut().push(text.clone());
+        net.sent.borrow_mut().push(Sent {
+            from: self.0.me.key(),
+            to: to.key(),
+            message: serde_json::from_str(&text).unwrap(),
+        });
         let target = net.nodes.borrow().get(&to.key()).cloned();
         if let Some(target) = target {
             target
@@ -243,7 +275,7 @@ fn convo(c: &str) -> QueryBuilder {
 
 /// The engine's peer sagas, as a map: refuses an id it already holds.
 #[derive(Clone, Default)]
-struct FakeRows(Rc<FakeRowsInner>);
+pub(super) struct FakeRows(Rc<FakeRowsInner>);
 
 #[derive(Default)]
 struct FakeRowsInner {
@@ -253,16 +285,26 @@ struct FakeRowsInner {
 }
 
 impl FakeRows {
-    fn put(&self, id: &str, r: Row) {
+    pub(super) fn put(&self, id: &str, r: Row) {
         self.0.store.borrow_mut().insert(id.to_string(), r);
     }
 
-    fn get(&self, id: &str) -> Option<Row> {
+    pub(super) fn get(&self, id: &str) -> Option<Row> {
         self.0.store.borrow().get(id).cloned()
     }
 
-    fn calls(&self) -> Vec<String> {
+    pub(super) fn calls(&self) -> Vec<String> {
         self.0.calls.borrow().clone()
+    }
+
+    /// Every row held, in id order.
+    pub(super) fn all(&self) -> Vec<Row> {
+        self.0.store.borrow().values().cloned().collect()
+    }
+
+    /// How often the manager read a row from the store.
+    pub(super) fn reads(&self) -> usize {
+        self.0.reads.get()
     }
 }
 
@@ -414,7 +456,7 @@ fn one(field: &str, value: &str) -> Row {
     Row::from([(field.to_string(), Value::from(value))])
 }
 
-async fn flush() {
+pub(super) async fn flush() {
     for _ in 0..50 {
         tokio::task::yield_now().await;
     }
@@ -828,7 +870,7 @@ impl ChannelTransport for Unsupported {
         false
     }
     fn want(&self, _users: &BTreeSet<String>) {}
-    fn send(&self, _to: &PeerRef, _message: &ChannelMessage) {}
+    fn send(&self, _to: &PeerRef, _message: &ChannelWire) {}
     fn close(&self) {}
 }
 

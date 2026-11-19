@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use crate::client::engine::{Engine, QueryOptions};
 use crate::error::{Error, Result};
 use crate::modules::auth::{AuthPersistence, AuthService};
-use crate::modules::query_builder::RelationPlan;
+use crate::modules::channel::{query_interest, related_interest, QueryInterest};
+use crate::modules::query_builder::{QueryBuilder, RelationPlan};
 use crate::modules::query_host::QueryHost;
 use crate::runtime::services::AuthSession;
 use crate::runtime::{RecordsCallback, Subscription};
@@ -108,13 +109,19 @@ impl EngineHost {
 impl QueryHost for EngineHost {
     async fn register_query(
         &self,
-        _table: &str,
+        table: &str,
         surql: &str,
         params: Object,
         ttl: &str,
         relations: Vec<RelationPlan>,
     ) -> Result<QueryHash> {
-        self.engine()?
+        let engine = self.engine()?;
+        // Whoever registers here names the tables the query reads. That is
+        // all there is to say about it, unless a builder adds its filter
+        // (`describe_query`).
+        let mut shows = vec![QueryInterest::whole(table)];
+        related_interest(&relations, &mut shows);
+        let hash = engine
             .query_raw(
                 surql,
                 params,
@@ -123,7 +130,15 @@ impl QueryHost for EngineHost {
                     relations,
                 },
             )
-            .await
+            .await?;
+        engine.note_shows(&hash, shows, false);
+        Ok(hash)
+    }
+
+    fn describe_query(&self, hash: &str, query: &QueryBuilder) {
+        if let Some(engine) = self.0.upgrade() {
+            engine.describe_query(hash, query_interest(engine.schema(), query));
+        }
     }
 
     fn subscribe(&self, hash: &str, callback: RecordsCallback, immediate: bool) -> Subscription {

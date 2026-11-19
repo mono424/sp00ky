@@ -184,6 +184,8 @@ pub fn auth_params(params: Object, namespace: Option<&str>, database: Option<&st
 }
 
 #[cfg(feature = "remote")]
+pub(crate) use ws::tls_config;
+#[cfg(feature = "remote")]
 pub use ws::WebSocketSurrealClient;
 
 #[cfg(feature = "remote")]
@@ -315,7 +317,7 @@ mod ws {
     /// The TLS setup, built once with an explicit `ring` provider: relying on
     /// the process-default provider panics when an embedding app links another
     /// rustls provider too.
-    fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
+    pub(crate) fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
         static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
         if let Some(config) = CONFIG.get() {
             return Ok(config.clone());

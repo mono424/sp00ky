@@ -50,3 +50,7 @@ tokio = { version = "1.47", features = ["rt", "time", "sync", "macros", "net", "
 tempfile = "3"
 # Parses generated Rust in the codegen tests.
 syn = { version = "2", features = ["full"] }
+# The real room relay: `tests/relay_room.rs` shares writes between clients
+# through it. axum serves it, in the version the relay is built on.
+sp00ky-relay = { path = "../../apps/relay" }
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }

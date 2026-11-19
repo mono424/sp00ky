@@ -16,7 +16,8 @@ The second half ("Working on the crate") is for agents changing it.
 - Dependency (not on crates.io yet; pin a `rev`):
   `spooky-core = { git = "https://github.com/mono424/sp00ky", package = "spooky-core" }`
   in both `[dependencies]` and `[build-dependencies]`. Features (default on):
-  `remote` (WebSocket transport; off = local-only), `codegen`. MSRV 1.85.
+  `remote` (WebSocket transport, also the room relay's; off = local-only),
+  `codegen`. MSRV 1.85.
 - Codegen in `build.rs`: `spooky_core::codegen::generate_rust(&surql, &backends)`
   writes `$OUT_DIR/db.rs`; `src/db.rs` is
   `include!(concat!(env!("OUT_DIR"), "/db.rs"));`. Typed backend jobs:
@@ -109,6 +110,23 @@ work on any executor (GPUI, smol, tokio, `futures::executor::block_on`).
   (`spooky_core::modules::channel`: `RtcPeerConnectionFactory`,
   `RtcPeerConnection`, `RtcDataChannel`, or a custom `transport`), else status
   is `Unsupported`. `ChannelsConfig::accept(table, |op| ..)` for per-table rules.
+- Sharing with the user's own devices (experimental, needs the `remote`
+  feature): `config.channels = Some(ChannelsConfig::default().share("game").share_rows("note", |row| ..).relay("wss://relay.example.com/room"))`
+  sends this user's optimistic writes on those tables (no `-- @channel` mark
+  needed) to their other devices, Rust, Flutter or browser, which show them
+  before the server has them; nothing is shared unless a table is named, and a
+  rule that panics shares nothing. `relay` is the WebSocket address of
+  `sp00ky-relay` (`apps/relay`): one socket per client, the hello carries the
+  session token, or `ChannelRelayConfig::new(url).token(|| ..)` for a client
+  with no endpoint or a relay with a verifier of its own. State:
+  `client.share_state()` / `share_state_watch()` (`ChannelState`: `Connected`
+  with the user's id in `peers` while another device of theirs is in the room,
+  `Idle` when nothing is shared or nobody is signed in, `Unsupported` without a
+  relay). Devices tell each other what their live queries can show and a write
+  nobody shows is not sent: `live`, `live_typed` and a builder's `subscribe`
+  describe their query, while `live_raw` / `subscribe(hash)` count as showing
+  everything. No WebRTC is involved and none is needed: there is no direct
+  link between own devices, everything goes through the relay.
 - Native push (experimental): `let push = client.push();` at startup (installs
   the sign-out unregister hook). `register(PushToken::new(PushKind::Apns, token, bundle_id).with_platform(..).with_environment(..), PushRegisterOptions::default())`,
   `sync(Some(token), PushSyncOptions::default()) -> PushSyncStatus` (never fails),
@@ -210,6 +228,47 @@ spec; the TypeScript source breaks ties.
   `tests/*.rs`), using `crate::testing::TestRig` and `run_local`.
 - Format only the files you touched (`rustfmt --edition 2021 <files>`), never a
   bare `cargo fmt` at the repo root.
+
+## Channels and sharing
+
+`modules/channel/`: `mod.rs` (the pure helpers, `ChannelTransport`,
+`ChannelWire`, `split_transport`), `manager.rs` (`ChannelManager`),
+`webrtc.rs` (the mesh between users), `interest.rs` (what a device's queries
+show), `room.rs` (the socket to the relay, behind `remote`). `channels.share`
+and the room were ported from the TypeScript directly (`index.ts`, `room.ts`,
+`hub.ts` in `packages/core/src/modules/channel`), so there the TypeScript is
+the spec.
+
+- **The wire is shared with the browser and Flutter.** `op` and `interest`
+  messages, the relay frames (protocol v1, `apps/relay/README.md`) and the hub
+  envelope (`{"h":"tabs"}`, `{"h":"m","from","to","m"}` inside the relay's
+  `d.m`) must stay what `packages/core` sends. A browser shares one socket
+  between its tabs, so a member of a room speaks for a list of tabs and a peer
+  is one tab; this client is a member that speaks for one tab, itself (the
+  manager's peer id is both its relay peer id and its tab id). `d.s` is the
+  signaling of the browsers' direct WebRTC link: ignored here, the browser
+  then stays on the relay.
+- **Own user through the room, everybody else through the mesh**
+  (`split_transport`); a custom `ChannelsConfig::transport` replaces both.
+  `ChannelTransport::supports(user)` lets the two halves differ, so a channel
+  to another user is still `Unsupported` without a WebRTC stack while the own
+  devices connect.
+- **Interest**: `ChannelManager::tap_showing(cb, interest)` takes what a
+  subscription can show; the manager merges its taps, announces the result to
+  the user's other devices (coalesced per turn, and to a device when it
+  connects) and `send` skips an own device whose announced interest does not
+  include the row before or after the write. The state holds a query as
+  SurrealQL only, so the engine keeps the claims beside it
+  (`Engine::describe_query`, fed by `QueryHost::describe_query` from the
+  builder and by `Sp00kyClient::live`); a module that registers through
+  `QueryHost::register_query` claims the tables it names, raw SurrealQL nobody
+  described claims everything. An operator or path the row alone cannot decide
+  is the whole table, never less.
+- Tests: `share_tests.rs` (port of `share.test.ts`), `room/tests.rs` (a relay
+  in memory and tokio's paused clock: backoff, heartbeat, `reauth`, the
+  envelope), `tests/relay_room.rs` (whole engines against the real
+  `sp00ky-relay`, plus a bare WebSocket that behaves like a browser with two
+  tabs and pins the frames).
 
 ## Checks
 

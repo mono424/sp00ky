@@ -25,8 +25,9 @@ spooky-core = { git = "https://github.com/mono424/sp00ky", package = "spooky-cor
 spooky-core = { git = "https://github.com/mono424/sp00ky", package = "spooky-core" }
 ```
 
-Features: `remote` (default, the SurrealDB WebSocket transport; without it the
-client is local-only) and `codegen` (default, schema to Rust for build scripts).
+Features: `remote` (default, the SurrealDB WebSocket transport and the socket
+to the room relay; without it the client is local-only) and `codegen`
+(default, schema to Rust for build scripts).
 
 ## Generate types from the schema
 
@@ -132,6 +133,8 @@ membership known: an empty list really is empty) drive loading states.
 | Files | `bucket(name).put/read/get/delete/list` (reads cached per `BlobCacheConfig`) |
 | Feature flags, releases | `feature(key, fallback)`, `app_release(app)` |
 | Backend jobs | `run(backend, path, payload, RunOptions)` |
+| Peer to peer channels (experimental) | `channel(&[query], peers)` on `-- @channel` tables; bring a WebRTC stack (`ChannelsConfig::rtc`) |
+| Sharing with your own devices (experimental) | `ChannelsConfig::default().share("note").relay("wss://relay.example.com/room")`, `share_state()`, `share_state_watch()` |
 | App lifecycle | `wake()`, `set_offline(bool)`, `checkpoint()`, `detach()`, `close()` |
 
 Call `close().await` before the process exits so the circuit snapshot is

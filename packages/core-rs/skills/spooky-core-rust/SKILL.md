@@ -6,7 +6,7 @@ description: >-
   service) opens a Sp00kyClient, generates types from the schema in build.rs,
   runs live queries, writes optimistically, signs users in, shows sync state,
   reads bucket files, checks feature flags, enqueues backend jobs, or uses
-  peer to peer channels or native push.
+  peer to peer channels, sharing with the user's own devices or native push.
 metadata:
   author: sp00ky-sync
   version: "0.0.1"
@@ -162,6 +162,16 @@ needs the backend in the generated schema.
   other. Channel writes take any `IntoObject`, like client writes. The app injects a WebRTC
   stack via `config.channels = Some(ChannelsConfig { rtc: Some(factory), .. })`,
   else the status is `Unsupported`.
+- Sharing with the user's own devices:
+  `config.channels = Some(ChannelsConfig::default().share("game").share_rows("note", |row| row.get("draft") != Some(&Value::Bool(true))).relay("wss://relay.example.com/room"))`.
+  The user's optimistic writes on those tables show on their other devices
+  (Rust, Flutter, browser) before the server has them; no `-- @channel` mark
+  and no WebRTC stack needed, only a `sp00ky-relay` and the `remote` feature.
+  `client.share_state()` / `share_state_watch()` say how the link is doing
+  (`Connected` while another device of the user is in the room, `Unsupported`
+  without a relay). Prefer `client.live(..)` over `live_raw`: a built query
+  tells the other devices which rows it shows, so they only send those, while
+  raw SurrealQL asks for every shared write.
 - `let push = client.push();` at startup, then
   `push.register(PushToken::new(PushKind::Apns, token, bundle_id), PushRegisterOptions::default())`
   and `push.sync(Some(token), PushSyncOptions::default())` on every launch

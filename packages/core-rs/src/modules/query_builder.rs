@@ -499,8 +499,11 @@ impl QueryBuilder {
             Error::InvalidArgument("QueryBuilder has no host (build-only)".into())
         })?;
         let (sql, vars) = self.build()?;
-        host.register_query(&self.table, &sql, vars, ttl, self.relations.clone())
-            .await
+        let hash = host
+            .register_query(&self.table, &sql, vars, ttl, self.relations.clone())
+            .await?;
+        host.describe_query(&hash, self);
+        Ok(hash)
     }
 
     /// [`QueryBuilder::run`] with the default ttl.

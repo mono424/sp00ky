@@ -39,8 +39,7 @@ use serde_json::{json, Value as Json};
 use tokio::task::JoinHandle;
 
 use super::{
-    id_key, ChannelLogger, ChannelMessage, ChannelTransport, PeerLinkStatus, PeerRef,
-    TransportHooks,
+    id_key, ChannelLogger, ChannelTransport, ChannelWire, PeerLinkStatus, PeerRef, TransportHooks,
 };
 use crate::error::{Error, Result};
 use crate::kernel::events::LogLevel;
@@ -317,7 +316,7 @@ impl ChannelTransport for WebRtcTransport {
         }
     }
 
-    fn send(&self, to: &PeerRef, message: &ChannelMessage) {
+    fn send(&self, to: &PeerRef, message: &ChannelWire) {
         let link = self.0.st.borrow().links.get(&to.key()).cloned();
         let Some(link) = link else { return };
         let dc = link.dc.borrow().clone();

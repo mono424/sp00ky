@@ -25,14 +25,14 @@ use crate::client::handle::Sp00kyClient;
 use crate::error::{Error, Result};
 use crate::modules::channel::PeerRef;
 use crate::modules::channel::{
-    prepare_scope, webrtc_transport, ChannelHandle, ChannelManager, ChannelRows, ChannelState,
-    LocalTransportFactory, ManagerOptions, OutgoingSignal, PreparedScope, Signal, SignalPort,
-    WebRtcOptions,
+    prepare_scope, split_transport, webrtc_transport, ChannelHandle, ChannelManager,
+    ChannelRelayConfig, ChannelRows, ChannelState, LocalTransportFactory, ManagerOptions,
+    OutgoingSignal, PreparedScope, QueryInterest, Signal, SignalPort, WebRtcOptions,
 };
 use crate::modules::query_builder::QueryBuilder;
 use crate::mutation::write::{self as write_saga, PeerWriteInput};
 use crate::runtime::Subscription;
-use crate::types::UpdateOptions;
+use crate::types::{QueryHash, UpdateOptions};
 use crate::value::{table_of, IntoObject, Object, Row, Value};
 
 /// The engine's channel state: the manager (built at wiring), the signaling
@@ -43,7 +43,15 @@ pub(crate) struct ChannelSlot {
     signal: RefCell<Option<Rc<dyn SignalPort>>>,
     shared: RefCell<HashMap<u64, SharedChannel>>,
     keep: RefCell<Vec<Subscription>>,
+    /// What each registered query can show, by hash, for the queries somebody
+    /// described (`channels.share`). The state holds a query as SurrealQL,
+    /// which says no more about its filter than the server would.
+    shows: RefCell<HashMap<QueryHash, Vec<QueryInterest>>>,
 }
+
+/// Past this many described queries, the ones no longer registered are
+/// forgotten.
+const SHOWS_PRUNE_AT: usize = 256;
 
 struct SharedChannel {
     channel: Sp00kyChannel,
@@ -135,13 +143,19 @@ impl Engine {
         let cfg = self.config().channels.clone();
         let signal = self.build_signal();
         *self.channels.signal.borrow_mut() = Some(signal.clone());
-        let transport: LocalTransportFactory = match cfg.as_ref().and_then(|c| c.transport.clone())
-        {
+        let custom = cfg.as_ref().and_then(|c| c.transport.clone());
+        // Between the user's own devices: one socket to their room on the
+        // relay.
+        let room = self.room_transport(cfg.as_ref().and_then(|c| c.relay.as_ref()));
+        let reaches_own_devices = custom.is_some() || room.is_some();
+        let transport: LocalTransportFactory = match custom {
             Some(factory) => Rc::new(move |hooks| factory(hooks)),
             None => {
                 let rtc = cfg.as_ref().and_then(|c| c.rtc.clone());
                 let ice_servers = cfg.as_ref().and_then(|c| c.ice_servers.clone());
-                Rc::new(move |hooks| {
+                // Between users: a WebRTC link per pair of devices, signaled
+                // through the database.
+                let mesh: LocalTransportFactory = Rc::new(move |hooks| {
                     webrtc_transport(
                         hooks,
                         WebRtcOptions {
@@ -152,7 +166,8 @@ impl Engine {
                             connect_timeout: CONNECT_TIMEOUT,
                         },
                     )
-                })
+                });
+                split_transport(room, mesh)
             }
         };
         let rows: Rc<dyn ChannelRows> = Rc::new(EngineRows(Rc::downgrade(self)));
@@ -165,6 +180,13 @@ impl Engine {
                 ..Default::default()
             },
         );
+        if manager.sharing() && !reaches_own_devices {
+            tracing::warn!(
+                target: "spooky.channel",
+                "channels.share is set without a room to share through: nothing reaches your other devices \
+                 until channels.relay names a relay (which needs the `remote` feature)"
+            );
+        }
         // Who this device is to its peers: the signed-in user.
         if manager.enabled() {
             if let Some(auth) = self.auth() {
@@ -174,6 +196,30 @@ impl Engine {
             }
         }
         *self.channels.manager.borrow_mut() = Some(manager);
+    }
+
+    /// The transport to the user's own devices, when a relay is configured.
+    /// The hello carries the session token, which is how the relay knows
+    /// whose room this is.
+    #[cfg(feature = "remote")]
+    fn room_transport(&self, relay: Option<&ChannelRelayConfig>) -> Option<LocalTransportFactory> {
+        use crate::modules::channel::{room_transport, RoomOptions};
+        let relay = relay?.clone();
+        let auth = self.auth().cloned();
+        Some(Rc::new(move |hooks| {
+            let (given, auth) = (relay.token.clone(), auth.clone());
+            let token = move || match &given {
+                Some(token) => token(),
+                None => auth.as_ref().and_then(|a| a.token()),
+            };
+            room_transport(hooks, RoomOptions::new(relay.url.clone(), token))
+        }))
+    }
+
+    /// Without the `remote` feature there is no WebSocket to hold a room with.
+    #[cfg(not(feature = "remote"))]
+    fn room_transport(&self, _relay: Option<&ChannelRelayConfig>) -> Option<LocalTransportFactory> {
+        None
     }
 
     fn build_signal(&self) -> Rc<dyn SignalPort> {
@@ -193,6 +239,7 @@ impl Engine {
     pub(super) fn close_channels(&self) {
         self.channels.shared.borrow_mut().clear();
         self.channels.keep.borrow_mut().clear();
+        self.channels.shows.borrow_mut().clear();
         let manager = self.channels.manager.borrow_mut().take();
         if let Some(m) = manager {
             m.close();
@@ -206,9 +253,57 @@ impl Engine {
         self.channels.manager.borrow().clone()
     }
 
-    /// The channel manager when the schema has `@channel` tables, else `None`.
+    /// The channel manager when the schema has `@channel` tables or
+    /// `channels.share` names one, else `None`.
     fn active_channels(&self) -> Option<ChannelManager> {
         self.channel_manager().filter(ChannelManager::enabled)
+    }
+
+    /// The link to this user's other devices (`channels.share`): `Connected`
+    /// with the user's id in `peers` while at least one other device of
+    /// theirs is in the room. `Idle` when nothing is shared or nobody is
+    /// signed in, `Unsupported` when no relay is configured.
+    pub fn share_state(&self) -> ChannelState {
+        self.channel_manager()
+            .map(|m| m.own_state())
+            .unwrap_or_default()
+    }
+
+    /// Called at once with [`Engine::share_state`], then on every change,
+    /// until the returned subscription is dropped.
+    pub fn subscribe_share_state(&self, cb: impl Fn(&ChannelState) + 'static) -> Subscription {
+        match self.channel_manager() {
+            Some(m) => m.subscribe_own(cb),
+            None => {
+                cb(&ChannelState::default());
+                Subscription::noop()
+            }
+        }
+    }
+
+    /// Note what the registered query `hash` can show (see
+    /// [`crate::modules::channel::query_interest`]). With `channels.share`,
+    /// the user's other devices are told, and only send what a subscription
+    /// to it has a use for. A query nobody describes counts as showing
+    /// everything.
+    pub fn describe_query(&self, hash: &str, shows: Vec<QueryInterest>) {
+        self.note_shows(hash, shows, true);
+    }
+
+    /// [`Engine::describe_query`]; `replace` false keeps what somebody who
+    /// knew more already said.
+    pub(super) fn note_shows(&self, hash: &str, shows: Vec<QueryInterest>, replace: bool) {
+        if !self.channel_manager().is_some_and(|m| m.sharing()) {
+            return;
+        }
+        let mut known = self.channels.shows.borrow_mut();
+        if known.len() >= SHOWS_PRUNE_AT {
+            self.runtime()
+                .read(|s| known.retain(|hash, _| s.queries.contains_key(hash)));
+        }
+        if replace || !known.contains_key(hash) {
+            known.insert(hash.to_string(), shows);
+        }
     }
 
     /// Where WebRTC signals go: rows of `_00_channel_signal`.
@@ -361,8 +456,8 @@ impl Engine {
     }
 
     /// A registered query's rows, on every change. `immediate` replays the
-    /// current rows. With `@channel` tables in the schema, channel peers'
-    /// values are folded in (output only, never the store).
+    /// current rows. With `@channel` or shared tables in the schema, channel
+    /// peers' values are folded in (output only, never the store).
     pub fn subscribe(
         &self,
         hash: &str,
@@ -372,7 +467,10 @@ impl Engine {
         let Some(channels) = self.active_channels() else {
             return self.subscribe_records(hash, cb, immediate);
         };
-        let tap = Rc::new(channels.tap(cb));
+        // With `channels.share`, the user's other devices are told what this
+        // query can show, and only send what it has a use for.
+        let shows = self.channels.shows.borrow().get(hash).cloned();
+        let tap = Rc::new(channels.tap_showing(cb, shows));
         let feed = tap.clone();
         let sub = self.subscribe_records(hash, move |rows| feed.feed(rows), immediate);
         Subscription::new(move || {

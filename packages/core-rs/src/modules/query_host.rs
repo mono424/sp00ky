@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::modules::query_builder::RelationPlan;
+use crate::modules::query_builder::{QueryBuilder, RelationPlan};
 use crate::runtime::{RecordsCallback, Subscription};
 use crate::types::QueryHash;
 use crate::value::Object;
@@ -32,6 +32,12 @@ pub trait QueryHost {
     /// Watch a registered query's rows. `immediate` replays the current rows.
     /// Counts as a subscriber (keeps the query alive) until the guard drops.
     fn subscribe(&self, hash: &str, callback: RecordsCallback, immediate: bool) -> Subscription;
+
+    /// The builder behind a query that was just registered. `register_query`
+    /// only gets its SurrealQL; a host that tells the user's other devices
+    /// what this one shows (`channels.share`) reads the filter from here. The
+    /// default has no use for it.
+    fn describe_query(&self, _hash: &str, _query: &QueryBuilder) {}
 }
 
 /// Fakes for module tests: a host that records registrations and lets a test

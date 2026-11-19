@@ -99,6 +99,7 @@ choice of runtime.
 ## Next
 
 - Debounced updates, the failed-write tray, sync indicators, buckets, feature
-  flags, backend jobs, channels and push: the Rust guide on the docs site.
+  flags, backend jobs, channels, sharing with your own devices and push: the
+  Rust guide on the docs site.
 - `AGENTS.md`: the full public API and the gotchas.
 - `tests/client_local.rs`: a local-only client in a test.

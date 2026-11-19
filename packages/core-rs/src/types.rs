@@ -330,6 +330,8 @@ pub struct Sp00kyConfig {
     /// Peer to peer channels for `-- @channel` tables: accept rules, the
     /// WebRTC stack, a custom transport. `None` uses the defaults (no WebRTC
     /// stack, so channels report `unsupported` unless a transport is given).
+    /// Also what is shared with the user's own other devices (`share`) and
+    /// the room relay they meet on (`relay`).
     pub channels: Option<crate::modules::channel::ChannelsConfig>,
 }
 

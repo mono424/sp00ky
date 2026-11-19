@@ -63,6 +63,8 @@ jobs:
         run: cargo test --locked -p scheduler --lib --test integration --test handover --test handover_two_step
       - name: Native SSP adapter builds
         run: cargo check --locked -p ssp-server
+      - name: Room relay regressions
+        run: cargo test --locked -p sp00ky-relay
       - name: Portable node builds for wasm
         run: bash scripts/check-portability.sh --locked
 

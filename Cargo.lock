@@ -7545,6 +7545,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sp00ky-relay"
+version = "1.0.0-beta.8"
+dependencies = [
+ "async-trait",
+ "axum 0.7.9",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "spade"
 version = "2.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

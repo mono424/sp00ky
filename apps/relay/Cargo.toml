@@ -1,0 +1,25 @@
+[package]
+name = "sp00ky-relay"
+version = "1.0.0-beta.8"
+edition = "2024"
+
+# A memory-only WebSocket relay: the devices of one user join that user's room
+# and forward each other small JSON messages. It stores nothing and reads no
+# payload, so the dependency list is kept deliberately short. axum 0.7 and
+# reqwest 0.12 are the versions the scheduler and the agent already build.
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "ws"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The version axum's `ws` feature is built on, so test clients and the server
+# share one tungstenite.
+tokio-tungstenite = "0.24"

@@ -6,6 +6,7 @@ members = [
     "apps/scheduler",
     "apps/cli",
     "apps/agent",
+    "apps/relay",
     "packages/ssp",
     "packages/ssp-protocol",
     "packages/ssp-wasm",

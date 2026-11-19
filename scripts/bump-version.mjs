@@ -12,6 +12,7 @@ const CARGO_TOML_PACKAGES = [
   "apps/cli/Cargo.toml",
   "apps/ssp-portable/Cargo.toml",
   "apps/ssp-cf/Cargo.toml",
+  "apps/relay/Cargo.toml",
   "packages/ssp/Cargo.toml",
   "packages/ssp-protocol/Cargo.toml",
   "packages/ssp-ffi/Cargo.toml",

@@ -27,8 +27,12 @@ const logger: any = {
   child: () => logger,
 };
 
-/** A core Runtime whose `_00_view` holds one row for query `q`, behind a SyncedDb. */
-function engine() {
+/**
+ * A core Runtime whose `_00_view` holds one row for query `q`, behind a
+ * SyncedDb. `records`: rows the entry is born holding, unanswered (what a
+ * registration paints from the store's copy of the last session).
+ */
+function engine(records: Record<string, unknown>[] = []) {
   const a = fakeAdapters({
     local: {
       getById: async () => ({ ids: [['thing:1', 1]], confirmed: true }),
@@ -43,7 +47,7 @@ function engine() {
     tabId: 'tab-a',
     // Registered while still in the anon bucket: cold, nothing painted.
     initialState: {
-      ...buildState([buildEntry({ def: { hash: 'q', plan: { table: 'thing' } as any } })]),
+      ...buildState([buildEntry({ def: { hash: 'q', plan: { table: 'thing' } as any }, records })]),
       sessionId: 's',
     },
   });
@@ -120,6 +124,31 @@ describe('createQuery across a bucket switch (sign-in)', () => {
 
       expect(seen.filter((s) => s.startsWith('settled') && s.endsWith(' 0'))).toEqual([]);
       expect(seen.filter((s) => s.includes('empty'))).toEqual([]);
+      dispose();
+    });
+  });
+});
+
+describe('createQuery on an entry born holding rows', () => {
+  it('is not loading: the first rows are followed by "not answered yet", not by a flip back', async () => {
+    const { rt, db } = engine([{ id: 'thing:1', name: 'mine' }]);
+    await createRoot(async (dispose) => {
+      const q = createQuery<any, any, any, any, false, any>(db, {
+        hash: 'q',
+        isOne: false,
+        run: async () => ({ hash: 'q' }),
+      } as any);
+      createEffect(
+        () => q.data(),
+        () => {}
+      );
+      flush();
+      await settle();
+      expect(rt.state.queries.get('q')!.lifecycle.phase).toBe('cold');
+      expect(q.data().map((r: any) => r.id)).toEqual(['thing:1']);
+      expect(q.isAuthoritative()).toBe(false);
+      expect(q.isLoading()).toBe(false);
+      expect(q.hasData()).toBe(true);
       dispose();
     });
   });

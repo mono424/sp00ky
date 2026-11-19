@@ -11,6 +11,8 @@ export function mockEngine() {
   const subs = new Map<string, (e: Emission) => void>();
   const statusSubs = new Map<string, (s: string) => void>();
   const authoritySubs = new Map<string, (known: boolean) => void>();
+  // Rows a query already holds when it is subscribed to (see `hold`).
+  const held = new Map<string, Emission>();
   const unsubscribed: string[] = [];
   const deregistered: string[] = [];
   const preloaded: string[] = [];
@@ -24,8 +26,10 @@ export function mockEngine() {
     }),
     subscribe: vi.fn<
       (hash: string, cb: (e: Emission) => void, o?: Immediate) => Promise<() => void>
-    >(async (hash, cb) => {
+    >(async (hash, cb, o) => {
       subs.set(hash, cb);
+      // Like the core: the immediate rows are delivered before `subscribe` returns.
+      if (o?.immediate && held.has(hash)) cb(held.get(hash)!);
       return () => {
         subs.delete(hash);
         unsubscribed.push(hash);
@@ -46,6 +50,9 @@ export function mockEngine() {
       preloaded.push(q.hash);
     }),
     create: vi.fn<(id: string, payload: Record<string, unknown>) => Promise<void>>(async () => {}),
+    // An open client by default. `eagerEngine` is the one that is not.
+    isLocalReady: vi.fn<() => boolean>(() => true),
+    peekQuery: vi.fn<(q: { hash: string }) => Emission | null>(() => null),
   };
   const db = Object.create(SyncedDb.prototype) as SyncedDb<any>;
   (db as any).sp00ky = sp00ky;
@@ -55,11 +62,26 @@ export function mockEngine() {
     emit: (hash: string, e: Emission) => subs.get(hash)?.(e),
     setStatus: (hash: string, s: string) => statusSubs.get(hash)?.(s),
     setAuthority: (hash: string, known: boolean) => authoritySubs.get(hash)?.(known),
+    /** The query is registered already holding `e`: its first subscriber gets them at once. */
+    hold: (hash: string, e: Emission) => void held.set(hash, e),
     unsubscribed,
     deregistered,
     preloaded,
     hasSub: (hash: string) => subs.has(hash),
   };
+}
+
+/**
+ * What `<Sp00kyProvider eager>` hands the tree: an eager `SyncedDb` whose
+ * client is not open yet, with `painted` as the rows its store kept from the
+ * last time the app was open.
+ */
+export function eagerEngine(painted: Emission | null) {
+  const eng = mockEngine();
+  (eng.db as any).eager = true;
+  eng.sp00ky.isLocalReady.mockReturnValue(false);
+  eng.sp00ky.peekQuery.mockReturnValue(painted);
+  return eng;
 }
 
 export function mockQuery(hash: string, isOne = false, fail?: Error) {

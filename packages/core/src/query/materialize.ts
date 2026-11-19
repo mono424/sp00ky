@@ -3,6 +3,10 @@ import type { RecordId } from 'surrealdb';
 import type { Effect } from '../kernel/effects';
 import { fx } from '../kernel/effects';
 import { encodeRecordId, parseRecordIdString } from '../utils/index';
+import type { QueryEntry } from '../state/client-state';
+import type { Overlay } from '../state/selectors';
+import { viewKeyInput } from './hash';
+import { buildRenderIds, paintsCold, resolveMembership } from './render-set';
 import { buildIdSetPlan, buildIdSetSurql, buildWindowMaterialization } from './window-query';
 
 export interface MaterializeSource {
@@ -18,16 +22,88 @@ export const isWindowed = (surql: string): boolean => buildWindowMaterialization
  * with the overlay applied); `null` means "no membership yet, scan the local
  * store with the query's own predicate".
  */
-export function materializeEffect(src: MaterializeSource, ids: string[] | null): Effect {
+export function materializeEffect(src: MaterializeSource, ids: string[] | null, paintKey?: string): Effect {
   if (ids !== null) {
     const parsed = ids.map((id) => parseRecordIdString(id));
-    if (src.plan) return fx.local.select(buildIdSetPlan(src.plan, parsed), src.params);
+    if (src.plan) return fx.local.select(buildIdSetPlan(src.plan, parsed), src.params, paintKey);
     const idSet = buildIdSetSurql(src.surql);
     if (idSet) return fx.local.query(idSet.query, { ...src.params, __win: parsed });
     return fx.local.query(src.surql, src.params);
   }
-  if (src.plan) return fx.local.select(src.plan, src.params);
+  if (src.plan) return fx.local.select(src.plan, src.params, paintKey);
   return fx.local.query(src.surql, src.params);
+}
+
+/**
+ * The peek that goes with {@link materializeEffect}: what the read named
+ * `paintKey` answered in an earlier page load, for a store that kept it.
+ * It takes the plan, since only a query that has one can be painted: no
+ * paint cache covers raw SurrealQL.
+ */
+export function paintEffect(plan: QueryPlan, params: Record<string, unknown>, ids: string[] | null, paintKey: string): Effect {
+  const read = ids === null ? plan : buildIdSetPlan(plan, ids.map((id) => parseRecordIdString(id)));
+  return fx.local.peekSelect(read, params, paintKey);
+}
+
+/**
+ * The name a query's render read goes by in the store's paint cache. Built
+ * from what a page knows the moment it has the query (its text and its
+ * parameters), not from a digest that takes a turn of the event loop: a
+ * component asks for these rows while it renders, before the client is open.
+ *
+ * A cold scan is kept under a name of its own. Its rows are filtered before
+ * they show (`RenderRead.shows`), by what the client only knows once it is
+ * open; the rows of a membership render show as read. So a caller without
+ * the client's state (`Sp00kyClient.peekQuery`) asks for the membership name
+ * alone, and never paints a row a cold render would have hidden.
+ */
+export const paintKeyOf = (src: Pick<MaterializeSource, 'surql' | 'params'>, ids: string[] | null): string =>
+  viewKeyInput(src) + (ids === null ? '\ncold' : '');
+
+/** What one render of a query reads, and which of the rows it gets back may show. */
+export interface RenderRead {
+  /** The render set, or `null` for a scan with the query's own predicate. */
+  ids: string[] | null;
+  shows(rows: Record<string, unknown>[]): Record<string, unknown>[];
+}
+
+/**
+ * Membership (or a cold scan) with the outbox overlay applied. `known` is the
+ * set of ids some durable view vouches for: before the server has answered
+ * (`cold`) only those bodies paint (see `paintsCold`).
+ */
+export function renderRead(
+  entry: Pick<QueryEntry, 'def' | 'lifecycle' | 'remoteArray' | 'localArray'>,
+  ov: Overlay,
+  known: ReadonlySet<string>
+): RenderRead {
+  const isWindow = isWindowed(entry.def.surql);
+  const paints = (id: string | null) => id === null || paintsCold(id, known, ov);
+  const coldWindow = entry.lifecycle.phase === 'cold' && isWindow;
+  const membership = resolveMembership({
+    phase: entry.lifecycle.phase,
+    remoteArray: entry.remoteArray,
+    localArray: coldWindow ? entry.localArray.filter(([id]) => paints(id)) : entry.localArray,
+    isWindow,
+  });
+  const ids = membership
+    ? buildRenderIds(membership, entry.localArray, ov, {
+        hasExplicitOrder: (entry.def.plan?.orderBy?.length ?? 0) > 0,
+        isWindow,
+      })
+    : null;
+  return {
+    ids,
+    // A peer's delete leaves the row in the store until it is confirmed, so
+    // the predicate scan must drop it here (an own delete removed it already).
+    shows: (rows) =>
+      ids !== null
+        ? rows
+        : rows.filter((row) => {
+            const key = rowKey(row);
+            return paints(key) && !(key !== null && ov.deletes.has(key));
+          }),
+  };
 }
 
 /** Rows out of either read effect's result. */

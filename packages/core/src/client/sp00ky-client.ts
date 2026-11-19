@@ -61,7 +61,9 @@ import { boot } from '../boot/boot.saga';
 import { preload } from '../boot/preload.saga';
 import { DEGRADE_AFTER_FAILURES, OUTBOX_BATCH_SIZE, PUSH_TIMEOUT_MS } from '../kernel/constants';
 import { Runtime } from './runtime';
-import { createAdapters, createServices, createTabsCoordinator, type ServiceHost, type Services } from './services';
+import { createAdapters, createServices, createTabsCoordinator, readBootBucketHint, type ServiceHost, type Services } from './services';
+import { ANON_USER_ID } from '../modules/ref-tables';
+import { paintKeyOf } from '../query/materialize';
 import { BucketHandle, bucketSettings } from './bucket-handle';
 import { ImpersonationBanner } from '../modules/auth/impersonation-banner';
 import type { LeaderSyncHub, SyncForwarder } from '../services/tabs/coordinator';
@@ -81,6 +83,17 @@ export interface Sp00kyClientDeps<S extends SchemaStructure> {
  * state read, or a subscription on the runtime; the engine's behaviour lives
  * in the sagas.
  */
+/** A promise and the two ways to settle it; settling twice does nothing. */
+function deferred(): { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void } {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 export class Sp00kyClient<S extends SchemaStructure> {
   public readonly auth: AuthService<S>;
   public readonly streamProcessor: StreamProcessorService;
@@ -146,8 +159,14 @@ export class Sp00kyClient<S extends SchemaStructure> {
     this.streamProcessor = s.streamProcessor;
 
     const liveQueryPort = {
-      query: (table: string, surql: string, params: Record<string, unknown>, ttl: QueryTimeToLive) =>
-        this.runtime.run(registerLocal(this.env, { tableName: table, surql, params, ttl })),
+      // Feature flags and app releases register here, from boot (which has a
+      // session by the time it asks) and from hooks. A hook on a client that
+      // is not open yet has no session to register under: it waits, where it
+      // used to fail and only be tried again at the next sign-in.
+      query: async (table: string, surql: string, params: Record<string, unknown>, ttl: QueryTimeToLive) => {
+        if (this.runtime.state.sessionId === null) await this.ready.promise;
+        return this.runtime.run(registerLocal(this.env, { tableName: table, surql, params, ttl }));
+      },
       subscribe: (hash: string, cb: (records: Record<string, any>[]) => void, options?: { immediate?: boolean }) =>
         this.runtime.subscribe(hash, cb, options),
     };
@@ -268,6 +287,11 @@ export class Sp00kyClient<S extends SchemaStructure> {
       });
     }
     this.wireAdapters();
+    // Unobserved, a failed boot must not also be an unhandled rejection.
+    this.ready.promise.catch(() => {});
+    // The bucket `boot` is about to open, so the store can paint from it now
+    // (`peekQuery`). Alone in the store only: see `LocalStore.expectBucket`.
+    if (!s.tabs) s.local.expectBucket?.(readBootBucketHint() ?? ANON_USER_ID);
   }
 
   /** Adapter callbacks become runtime events; runtime events reach the legacy services. */
@@ -374,11 +398,39 @@ export class Sp00kyClient<S extends SchemaStructure> {
 
   // ---- lifecycle ---------------------------------------------------------------
 
+  /** Settled by `init`: what a call made before the client is open waits on. */
+  private ready = deferred();
+
   async init(): Promise<void> {
-    await this.runtime.run(boot(this.env, { sharedTabs: this.services.tabs !== null }));
+    try {
+      await this.runtime.run(boot(this.env, { sharedTabs: this.services.tabs !== null }));
+      this.ready.resolve();
+    } catch (error) {
+      this.ready.reject(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Resolves once `init()` has finished, and rejects with its error if it
+   * fails. A page that renders before the client is open (a provider's
+   * `eager` mode) awaits this for whatever must not run earlier.
+   */
+  whenReady(): Promise<void> {
+    return this.ready.promise;
+  }
+
+  /**
+   * Queries and writes need the open client: its store, its session. Asked
+   * for earlier, they wait for `init()` to finish, so a component may register
+   * a query on its first render and need not know whether the client is open.
+   */
+  private opened(): Promise<void> | undefined {
+    return this.runtime.state.localReady ? undefined : this.ready.promise;
   }
 
   async close(): Promise<void> {
+    this.ready.reject(new Error('Sp00kyClient: closed before it was ready'));
     const s = this.services;
     s.connectionSupervisor.dispose();
     for (const dispose of this.disposers.splice(0)) dispose();
@@ -429,8 +481,33 @@ export class Sp00kyClient<S extends SchemaStructure> {
     };
   }
 
-  private initQuery(table: string, q: InnerQuery<any, any, any>, ttl: QueryTimeToLive): Promise<string> {
+  private async initQuery(table: string, q: InnerQuery<any, any, any>, ttl: QueryTimeToLive): Promise<string> {
+    await this.opened();
     return this.runtime.run(registerLocal(this.env, this.registerInput(table, q, ttl)));
+  }
+
+  /**
+   * The rows this query rendered the last time this browser had the app open,
+   * handed back at once and with no need for `init()` to have run: something
+   * for a component to render on its first pass, where it would have rendered
+   * an empty list. `null` when the local store keeps no such copy (only
+   * `localEngine: 'rows'` with its paint cache does, and not with shared
+   * tabs), or has none for this query.
+   *
+   * They are rows to paint from, not a result. The query still has to be run
+   * and subscribed to; what that delivers is the answer, and it replaces these
+   * rows when it differs.
+   */
+  peekQuery(finalQuery: FinalQuery<S, any, any, any, any, any>): Record<string, any>[] | null {
+    try {
+      const q = finalQuery.innerQuery;
+      const input = this.registerInput(q.tableName, q, '10m');
+      if (!input.plan) return null;
+      // The membership render's rows only: a cold scan's are filtered by state the closed client does not have.
+      return this.services.local.peekSelect?.(input.plan, input.params, { paintKey: paintKeyOf(input, []) }) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -449,6 +526,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
 
   async queryRaw(sql: string, params: Record<string, any>, ttl: QueryTimeToLive): Promise<string> {
     this.assertRawRemoteAllowed('queryRaw');
+    await this.opened();
     const tableName = sql.split('FROM ')[1]?.split(' ')[0] ?? '';
     return this.runtime.run(registerLocal(this.env, { tableName, surql: sql, params, ttl }));
   }
@@ -460,6 +538,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
    */
   async preload(finalQuery: FinalQuery<S, any, any, any, any, any>, options?: PreloadOptions): Promise<void> {
     const q = finalQuery.innerQuery;
+    await this.opened();
     await this.runtime.run(preload(this.env, this.registerInput(q.tableName, q, '10m')), { signal: options?.signal });
   }
 
@@ -502,9 +581,20 @@ export class Sp00kyClient<S extends SchemaStructure> {
       setPeers: handle.setPeers,
       setQueries: (next) => handle.setScopes(this.channelScopes(next)),
       close: handle.close,
-      update: (table, id, data, options) => this.writeUpdate(table, id, data as Record<string, unknown>, options, scoped(table)) as never,
-      create: (id, data) => this.writeCreate(id, data as Record<string, unknown>, scoped(id.slice(0, id.indexOf(':')))) as never,
-      delete: (table, id) => this.writeDelete(table, id, scoped(table)),
+      // Like every write, these wait for a client that is not open yet. A
+      // table the channel does not carry is still refused at once, in the call.
+      update: ((table: string, id: string, data: Record<string, unknown>, options?: UpdateOptions) => {
+        const scope = scoped(table);
+        return Promise.resolve(this.opened()).then(() => this.writeUpdate(table, id, data, options, scope));
+      }) as never,
+      create: ((id: string, data: Record<string, unknown>) => {
+        const scope = scoped(id.slice(0, id.indexOf(':')));
+        return Promise.resolve(this.opened()).then(() => this.writeCreate(id, data, scope));
+      }) as never,
+      delete: (table, id) => {
+        const scope = scoped(table);
+        return Promise.resolve(this.opened()).then(() => this.writeDelete(table, id, scope));
+      },
     };
   }
 
@@ -554,14 +644,17 @@ export class Sp00kyClient<S extends SchemaStructure> {
   // ---- mutations ---------------------------------------------------------------
 
   async create<T extends Record<string, unknown>>(id: string, data: T): Promise<T> {
+    await this.opened();
     return (await this.writeCreate(id, data)) as T;
   }
 
   async update<T extends Record<string, unknown>>(table: string, id: string, data: Partial<T>, options?: UpdateOptions): Promise<T> {
+    await this.opened();
     return (await this.writeUpdate(table, id, data as Record<string, unknown>, options)) as T;
   }
 
   async delete(table: string, id: string): Promise<void> {
+    await this.opened();
     await this.writeDelete(table, id);
   }
 
@@ -754,6 +847,8 @@ export class Sp00kyClient<S extends SchemaStructure> {
   /** Open a `@crdt` field for editing. `draft` (from {@link createCrdtDraft})
    *  hands over edits made before the record existed. */
   async openCrdtField(table: string, recordId: string, field: string, draft?: CrdtField): Promise<CrdtField> {
+    // Opening reads this device's unsent edits from the store: it has to be open.
+    await this.opened();
     return this.services.crdt.open(table, recordId, field, draft);
   }
 
@@ -770,7 +865,7 @@ export class Sp00kyClient<S extends SchemaStructure> {
   }
 
   bucket<B extends BucketNames<S>>(name: B): BucketHandle {
-    return new BucketHandle(name, this.services.remote, this.services.blobs, bucketSettings(this.config, name, this.services.logger));
+    return new BucketHandle(name, this.services.remote, this.services.blobs, bucketSettings(this.config, name, this.services.logger), () => this.opened());
   }
 
   getBlobCacheStats() {

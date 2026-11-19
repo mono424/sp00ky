@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sp00ky storage benchmark</title>
+    <!--
+      Both stores that can be started ahead of the app are: the row store's worker (the client's
+      own ROWS_PREWARM_SNIPPET, which vite.config.ts puts at the top of this head) and the
+      IndexedDB connection, as a careful app would open it. Each only acts when its backend has
+      data from an earlier load.
+    -->
+    <script>
+      (function(){try{if(localStorage.getItem("bench:idb-preopen")!=="1")return;globalThis.__benchIdb=new Promise(function(resolve,reject){var r=indexedDB.open("sp00ky-storage-bench",1);r.onsuccess=function(){resolve(r.result)};r.onerror=function(){reject(r.error)}})}catch(e){}})();
+    </script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781; --line: #e1e0d9;
+        --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --mute: #b9b7ae; --good: #006300; --bad: #d03b3b; --accent: #2a78d6;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781; --line: #2c2c2a;
+          --s1: #3987e5; --s2: #d95926; --s3: #199e70; --mute: #5c5b56; --good: #0ca30c; --bad: #e66767; --accent: #3987e5;
+        }
+      }
+      * { box-sizing: border-box; }
+      body { font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif; margin: 0; background: var(--page); color: var(--ink); }
+      main { max-width: 980px; margin: 0 auto; padding: 28px 16px 64px; }
+      h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+      .lede { margin: 0 0 18px; color: var(--ink2); max-width: 70ch; }
+      code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+      .controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: end; }
+      .controls label { display: grid; gap: 3px; font-size: 12px; color: var(--ink2); }
+      input, select { font: inherit; padding: 5px 8px; border-radius: 7px; border: 1px solid var(--line); background: var(--page); color: var(--ink); }
+      input[type='number'] { width: 96px; }
+      input[type='text'] { width: 170px; }
+      button { font: inherit; padding: 6px 14px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      #status { font-variant-numeric: tabular-nums; color: var(--ink2); min-height: 1.4em; flex-basis: 100%; }
+
+      .tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+      .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+      .tile .who { display: flex; align-items: center; gap: 7px; color: var(--ink2); font-size: 12.5px; }
+      .tile .big { font-size: 34px; font-weight: 650; letter-spacing: -0.02em; line-height: 1.15; margin-top: 6px; font-variant-numeric: tabular-nums; }
+      .tile .big small { font-size: 14px; font-weight: 400; color: var(--muted); letter-spacing: 0; }
+      .tile .cap { color: var(--ink2); font-size: 12.5px; }
+      .tile .line { display: flex; justify-content: space-between; gap: 8px; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--ink2); }
+      .tile .line b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+      .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 4px 2px; color: var(--ink2); font-size: 13px; }
+      .legend.small { margin-top: 10px; font-size: 12px; }
+      .legend span { display: inline-flex; align-items: center; gap: 6px; }
+      .legend i, .who i, .tip i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex: none; }
+      .note { color: var(--muted); font-size: 12px; margin: 2px 2px 12px; }
+      section { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px 8px; margin-bottom: 14px; }
+      h2 { font-size: 14px; margin: 0; }
+      .about { color: var(--ink2); font-size: 12.5px; margin: 2px 0 8px; max-width: 78ch; }
+      .row { display: grid; grid-template-columns: minmax(150px, 34%) 1fr; gap: 16px; padding: 9px 0; border-top: 1px solid var(--line); align-items: center; }
+      section > .row:first-of-type { margin-top: 8px; }
+      .label small { display: block; color: var(--muted); font-size: 11.5px; }
+      .bars { display: grid; gap: 2px; }
+      .bar { display: grid; grid-template-columns: 1fr 118px; align-items: center; gap: 10px; padding: 2px 0; cursor: default; }
+      .track { position: relative; height: 9px; }
+      .fill { height: 9px; border-radius: 0 4px 4px 0; min-width: 2px; }
+      .p95 { position: absolute; top: -2px; width: 2px; height: 13px; background: var(--ink); opacity: 0.45; border-radius: 1px; transform: translateX(-1px); }
+      .p95.static { position: static; display: inline-block; transform: none; width: 2px; height: 11px; border-radius: 1px; }
+      .val { font-variant-numeric: tabular-nums; text-align: right; color: var(--ink2); font-size: 12.5px; white-space: nowrap; }
+      .val.best { color: var(--ink); font-weight: 650; }
+      .delta { margin-left: 6px; font-size: 11px; font-weight: 500; }
+      .delta.down { color: var(--good); }
+      .delta.up { color: var(--bad); }
+      .bar:hover .fill { filter: brightness(1.1); }
+      .tip { position: absolute; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgb(0 0 0 / 0.18); display: none; max-width: 280px; z-index: 5; }
+      .tip b { display: flex; align-items: center; gap: 6px; }
+      .tip div { color: var(--ink2); font-variant-numeric: tabular-nums; }
+      details { margin: 14px 2px; }
+      summary { cursor: pointer; color: var(--ink2); font-size: 12.5px; }
+      table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+      th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+      th:first-child, td:first-child { text-align: left; white-space: normal; }
+      th { color: var(--ink2); font-weight: 500; }
+      th.group { text-align: left; padding-top: 14px; color: var(--ink); font-weight: 600; }
+      td small, th small { color: var(--muted); }
+      td.best { font-weight: 650; }
+      textarea { width: 100%; height: 180px; margin-top: 8px; font: 12px ui-monospace, monospace; background: var(--surface); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; }
+      body.leader .panel:not(.status), body.leader #results, body.leader details { display: none; }
+      @media (max-width: 640px) {
+        .tiles { grid-template-columns: 1fr; }
+        .row { grid-template-columns: 1fr; gap: 6px; }
+        .bar { grid-template-columns: 1fr 104px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Storage benchmark</h1>
+      <p class="lede">IndexedDB, the SQLite engine and the row store, on the reads and writes the client makes. Run it from a production build (<code>pnpm build &amp;&amp; pnpm preview</code>): against a dev server the fresh-page numbers measure Vite.</p>
+      <div class="panel status">
+        <div class="controls">
+          <label>games <input id="games" type="number" min="1000" step="1000" /></label>
+          <label>comments <input id="comments" type="number" min="1000" step="1000" /></label>
+          <label>script download ms <input id="idle" type="number" min="0" step="10" /></label>
+          <label>app startup ms <input id="boot" type="number" min="0" step="10" /></label>
+          <label>name this run <input id="label" type="text" placeholder="e.g. before the change" /></label>
+          <button class="primary" id="run">Run</button>
+          <button id="tabs" title="Opens a second tab that leads; this one follows it">Shared-tabs test</button>
+          <button id="reset" title="Wipe every backend, the results and the kept runs">Reset</button>
+          <label>compare with <select id="baseline"><option value="">nothing</option></select></label>
+          <span id="status"></span>
+        </div>
+      </div>
+      <div id="results"></div>
+      <details>
+        <summary>Raw results (JSON)</summary>
+        <textarea id="json" readonly></textarea>
+      </details>
+    </main>
+    <div class="tip" id="tip"></div>
+    <script type="module" src="/src/bench.ts"></script>
+  </body>
+</html>

@@ -19,7 +19,8 @@ export interface SqliteTransport {
   readonly kind: 'worker' | 'port';
   /** True while the transport can carry a request. */
   readonly connected: boolean;
-  call<T = unknown>(type: string, payload?: unknown): Promise<T>;
+  /** `transfer` hands the listed buffers over instead of copying them. */
+  call<T = unknown>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T>;
   /** Reject every pending request with `reason`. Safe to call repeatedly. */
   failAll(reason: string): void;
   /** failAll + release the underlying channel. Terminal. `err` overrides the
@@ -69,13 +70,13 @@ abstract class BaseTransport implements SqliteTransport {
     else p.reject(new Error(error));
   }
 
-  call<T = unknown>(type: string, payload?: unknown): Promise<T> {
+  call<T = unknown>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T> {
     if (this.closed) return Promise.reject(this.makeError('transport closed'));
     const id = ++this.seq;
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
-        this.post({ id, type, payload });
+        this.post({ id, type, payload }, transfer);
       } catch (e) {
         this.pending.delete(id);
         reject(e);
@@ -215,8 +216,9 @@ export class PortSqliteTransport extends BaseTransport {
     this.onPortDead(reason);
   }
 
-  protected post(msg: unknown): void {
-    this.port.postMessage(msg);
+  protected post(msg: unknown, transfer?: Transferable[]): void {
+    if (transfer) this.port.postMessage(msg, transfer);
+    else this.port.postMessage(msg);
   }
 
   protected makeError(reason: string): Error {

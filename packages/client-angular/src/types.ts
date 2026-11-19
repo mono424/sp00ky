@@ -69,7 +69,24 @@ export interface Sp00kyOptions<S extends SchemaStructure> {
   /**
    * Prewarm data into the local cache before the app renders. Runs after
    * `init()`, inside the same app initializer. Best-effort: a rejection is
-   * logged and the app starts anyway.
+   * logged and the app starts anyway. With `eager` it still runs after
+   * `init()`, but the app no longer waits for it.
    */
   preload?: (db: SyncedDb<S>) => Promise<void>;
+  /**
+   * Bootstrap and render the app at once, before the client is initialized.
+   * With `localEngine: 'rows'`, `injectQuery` then returns the rows a query
+   * showed the last time the app was open, on its very first read; the query
+   * itself starts as soon as the client is ready and corrects them.
+   *
+   * What changes for the app: it starts on a client that is not open yet.
+   * Queries and writes made early wait for it; everything that reports state
+   * (auth, feature flags, sync status) reports "not known yet" until then, so
+   * gate what a signed-out visitor must not see on `db.whenReady()` or
+   * `db.isReady`. Bootstrap no longer waits for `init()` or `preload`, and no
+   * longer fails when `init()` does: the failure is logged, and queries
+   * waiting on the client report it through `injectQuery().error`. Browser
+   * only: a server render never starts the client, with or without it.
+   */
+  eager?: boolean;
 }

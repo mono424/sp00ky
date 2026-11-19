@@ -5,7 +5,7 @@ import type {
   TableNames,
   QueryResult,
 } from '@spooky-sync/query-builder';
-import { createEffect, createSignal, onCleanup, useContext } from 'solid-js';
+import { createEffect, createSignal, onCleanup, untrack, useContext } from 'solid-js';
 import { createStore, reconcile } from 'solid-js/store';
 import { SyncedDb } from '..';
 import type { Sp00kyQueryResultPromise } from '@spooky-sync/core';
@@ -119,6 +119,11 @@ export function useQuery<
 
   const [error, setError] = createSignal<Error | undefined>(undefined);
   const [isFetched, setIsFetched] = createSignal(false);
+  // The rows on screen are the ones this query showed the last time the app
+  // was open, painted while the client is still opening (an eager provider).
+  // Not a loading state, and not an answer either: `isFetched`, and with it
+  // `isSettled`, stays false until the query itself delivers.
+  const [isPainted, setIsPainted] = createSignal(false);
   const [isFetching, setIsFetching] = createSignal(false);
   // Results live in a store (not a signal) so consecutive live-query emissions
   // are merged with `reconcile`: unchanged rows keep their object identity and
@@ -158,6 +163,45 @@ export function useQuery<
   };
 
   const sp00ky = db.getSp00ky();
+
+  // On a client that is not open yet the query cannot answer for a while:
+  // show what it showed last time meanwhile. Once the client is ready there is
+  // nothing to peek, the first subscribe callback carries those rows.
+  let paintedHash: string | undefined;
+  const paint = (
+    query: FinalQuery<S, TableName, T, RelatedFields, IsOne, Sp00kyQueryResultPromise>
+  ) => {
+    paintedHash = String(query.hash);
+    let rows: Record<string, unknown>[] | null = null;
+    try {
+      if (!sp00ky.isLocalReady()) rows = db.peekQuery(query);
+    } catch {
+      // Painting early is a bonus: a peek that fails paints nothing.
+    }
+    if (!rows || rows.length === 0) {
+      setIsPainted(false);
+      return;
+    }
+    setState('value', reconcile((query.isOne ? rows[0] : rows) as any, { key: 'id' }));
+    setVersion((v) => v + 1);
+    setIsPainted(true);
+  };
+  // Painted here, not in the effect below, which only runs after the first
+  // render has read `data()`.
+  try {
+    if (!sp00ky.isLocalReady()) {
+      const first = untrack(() =>
+        (options?.enabled?.() ?? true)
+          ? typeof finalQuery === 'function'
+            ? finalQuery()
+            : finalQuery
+          : null
+      );
+      if (first) paint(first);
+    }
+  } catch {
+    // The effect resolves the query again and is where a failure surfaces.
+  }
 
   /**
    * Registration can fail — the canonical case is the SSP answering 503
@@ -292,6 +336,9 @@ export function useQuery<
     const myRun = ++runId;
     teardownActive();
     setIsFetched(false);
+    // An identity that was not painted above (it changed while the client is
+    // still opening) is painted now; on a ready client this only clears the flag.
+    if (queryString !== paintedHash) paint(query);
     // A new identity starts clean: a previous identity's failure must not keep
     // this one out of its loading state.
     setError(undefined);
@@ -314,7 +361,7 @@ export function useQuery<
   });
 
   const isLoading = () => {
-    return !isFetched() && error() === undefined;
+    return !isFetched() && !isPainted() && error() === undefined;
   };
 
   // True once the query has delivered a result AND no fetch cycle is in flight

@@ -3,6 +3,9 @@ import { defineConfig } from 'vitest/config';
 // Thresholds start at the numbers the suite hits today and are ratcheted per
 // directory as the saga core lands (see the plan's commit 10). Exclusions:
 //   *.fixture.ts / src/testing/**   test-only harness code
+//   rows-worker.ts                  runs inside a Worker (OPFS sync access handles +
+//                                   Web Locks); its ops are `handleRowsOp`, which
+//                                   the engine tests run in-process
 //   sqlite-worker.ts                runs inside a Worker (sqlite-wasm + OPFS +
 //                                   postMessage globals); covered by the sqlite
 //                                   integration tests and the build check
@@ -25,6 +28,7 @@ export default defineConfig({
         'src/**/*.fixture.ts',
         'src/testing/**',
         'src/services/database/sqlite-worker.ts',
+        'src/services/database/rows-worker.ts',
         'src/client/services.ts',
       ],
       thresholds: {

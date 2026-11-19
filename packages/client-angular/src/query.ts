@@ -137,7 +137,10 @@ export interface QueryState<TData> {
   /**
    * The result. `[]` / `null` before the first emission, then each live
    * emission with structural sharing: unchanged rows keep their object
-   * identity, and a deep-equal emission does not notify.
+   * identity, and a deep-equal emission does not notify. On a client that is
+   * not ready yet (`provideSp00ky(config, { eager: true })`) it holds, until
+   * the first emission, the rows the query showed the last time the app was
+   * open, when the local store kept them.
    */
   readonly data: Signal<TData>;
   /** Registration or sync error (e.g. SSP 503 during bootstrap). Never thrown. */
@@ -220,7 +223,8 @@ export function injectQuery(
   options?: QueryOptions
 ): QueryState<unknown> {
   return inContext(injectQuery, options?.injector, () => {
-    const sp00ky = engineDb('injectQuery').getSp00ky();
+    const db = engineDb('injectQuery');
+    const sp00ky = db.getSp00ky();
     const injector = inject(Injector);
 
     // Rows stay plain objects: they reach `db.update(...)`, workers and
@@ -229,11 +233,14 @@ export function injectQuery(
     const error = signal<Error | undefined>(undefined);
     // Server membership known and painted for the current identity (core authority).
     const isAuthoritative = signal(false);
-    // An emission WITH data was applied for the current identity. With
-    // `isAuthoritative` this ends the cold load: a cached paint ends it without
-    // the server, a server answer ends it without rows.
+    // An emission WITH data was applied for the current identity, or one took
+    // over from `painted` rows. With `isAuthoritative` this ends the cold load:
+    // a cached paint ends it without the server, a server answer ends it
+    // without rows.
     const hasPainted = signal(false);
     const isFetching = signal(false);
+    // The current identity has emitted: from here `data` is its own.
+    const hasEmitted = signal(false);
     // Registered hash of the attached query, for opt-in deregistration.
     let activeHash: string | undefined;
 
@@ -249,6 +256,32 @@ export function injectQuery(
     });
     const isOne = computed(() => resolved()?.isOne);
 
+    // With an eager `provideSp00ky` the client may not be ready yet, and the
+    // query cannot answer for a while: these are the rows it showed the last
+    // time the app was open, to show until it emits. Derived from the identity
+    // like `isOne`, so the very first read has them and the query function
+    // runs no earlier than a read. Once the client is ready there is nothing
+    // to peek: the query's first emission carries the same rows.
+    const painted = computed(() => {
+      try {
+        if (hasEmitted() || identity() === null) return undefined;
+        const q = untracked(resolved);
+        if (!q || sp00ky.isLocalReady()) return undefined;
+        const rows = db.peekQuery(q);
+        return rows && rows.length > 0 ? (q.isOne ? rows[0] : rows) : undefined;
+      } catch {
+        // Painting early is a bonus: a peek that fails paints nothing. Neither
+        // does a query function that cannot run yet (it reads a required input
+        // before it is set), so `isLoading()` stays readable that early.
+        return undefined;
+      }
+    });
+    // What is on screen: the painted rows until the identity emits, then `data`.
+    const shown = computed(() => {
+      const rows = painted();
+      return rows === undefined ? data() : share(data(), rows);
+    });
+
     const attach = effect(
       (onCleanup) => {
         const id = identity();
@@ -257,8 +290,13 @@ export function injectQuery(
         // emits, so growing a `.limit()` does not flash an empty list.
         isAuthoritative.set(false);
         hasPainted.set(false);
+        hasEmitted.set(false);
         isFetching.set(false);
         error.set(undefined);
+        // Painted rows are kept as `data` too, so they stay on screen like any
+        // previous data when the identity changes again before this one emits.
+        const seed = untracked(painted);
+        if (seed !== undefined) data.set(share(untracked(data), seed));
         if (id === null) return;
         const q = untracked(resolved);
         if (!q) return;
@@ -313,8 +351,16 @@ export function injectQuery(
                   // Every emission is applied as is: the core only emits what
                   // it decided the query holds. One WITH data ends the cold load.
                   const next = q.isOne ? (rows[0] ?? null) : rows;
-                  data.set(share(untracked(data), next));
-                  if (q.isOne ? next !== null && next !== undefined : rows.length > 0) {
+                  // The first emission takes over from the painted rows. It is
+                  // shared with them, so an answer equal to them changes
+                  // nothing on screen, and the latch they held stays.
+                  const wasPainted = untracked(painted) !== undefined;
+                  data.set(share(untracked(shown), next));
+                  hasEmitted.set(true);
+                  if (
+                    wasPainted ||
+                    (q.isOne ? next !== null && next !== undefined : rows.length > 0)
+                  ) {
                     hasPainted.set(true);
                   }
                   sp00ky.reportFrontendTiming(hash, performance.now() - t0);
@@ -327,14 +373,16 @@ export function injectQuery(
             // is the channel that ends a cold load whose honest answer is zero
             // rows. A flip back to false is a bucket switch (another
             // principal): what is painted is the previous one's, so the paint
-            // latch goes with it.
+            // latch goes with it. Only a flip BACK does that: the "not answered
+            // yet" a fresh subscription delivers at once takes nothing from
+            // rows that are already on screen.
             addCleanup(
               sp00ky.subscribeQueryAuthority(
                 hash,
                 (known) => {
                   if (disposed) return;
+                  if (!known && untracked(isAuthoritative)) hasPainted.set(false);
                   isAuthoritative.set(known);
-                  if (!known) hasPainted.set(false);
                 },
                 { immediate: true }
               )
@@ -358,7 +406,7 @@ export function injectQuery(
     }
 
     const current = computed(() => {
-      const v = data();
+      const v = shown();
       const one = isOne();
       if (one === false && !Array.isArray(v)) return EMPTY_LIST;
       if (one === true && Array.isArray(v)) return null;
@@ -372,7 +420,10 @@ export function injectQuery(
     return {
       data: current,
       error: error.asReadonly(),
-      isLoading: computed(() => !isAuthoritative() && !hasPainted() && error() === undefined),
+      isLoading: computed(
+        () =>
+          !isAuthoritative() && !hasPainted() && painted() === undefined && error() === undefined
+      ),
       isFetching: isFetching.asReadonly(),
       isAuthoritative: isAuthoritative.asReadonly(),
       hasData,

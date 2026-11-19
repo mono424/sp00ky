@@ -2,11 +2,16 @@ import { describe, expect, it, vi } from 'vitest';
 import { flushSync } from 'svelte';
 import { SyncedDb } from '../src/db.js';
 import {
+  useAppRelease,
+  useFeatureFlag,
+  useImpersonation,
   usePendingMutations,
+  useStorageStatus,
   useSubmission,
   useSyncActivity,
   useSyncStatus,
 } from '../src/status.svelte.js';
+import { useChannel, useCrdtField } from '../src/realtime.svelte.js';
 import { mockEngine } from './helpers.js';
 
 /** A db whose pending-mutation and fetch counts the test sets. */
@@ -145,5 +150,80 @@ describe('SyncedDb writes', () => {
     // A Svelte proxy cannot be structured-cloned; the copy can.
     expect(() => structuredClone(draft)).toThrow();
     expect(() => structuredClone(sent)).not.toThrow();
+  });
+});
+
+describe('SyncedDb before init()', () => {
+  // The real core client: creating it opens nothing.
+  const config = {
+    database: { namespace: 'n', database: 'd', endpoint: 'ws://127.0.0.1:9/rpc', store: 'memory' },
+    schema: {
+      tables: [{ name: 'post', channel: true, columns: { title: { type: 'string' } } }],
+      relationships: [],
+      backends: {},
+      buckets: [],
+    },
+    schemaSurql: '',
+    logLevel: 'silent',
+  } as any;
+
+  it('throws, as it always did', async () => {
+    const db = new SyncedDb<any>(config);
+    expect(db.isReady).toBe(false);
+    expect(() => db.getSp00ky()).toThrow('SyncedDb not initialized');
+    expect(() => db.query('post')).toThrow('SyncedDb not initialized');
+    expect(() => db.syncHealth).toThrow('SyncedDb not initialized');
+    expect(() => db.auth).toThrow('SyncedDb not initialized');
+    await expect(db.create('post:1', {})).rejects.toThrow('SyncedDb not initialized');
+    expect(db.peekQuery({} as any)).toBeNull();
+  });
+
+  it('eager: the runes are created on it and report nothing known yet', () => {
+    const db = new SyncedDb<any>(config, { eager: true });
+    const seen: Record<string, unknown> = {};
+    const destroy = $effect.root(() => {
+      const sync = useSyncStatus(db);
+      const storage = useStorageStatus(db);
+      const pending = usePendingMutations(db);
+      const activity = useSyncActivity(db);
+      const impersonation = useImpersonation({ rendersBanner: true }, db);
+      const flag = useFeatureFlag('beta', { fallback: 'off' }, db);
+      const release = useAppRelease({ app: 'web', currentVersion: '1.0.0' }, db);
+      const field = useCrdtField('post', () => null, 'title', db);
+      const channel = useChannel(
+        () => db.query('post').where({ title: 'x' }),
+        () => ['user:a', 'user:b'],
+        db
+      );
+      $effect(() => {
+        seen.sync = [sync.status, sync.everConnected, sync.isOffline, sync.connection];
+        seen.storage = storage.status;
+        seen.pending = pending.current;
+        seen.activity = [activity.fetchingQueries, activity.isDownloading, activity.isUploading];
+        seen.impersonating = impersonation.isImpersonating;
+        seen.flag = [flag.variant, flag.enabled];
+        seen.release = [release.latestVersion, release.updateAvailable];
+        seen.field = field.current;
+        seen.channelPeers = channel.peers;
+      });
+    });
+    flushSync();
+    expect(seen).toEqual({
+      sync: ['healthy', false, false, 'disconnected'],
+      storage: 'unknown',
+      pending: 0,
+      activity: [0, false, false],
+      impersonating: false,
+      flag: ['off', false],
+      release: [undefined, false],
+      field: null,
+      channelPeers: [],
+    });
+    expect(db.isReady).toBe(false);
+    // Signed out until `init()` has restored a session.
+    let userId: string | null | undefined;
+    db.auth.subscribe((id) => (userId = id))();
+    expect(userId).toBeNull();
+    destroy();
   });
 });

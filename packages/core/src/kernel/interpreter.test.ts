@@ -40,6 +40,23 @@ describe('interpreter', () => {
     expect(a.calls[0]).toEqual(['local.query', ['SELECT 1', { a: 1 }]]);
   });
 
+  it('local.peekSelect asks a store that keeps a paint cache, and is null for one that does not', async () => {
+    const h = fakeHost();
+    const plan = { table: 't' } as any;
+    // No paint cache (the SurrealDB and SQLite engines): nothing to paint from.
+    expect(await createInterpreter(fakeAdapters().adapters, h.host)(fx.local.peekSelect(plan, {}, 'k'))).toBeNull();
+    // One that kept the read: its rows, asked for by the paint key.
+    const seen: unknown[] = [];
+    const kept = fakeAdapters({
+      local: { peekSelect: (p, params, options) => (seen.push([p, params, options]), [{ id: 't:1' }]) },
+    });
+    expect(await createInterpreter(kept.adapters, h.host)(fx.local.peekSelect(plan, { a: 1 }, 'k'))).toEqual([{ id: 't:1' }]);
+    expect(seen).toEqual([[plan, { a: 1 }, { paintKey: 'k' }]]);
+    // One that has the cache and not this read.
+    const missed = fakeAdapters({ local: { peekSelect: () => null } });
+    expect(await createInterpreter(missed.adapters, h.host)(fx.local.peekSelect(plan, {}, 'k'))).toBeNull();
+  });
+
   it('ssp.register without a result throws; ssp.register uses default timings when the SSP reports none', async () => {
     const empty = fakeAdapters({ ssp: { registerQueryPlan: () => undefined } });
     const h = fakeHost();

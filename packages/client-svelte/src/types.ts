@@ -57,11 +57,26 @@ export type SyncedDbConfig<S extends SchemaStructure> = Prettify<Sp00kyConfig<S>
 export interface Sp00kyProviderProps<S extends SchemaStructure> {
   /** Client config. Read once when the provider mounts; wrap it in `{#key}` to switch databases. */
   config: SyncedDbConfig<S>;
-  /** Rendered until the client is ready (and on the server). */
+  /** Rendered until the client is ready (and on the server). Not rendered with `eager`. */
   fallback?: Snippet;
+  /**
+   * Render `children` at once, before the client is initialized. With
+   * `localEngine: 'rows'`, `useQuery` then returns the rows a query showed the
+   * last time the app was open, on the very first read; the query itself
+   * starts as soon as the client is ready and corrects them.
+   *
+   * What changes for the tree: it mounts on a client that is not open yet.
+   * Queries and writes made early wait for it; everything that reports state
+   * (auth, feature flags, sync status) reports "not known yet" until then, so
+   * gate what a signed-out visitor must not see on `useDb().whenReady()` or
+   * `db.isReady`. `preload` no longer holds the UI back, and `fallback` is
+   * never shown. Read once, at mount. In a server render the provider still
+   * renders the fallback: this is for client-rendered trees.
+   */
+  eager?: boolean;
   /** Init failed. Without it the error is logged. */
   onError?: (error: Error) => void;
-  /** The client is ready, right before the children render. */
+  /** The client is ready, right before the children render (with `eager` they already have). */
   onReady?: (db: SyncedDb<S>) => void;
   /**
    * Prewarm data into the local cache before revealing the UI. Runs after

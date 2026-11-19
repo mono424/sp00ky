@@ -4,4 +4,4 @@
   const db = useDb();
 </script>
 
-<p class="child">{db.constructor.name}</p>
+<p class="child" data-ready={String(db.isReady)}>{db.constructor.name}</p>

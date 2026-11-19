@@ -102,8 +102,14 @@ export interface QueryState {
   isFetching: boolean;
 }
 
+/** Rows a query showed the last time the app was open, to render with until it answers. */
+export interface PaintedRows {
+  rows: Record<string, unknown>[];
+  isOne: boolean;
+}
+
 export type QueryEvent =
-  | { type: 'reset' }
+  | { type: 'reset'; painted?: PaintedRows | null }
   | { type: 'rows'; rows: Record<string, unknown>[]; isOne: boolean }
   | { type: 'status'; fetching: boolean }
   | { type: 'authority'; known: boolean }
@@ -122,7 +128,10 @@ export const initialQueryState: QueryState = {
  *
  * - `reset` (a new identity) clears authority, the paint latch and the error.
  *   The previous `data` stays until the new identity emits, so growing a
- *   `.limit()` does not flash an empty list.
+ *   `.limit()` does not flash an empty list. With `painted` (the new
+ *   identity's rows from the last time the app was open, on a client that is
+ *   not ready yet) those rows are the data and the paint latch stays set: the
+ *   component renders them, not a loading state, until the query answers.
  * - `rows` applies every emission as-is (the core only emits what it decided
  *   the query holds); one WITH data ends the cold load on its own.
  * - `authority` is the channel that ends a cold load whose honest answer is
@@ -133,17 +142,22 @@ export const initialQueryState: QueryState = {
  */
 export function reduceQuery(state: QueryState, event: QueryEvent): QueryState {
   switch (event.type) {
-    case 'reset':
-      if (!state.isAuthoritative && !state.hasPainted && !state.error && !state.isFetching) {
+    case 'reset': {
+      const painted = event.painted && event.painted.rows.length > 0 ? event.painted : null;
+      const data = painted ? share(state.data, painted.isOne ? painted.rows[0] : painted.rows) : state.data;
+      const hasPainted = painted !== null;
+      if (!state.isAuthoritative && state.hasPainted === hasPainted && !state.error && !state.isFetching && data === state.data) {
         return state;
       }
       return {
         ...state,
+        data,
         isAuthoritative: false,
-        hasPainted: false,
+        hasPainted,
         error: undefined,
         isFetching: false,
       };
+    }
     case 'rows': {
       const next = event.isOne ? (event.rows[0] ?? null) : event.rows;
       const hasRows = event.isOne ? next !== null && next !== undefined : event.rows.length > 0;
@@ -155,7 +169,10 @@ export function reduceQuery(state: QueryState, event: QueryEvent): QueryState {
     case 'status':
       return event.fetching === state.isFetching ? state : { ...state, isFetching: event.fetching };
     case 'authority': {
-      const hasPainted = event.known ? state.hasPainted : false;
+      // Only a flip BACK to false takes the paint latch: "not answered yet",
+      // which a query says as soon as it is subscribed to, takes nothing from
+      // rows that are already on screen (painted from the last session).
+      const hasPainted = event.known || !state.isAuthoritative ? state.hasPainted : false;
       if (event.known === state.isAuthoritative && hasPainted === state.hasPainted) return state;
       return { ...state, isAuthoritative: event.known, hasPainted };
     }
@@ -169,10 +186,26 @@ export function reduceQuery(state: QueryState, event: QueryEvent): QueryState {
 // ---------------------------------------------------------------------------
 
 type AnyFinalQuery = FinalQuery<any, any, any, any, any, Sp00kyQueryResultPromise>;
+
+/** `peek()` as an event's `painted`. Painting early is a bonus: a peek that fails paints nothing. */
+function paintedRows(peek: () => Record<string, unknown>[] | null, query: AnyFinalQuery): PaintedRows | null {
+  try {
+    const rows = peek();
+    return rows && rows.length > 0 ? { rows, isOne: query.isOne === true } : null;
+  } catch {
+    return null;
+  }
+}
 type Sp00ky = ReturnType<SyncedDb<any>['getSp00ky']>;
 
 class QueryStore {
-  private state: QueryState = initialQueryState;
+  private state: QueryState;
+
+  /** `painted`: what the query's first render shows, when the client is not ready to answer yet. */
+  constructor(painted: PaintedRows | null = null) {
+    this.state = reduceQuery(initialQueryState, { type: 'reset', painted });
+  }
+
   private listeners = new Set<() => void>();
   /** Registered hash of the attached query, for opt-in deregistration on unmount. */
   activeHash: string | undefined;
@@ -205,7 +238,10 @@ class QueryStore {
    * the sync scheduler retries the registration underneath.
    */
   attach(sp00ky: Sp00ky, query: AnyFinalQuery): () => void {
-    this.dispatch({ type: 'reset' });
+    // On a client that is not open yet (an eager provider) the query cannot
+    // answer for a while: render what it showed last time meanwhile. Once the
+    // client is ready the query's own first value carries those rows.
+    this.dispatch({ type: 'reset', painted: paintedRows(() => (sp00ky.isLocalReady() ? null : sp00ky.peekQuery(query)), query) });
     let disposed = false;
     const cleanups: (() => void)[] = [];
     // `sp00ky.subscribe` resolves its unsubscribe asynchronously; the status
@@ -403,11 +439,13 @@ export function useQuery(
   }
   const query = (explicit ? queryOrOptions : dbOrQuery) as AnyFinalQuery | null | undefined;
   const options = (explicit ? maybeOptions : queryOrOptions) as QueryOptions | undefined;
+  const enabled = options?.enabled ?? true;
 
-  const [store] = useState(() => new QueryStore());
+  // Seeded for the very first render: with an eager provider the client is not
+  // initialized yet, and the rows this query showed last time are what to show.
+  const [store] = useState(() => new QueryStore(enabled && query ? paintedRows(() => db.peekQuery(query), query) : null));
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
 
-  const enabled = options?.enabled ?? true;
   const identity = enabled && query ? query.hash : null;
 
   useEffect(() => {

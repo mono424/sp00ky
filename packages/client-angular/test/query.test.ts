@@ -1,7 +1,9 @@
 import {
+  Component,
   createEnvironmentInjector,
   effect,
   EnvironmentInjector,
+  type OnInit,
   PLATFORM_ID,
   signal,
 } from '@angular/core';
@@ -169,6 +171,220 @@ describe('injectQuery', () => {
     const eng = mockEngine();
     provideDb(eng.db, [{ provide: PLATFORM_ID, useValue: 'server' }]);
     expect(() => inject(() => injectQuery(mockQuery('h1')))).toThrow(/browser only/);
+  });
+
+  it('rows in the first callback, then "not answered yet": not loading', async () => {
+    const eng = mockEngine();
+    eng.hold('h1', [{ id: 'post:a' }]);
+    provideDb(eng.db);
+    const q = inject(() => injectQuery(mockQuery('h1')));
+    await tick();
+    expect(q.data()).toEqual([{ id: 'post:a' }]);
+    expect(q.isAuthoritative()).toBe(false);
+    expect(q.isLoading()).toBe(false);
+    // A flip back (another principal) still takes the paint latch.
+    eng.setAuthority('h1', true);
+    eng.setAuthority('h1', false);
+    expect(q.isLoading()).toBe(true);
+  });
+});
+
+describe('injectQuery on a client that is not ready yet (eager)', () => {
+  const painted = [{ id: 'a', n: 1 }];
+
+  function notReady(rows: (hash: string) => Record<string, any>[] | null = () => painted) {
+    const eng = mockEngine();
+    eng.notReady(rows);
+    provideDb(eng.db);
+    return eng;
+  }
+
+  it('has the rows the query showed last time on the first read, then the answer', async () => {
+    const eng = notReady();
+    let runs = 0;
+    // Not flushed yet: this is the read a first render makes.
+    const q = TestBed.runInInjectionContext(() => {
+      const query = injectQuery(mockQuery('h1'));
+      effect(() => {
+        query.data();
+        runs++;
+      });
+      return query;
+    });
+    expect(q.data()).toEqual(painted);
+    expect(q.isLoading()).toBe(false);
+    expect(q.hasData()).toBe(true);
+    expect(q.isAuthoritative()).toBe(false);
+    expect(q.isSettled()).toBe(false);
+    expect(q.isEmpty()).toBe(false);
+    const first = q.data();
+
+    TestBed.tick();
+    await tick();
+    // Attaching, and its "not answered yet", did not swap them for a loading state.
+    expect(eng.hasSub('h1')).toBe(true);
+    expect(q.isLoading()).toBe(false);
+    expect(q.data()).toBe(first);
+
+    // The query answers with the same rows: nothing changes on screen.
+    eng.emit('h1', [{ id: 'a', n: 1 }]);
+    TestBed.tick();
+    expect(q.data()).toBe(first);
+    expect(q.isLoading()).toBe(false);
+    expect(runs).toBe(1);
+
+    // And with other rows: they win.
+    eng.emit('h1', [{ id: 'a', n: 2 }]);
+    expect(q.data()).toEqual([{ id: 'a', n: 2 }]);
+    expect(q.isAuthoritative()).toBe(false);
+  });
+
+  it('keeps them through the first rows of the query itself and its "not answered yet"', async () => {
+    const eng = notReady();
+    // What the core hands a subscriber once the client is open: the same rows.
+    eng.hold('h1', [{ id: 'a', n: 1 }]);
+    const q = TestBed.runInInjectionContext(() => injectQuery(mockQuery('h1')));
+    const first = q.data();
+    TestBed.tick();
+    await tick();
+    expect(q.data()).toBe(first);
+    expect(q.isLoading()).toBe(false);
+    expect(q.isAuthoritative()).toBe(false);
+  });
+
+  it('a component has them in its first change detection, and the query function is not run early', () => {
+    notReady((hash) => (hash === 'h1' ? painted : null));
+    const inInit: unknown[] = [];
+
+    @Component({
+      selector: 'test-list',
+      template: `@if (rows.isLoading()) {
+          loading
+        } @else {
+          @for (row of rows.data(); track row.id) {
+            <i>{{ row.n }}</i>
+          }
+        }`,
+    })
+    class List implements OnInit {
+      // Run here, in the field initializer, this function would throw: it
+      // reads a field declared below, as it may read a required input.
+      readonly rows = injectQuery(() => mockQuery(this.hash()));
+      readonly hash = signal('h1');
+
+      ngOnInit(): void {
+        // Earlier than the query's own effect.
+        inInit.push(this.rows.data());
+      }
+    }
+
+    @Component({ imports: [List], template: `<test-list />` })
+    class Host {}
+
+    const fixture = TestBed.createComponent(Host);
+    fixture.detectChanges();
+    expect(inInit).toEqual([painted]);
+    expect(fixture.nativeElement.textContent.trim()).toBe('1');
+  });
+
+  it('gives a .one() query its row', () => {
+    notReady();
+    const q = inject(() => injectQuery(mockQuery('h1', true)));
+    expect(q.data()).toEqual(painted[0]);
+    expect(q.hasData()).toBe(true);
+    expect(q.isLoading()).toBe(false);
+  });
+
+  it('paints nothing once the client is ready', async () => {
+    const eng = notReady();
+    eng.sp00ky.isLocalReady.mockReturnValue(true);
+    const q = inject(() => injectQuery(mockQuery('h1')));
+    await tick();
+    expect(q.data()).toEqual([]);
+    expect(q.isLoading()).toBe(true);
+    expect(eng.sp00ky.peekQuery).not.toHaveBeenCalled();
+  });
+
+  it('paints nothing when the store kept nothing, or the peek fails', async () => {
+    notReady((hash) => {
+      if (hash === 'h1') return null;
+      if (hash === 'h2') return [];
+      throw new Error('no paint cache');
+    });
+    for (const hash of ['h1', 'h2', 'h3']) {
+      const q = inject(() => injectQuery(mockQuery(hash)));
+      await tick();
+      expect(q.data()).toEqual([]);
+      expect(q.isLoading()).toBe(true);
+    }
+  });
+
+  it('a query that is skipped paints nothing', () => {
+    const eng = notReady();
+    const q = inject(() => injectQuery(mockQuery('h1'), { enabled: false }));
+    expect(q.hasData()).toBe(false);
+    expect(eng.sp00ky.peekQuery).not.toHaveBeenCalled();
+  });
+
+  it('isLoading() stays readable while the query function cannot run yet', () => {
+    notReady();
+    // A required input, read before Angular has set it, throws like this.
+    const isSet = signal(false);
+    const q = TestBed.runInInjectionContext(() =>
+      injectQuery(() => {
+        if (!isSet()) throw new Error('NG0950');
+        return mockQuery('h1');
+      })
+    );
+    expect(q.isLoading()).toBe(true);
+    isSet.set(true);
+    expect(q.data()).toEqual(painted);
+    expect(q.isLoading()).toBe(false);
+  });
+
+  it('paints a new identity from its own rows, and keeps the previous ones when it has none', async () => {
+    const other = [{ id: 'b', n: 2 }];
+    notReady((hash) => (hash === 'h1' ? painted : hash === 'h2' ? other : null));
+    const hash = signal('h1');
+    const q = inject(() => injectQuery(() => mockQuery(hash())));
+    expect(q.data()).toEqual(painted);
+
+    hash.set('h2');
+    expect(q.data()).toEqual(other);
+    TestBed.tick();
+    await tick();
+    expect(q.data()).toEqual(other);
+    expect(q.isLoading()).toBe(false);
+
+    // Nothing kept for h3: as on any identity change, the previous rows stay
+    // until it emits, and it is a loading state.
+    hash.set('h3');
+    TestBed.tick();
+    await tick();
+    expect(q.data()).toEqual(other);
+    expect(q.isLoading()).toBe(true);
+  });
+
+  it('an emission without rows replaces the painted ones without a loading state', async () => {
+    const eng = notReady();
+    const q = inject(() => injectQuery(mockQuery('h1')));
+    await tick();
+    eng.emit('h1', []);
+    expect(q.data()).toEqual([]);
+    expect(q.isLoading()).toBe(false);
+    expect(q.isEmpty()).toBe(false);
+    eng.setAuthority('h1', true);
+    expect(q.isEmpty()).toBe(true);
+  });
+
+  it('a failed init surfaces as error and leaves the painted rows', async () => {
+    notReady();
+    // What `run()` does on a client whose init failed.
+    const q = inject(() => injectQuery(mockQuery('h1', false, new Error('init failed'))));
+    await tick();
+    expect(q.error()?.message).toBe('init failed');
+    expect(q.data()).toEqual(painted);
+    expect(q.isLoading()).toBe(false);
   });
 });
 

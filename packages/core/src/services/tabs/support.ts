@@ -19,10 +19,12 @@ export type SharedTabsSupport =
 
 export function detectSharedTabsSupport(config: Sp00kyConfig<any>): SharedTabsSupport {
   if (config.sharedTabs !== true) return { supported: false, reason: 'flag-off' };
-  // Shared-tabs only makes sense for the SQLite engine: it is the one whose
-  // OPFS pool is single-holder. The SurrealDB engine and custom engines keep
-  // their existing per-tab behavior.
-  if (config.localEngine !== 'sqlite') return { supported: false, reason: 'engine-not-sqlite' };
+  // Shared-tabs only makes sense for the engines whose OPFS files are
+  // single-holder: SQLite and the row store. The SurrealDB engine and custom
+  // engines keep their existing per-tab behavior.
+  if (config.localEngine !== 'sqlite' && config.localEngine !== 'rows') {
+    return { supported: false, reason: 'engine-not-sqlite' };
+  }
   if (typeof window === 'undefined') return { supported: false, reason: 'not-browser' };
   if (typeof SharedWorker === 'undefined') return { supported: false, reason: 'no-shared-worker' };
   if (typeof MessageChannel === 'undefined') {

@@ -33,10 +33,14 @@ export function useImpersonation(options: UseImpersonationOptions = {}): UseImpe
     db.auth.impersonation
   );
   // Re-acknowledged per session: a new impersonation restarts the client's
-  // fallback timer, and this component is what cancels it.
-  createEffect(() => {
-    if (options.rendersBanner && impersonation()) db.acknowledgeImpersonationBanner();
-  });
+  // fallback timer, and this component is what cancels it. Two-arg effect:
+  // Solid 2 throws on the single-arg form.
+  createEffect(
+    () => (options.rendersBanner ? impersonation() : null),
+    (active) => {
+      if (active) db.acknowledgeImpersonationBanner();
+    }
+  );
   return {
     impersonation,
     isImpersonating: () => impersonation() !== null,

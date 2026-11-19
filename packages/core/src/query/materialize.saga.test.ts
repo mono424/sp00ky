@@ -26,6 +26,22 @@ describe('materialize', () => {
     expect(again.emitted).toEqual([]);
     expect(again.state.queries.get('a')!.telemetry.updateCount).toBe(1);
   });
+  it('names its read after the query, and confirms rows painted at registration without telling subscribers twice', async () => {
+    // As `registerLocal` leaves an entry it could paint: rows in place, nothing notified.
+    const painted = buildEntry({ def: { hash: 'a', viewKey: 'view-a', plan }, records: [{ id: 'thing:1' }] });
+    expect(painted.lifecycle.notified).toBe(false);
+    const s = R.markDirty(['a'])(buildState([painted], vouch('thing:1')));
+    const same = await runPure(materialize('a'), { state: s, handlers: { 'local.select': () => [{ id: 'thing:1' }] } });
+    // A cold scan here (no membership yet), kept apart from the membership render's copy.
+    expect((same.log.find((e) => e.kind === 'local.select') as any).paintKey).toBe(`${JSON.stringify({ surql: painted.def.surql, params: painted.def.params })}\ncold`);
+    expect(same.emitted).toEqual([]);
+    expect(same.state.queries.get('a')!.lifecycle.notified).toBe(true);
+    // And when the store says otherwise, the read wins.
+    const other = await runPure(materialize('a'), { state: s, handlers: { 'local.select': () => [] } });
+    expect(other.state.queries.get('a')!.records).toEqual([]);
+    expect(other.emitted).toEqual([{ type: 'query:records', hash: 'a', records: [] }]);
+  });
+
   it('cold: a body no view vouches for (an orphan) does not paint; vouched, optimistic, _00_ and id-less rows do', async () => {
     const s = buildState(
       [buildEntry({ def: { hash: 'a', plan } })],

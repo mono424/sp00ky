@@ -47,9 +47,11 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
 </Sp00kyProvider>
 ```
 
-Provider props: `config` (read once at mount; wrap in `{#key}` to switch databases), `fallback` (snippet), `preload` (awaited before children render, best-effort), `onReady`, `onError`, `children`. The client is created in `onMount`, so server renders show the fallback. A client that was handed to the tree is deliberately not closed on destroy; one whose init outlived the provider is.
+Provider props: `config` (read once at mount; wrap in `{#key}` to switch databases), `fallback` (snippet), `preload` (awaited before children render, best-effort), `onReady`, `onError`, `eager`, `children`. The client is initialized in `onMount`, so server renders show the fallback.
 
-Without the provider: create `new SyncedDb(config)`, `await db.init()` (e.g. in a SvelteKit `load`), and call `setDbContext(db)` while the root layout initialises.
+`eager` renders the children at once, on a `SyncedDb` that is not initialized yet (`new SyncedDb(config, { eager: true })`: its core client is created on first use, `db.isReady` / `db.whenReady()` say when `init()` is done). With `localEngine: 'rows'` (and no `sharedTabs`), `useQuery` then holds on its first read the rows the query showed the last time the app was open (`db.peekQuery`, the engine's paint cache) with `isLoading` false, and the query itself, which waits for `init()` like every query and write made early, replaces them when it answers. Everything that reports state (`db.auth.subscribe`, feature flags, sync status) reports its not-known-yet default until the client is ready, so gate what a signed-out visitor must not see on `db.whenReady()`. `db.isReady` is a plain getter, not reactive state: read it in handlers, and await `db.whenReady()` to react. `fallback` is never rendered and `preload` no longer holds the UI back. Client-rendered trees only: a server render still produces the fallback. The paint latch (`hasPainted`) is only cleared by authority flipping BACK to false, never by a fresh subscription's first "not answered yet". A client that was handed to the tree is deliberately not closed on destroy, and an eager one is in the tree from the start; one whose init outlived the provider is.
+
+Without the provider: create `new SyncedDb(config)`, `await db.init()` (e.g. in a SvelteKit `load`), and call `setDbContext(db)` while the root layout initialises. For the eager behaviour, create it with `{ eager: true }` and call `init()` without awaiting it.
 
 Vite needs `vite-plugin-wasm`, `build.target: 'esnext'`, `optimizeDeps.exclude: ['@spooky-sync/client-svelte', '@spooky-sync/core', '@spooky-sync/ssp-wasm', '@surrealdb/wasm', '@surrealdb/wasm-native', '@sqlite.org/sqlite-wasm']` and `optimizeDeps.include: ['@spooky-sync/core > pino', '@spooky-sync/core > fast-json-patch']`. Pre-bundled, the client looks for its `.wasm` files and workers in the wrong folder (dev only: a 404 or `expected magic word`); `vite-plugin-top-level-await` is not needed and crashes with current `@swc/core`.
 
@@ -57,7 +59,7 @@ Vite needs `vite-plugin-wasm`, `build.target: 'esnext'`, `optimizeDeps.exclude: 
 
 Hooks that read context (`useDb`, and every hook without an explicit `db`) or open something must run while a component initialises (top level of `<script>`), or inside `$effect.root` with an explicit `db`.
 
-- **`useDb<typeof schema>()`**: the `SyncedDb<S>`. `create`, `update`, `delete`, `query`, `preload`, `run`, `channel`, `bucket`, `remoteQuery`, `useRemote`, `auth` / `signOut`, `pendingMutationCount`, `syncHealth` / `storageHealth` and their subscribe methods. Throws outside a provider.
+- **`useDb<typeof schema>()`**: the `SyncedDb<S>`. `create`, `update`, `delete`, `query`, `preload`, `run`, `channel`, `bucket`, `remoteQuery`, `useRemote`, `auth` / `signOut`, `pendingMutationCount`, `syncHealth` / `storageHealth` and their subscribe methods, `isReady` / `whenReady()` (for an `eager` tree). Throws outside a provider.
 - **`useQuery(query, options?)`** (or `useQuery(db, query, options?)`): live query. `query` is a getter returning a BUILT query (`.build()`, `.one().build()`) or `null` / `undefined` to skip; a fixed built query can be passed directly. Re-registration keys on the identity hash (surql + vars), not on rebuilds. Result getters:
   - `data`: rows, or the row / `null` for `.one()`. `[]` / `null` before the first result. Structurally shared.
   - `error`: registration / sync failure (e.g. SSP 503 NOT_READY). Never thrown; the scheduler retries.
@@ -69,6 +71,7 @@ Hooks that read context (`useDb`, and every hook without an explicit `db`) or op
   - `isSettled`: authoritative AND idle. Gate windowed-list end detection and create-if-missing on it. Not monotonic.
   - Options: `enabled?: boolean | (() => boolean)`, `deregisterOnCleanup?: boolean`.
   - On an identity change the previous `data` stays until the new identity emits (flags reset), so growing `.limit()` never flashes empty.
+  - Under `<Sp00kyProvider eager>`, while the client is not ready: `data` holds the rows the query showed last time (when the store kept any) with `isLoading` false and `isAuthoritative` / `isSettled` false, until the query answers.
 - **`usePreload(query, options?)`** (or `(db, query, options?)`): fire-and-forget prewarm of a likely-next query, keyed on its identity. Options: `enabled?`, `signal?`.
 - **`useSubmission(fn)`**: `{ submit, pending, error, result, clearError }`. `submit` never rejects. Needs no component or provider.
 - **`usePendingMutations(db?)`**: `{ current: number }`.

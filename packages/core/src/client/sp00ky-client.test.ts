@@ -114,6 +114,85 @@ describe('Sp00kyClient facade', () => {
     expect(a.calls.filter(([n]) => n === 'service.local.switchStore').map(([, args]) => args)).toEqual([['anon']]);
   });
 
+  it('peekQuery hands back what the store kept for a query, with no init and no run', () => {
+    const { client, services, a } = makeClient();
+    const query = client.query('thing', {}).build();
+    const asked: unknown[] = [];
+    (services.local as any).peekSelect = (plan: any, _params: unknown, opts: { paintKey: string }) => {
+      asked.push([plan.table, opts.paintKey]);
+      return [{ id: 'thing:1' }];
+    };
+    expect(client.peekQuery(query)).toEqual([{ id: 'thing:1' }]);
+    // The membership render's copy, named by what a page knows before the client is open.
+    expect(asked).toEqual([['thing', JSON.stringify({ surql: query.innerQuery.selectQuery.query, params: {} })]]);
+    expect(a.calls).toEqual([]);
+    expect(client.isLocalReady()).toBe(false);
+    // A store without a paint cache, or one that fails: nothing to paint, never an error.
+    (services.local as any).peekSelect = undefined;
+    expect(client.peekQuery(query)).toBeNull();
+    (services.local as any).peekSelect = () => {
+      throw new Error('storage');
+    };
+    expect(client.peekQuery(query)).toBeNull();
+  });
+
+  it('a query run before init waits for it', async () => {
+    const { client } = makeClient();
+    const query = client.query('thing', {}).build();
+    let hash: string | undefined;
+    const running = query.run().then((r) => {
+      hash = r.hash;
+    });
+    let ready = false;
+    void client.whenReady().then(() => {
+      ready = true;
+    });
+    await flush();
+    expect(hash).toBeUndefined();
+    expect(ready).toBe(false);
+    await client.init();
+    await running;
+    expect(ready).toBe(true);
+    expect(client.state.queries.has(hash!)).toBe(true);
+  });
+
+  it('CRDT fields and files asked for before init wait for it too', async () => {
+    const { client, services } = makeClient();
+    const opened: string[] = [];
+    (services.crdt as any).open = async (table: string, id: string, field: string) => (opened.push(`${table}/${id}/${field}`), {});
+    const field = client.openCrdtField('thing', 'thing:1', 'body');
+    // A handle of its own, so the test needs no bucket in the schema.
+    const touched: string[] = [];
+    const remote = new Proxy({}, { get: (_t, key) => (touched.push(String(key)), () => Promise.reject(new Error('remote')))});
+    const { BucketHandle } = await import('./bucket-handle');
+    const file = new BucketHandle('files', remote as any, null, undefined, () => (client.isLocalReady() ? undefined : client.whenReady())).exists('a.png');
+    file.catch(() => {});
+    await flush();
+    expect(opened).toEqual([]);
+    expect(touched).toEqual([]);
+    await client.init();
+    await field;
+    await file.catch(() => {});
+    expect(opened).toEqual(['thing/thing:1/body']);
+    expect(touched.length).toBeGreaterThan(0);
+  });
+
+  it('what waited for init fails with it', async () => {
+    const { client } = makeClient({
+      services: {
+        'local.connect': () => {
+          throw new Error('no store');
+        },
+      },
+    });
+    const running = client.query('thing', {}).build().run();
+    const writing = client.create('thing:1', { a: 1 });
+    await expect(client.init()).rejects.toThrow('no store');
+    await expect(client.whenReady()).rejects.toThrow('no store');
+    await expect(running).rejects.toThrow('no store');
+    await expect(writing).rejects.toThrow('no store');
+  });
+
   it('queryRaw registers locally and returns the hash before any remote work; subscribers paint from the local store', async () => {
     // Boot loads the view index: `thing:1` is vouched for, `thing:2` is an orphan and stays hidden.
     const stored = (sql: string) =>

@@ -38,6 +38,67 @@ describe('registerLocal', () => {
     expect(reg).toMatchObject({ plan: { queryHash: hash, tableName: 'thing', ttl: '10m' } });
   });
 
+  describe('painting from the last page load', () => {
+    const plan = { table: 'thing' } as any;
+    const planned = { ...input, plan };
+    const viewRow = () => ({ ids: [['thing:1', 2], ['thing:2', 1]], confirmed: true });
+
+    it('is born with the rows the store kept for this query, neither notified nor answered', async () => {
+      const painted = [{ id: 'thing:1', n: 1 }, { id: 'thing:2', n: 2 }];
+      const out = await runPure(registerLocal(env, planned), {
+        handlers: { 'local.getById': viewRow, 'ssp.register': sspOk, 'local.peekSelect': () => painted },
+      });
+      const entry = out.state.queries.get(out.result)!;
+      expect(entry.records).toEqual(painted);
+      expect(entry.lifecycle.phase).toBe('cached');
+      expect(entry.lifecycle.notified).toBe(false);
+      expect(entry.lifecycle.answered).toBe(false);
+      // The render that answers still runs: the query is dirty like any new one.
+      expect(out.state.dirty.has(out.result)).toBe(true);
+      // The peek names the read after the query (its text and parameters, which a
+      // page has before the client is open) and asks for the render set.
+      const peek = out.log.find((e) => e.kind === 'local.peekSelect') as any;
+      expect(peek.paintKey).toBe(JSON.stringify({ surql: input.surql, params: input.params }));
+      expect(peek.plan.ids.map((id: RecordId) => String(id.id))).toEqual(['1', '2']);
+    });
+
+    it('paints nothing when the store kept nothing, has no peek, or the peek throws', async () => {
+      for (const peek of [() => null, () => [], undefined, () => { throw new Error('storage'); }]) {
+        const out = await runPure(registerLocal(env, planned), {
+          handlers: { 'local.getById': viewRow, 'ssp.register': sspOk, ...(peek ? { 'local.peekSelect': peek } : {}) },
+        });
+        expect(out.state.queries.get(out.result)!.records).toEqual([]);
+      }
+    });
+
+    it('does not peek for a query without a plan', async () => {
+      const out = await runPure(registerLocal(env, input), {
+        handlers: { 'local.getById': viewRow, 'ssp.register': sspOk, 'local.peekSelect': () => [{ id: 'thing:1' }] },
+      });
+      expect(out.log.some((e) => e.kind === 'local.peekSelect')).toBe(false);
+      expect(out.state.queries.get(out.result)!.records).toEqual([]);
+    });
+
+    it('cold: shows of a kept scan only the rows a view vouches for', async () => {
+      // No view row for this query: a predicate scan. `thing:1` is vouched for by another query's view.
+      const out = await runPure(registerLocal(env, planned), {
+        state: { ...emptyState({ tabId: 't' }), views: new Map([['other', ['thing:1']]]) },
+        handlers: {
+          'local.getById': () => null,
+          'ssp.register': sspOk,
+          'local.peekSelect': () => [{ id: 'thing:1' }, { id: 'thing:orphan' }],
+        },
+      });
+      const entry = out.state.queries.get(out.result)!;
+      expect(entry.lifecycle.phase).toBe('cold');
+      expect(entry.records).toEqual([{ id: 'thing:1' }]);
+      const peek = out.log.find((e) => e.kind === 'local.peekSelect') as any;
+      expect(peek.plan.ids).toBeUndefined();
+      // A scan's copy has a name of its own: it is not what a closed client may paint.
+      expect(peek.paintKey).toBe(`${JSON.stringify({ surql: input.surql, params: input.params })}\ncold`);
+    });
+  });
+
   it('cached: a durable view row seeds membership; unconfirmed empty stays cold; a failing read is cold', async () => {
     const cached = await runPure(registerLocal(env, input), {
       handlers: { 'local.getById': () => ({ ids: [['thing:1', 2]], confirmed: false }), 'ssp.register': sspOk },

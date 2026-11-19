@@ -14,7 +14,24 @@ import { Sp00kyContext } from './context';
 
 export interface Sp00kyProviderProps<S extends SchemaStructure> {
   config: SyncedDbConfig<S>;
+  /** Rendered until the client is initialized (and `preload` resolved). Not rendered with `eager`. */
   fallback?: JSX.Element;
+  /**
+   * Render `children` at once, before the client is initialized. With
+   * `localEngine: 'rows'`, `useQuery` then renders the rows a query showed the
+   * last time the app was open, on the very first render; the query itself
+   * starts as soon as the client is ready and corrects them.
+   *
+   * What changes for the tree: it mounts on a client that is not open yet.
+   * Queries and writes made early wait for it; everything that reports state
+   * (auth, feature flags, sync status) reports "not known yet" until then, so
+   * gate what a signed-out visitor must not see on `useDb().whenReady()` or
+   * `db.isReady`. `preload` no longer holds the UI back, and `fallback` is
+   * never shown. Read once, when the provider is created. In a server render
+   * the provider still renders the fallback: this is for client-rendered
+   * trees.
+   */
+  eager?: boolean;
   onError?: (error: Error) => void;
   onReady?: (db: SyncedDb<S>) => void;
   /**
@@ -39,7 +56,14 @@ export function Sp00kyProvider<S extends SchemaStructure>(
     props
   );
 
-  const [db, setDb] = createSignal<SyncedDb<S> | undefined>(undefined);
+  // Eager: the instance the tree mounts on, from the first render. Building it
+  // opens nothing (its core client comes with its first use).
+  const early =
+    merged.eager && typeof window !== 'undefined'
+      ? new SyncedDb<S>(merged.config, { eager: true })
+      : undefined;
+
+  const [db, setDb] = createSignal<SyncedDb<S> | undefined>(early);
 
   // `onMount` is async, so a dispose can land mid-init. Only that narrow race is
   // handled here: an instance whose init finished AFTER the provider was already
@@ -60,14 +84,17 @@ export function Sp00kyProvider<S extends SchemaStructure>(
 
   onMount(async () => {
     try {
-      const instance = new SyncedDb<S>(merged.config);
+      const instance = early ?? new SyncedDb<S>(merged.config);
       await instance.init();
       if (disposed) {
-        await instance.close();
+        // An eager instance was in the tree's hands before it was initialized,
+        // so it is a mounted client like any other: not closed (see above).
+        if (!early) await instance.close();
         return;
       }
       // Gate first-load UI on prewarmed data. Best-effort: never let a preload
-      // failure keep the app stuck on the fallback.
+      // failure keep the app stuck on the fallback. With `eager` the UI is
+      // already up, so this only warms the cache.
       if (merged.preload) {
         try {
           await merged.preload(instance);

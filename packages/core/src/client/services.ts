@@ -173,7 +173,10 @@ export function createServices<S extends SchemaStructure>(config: Sp00kyConfig<S
   else persistence = config.persistenceClient;
   persistence = new ResilientPersistenceClient(persistence, logger);
   const streamProcessor = new StreamProcessorService(new EventSystem(['stream_update']), local, logger);
-  streamProcessor.configureCircuitPersistence(config.persistCircuit ?? config.localEngine === 'sqlite', config.circuitCheckpointMs);
+  streamProcessor.configureCircuitPersistence(
+    config.persistCircuit ?? (config.localEngine === 'sqlite' || config.localEngine === 'rows'),
+    config.circuitCheckpointMs
+  );
   streamProcessor.configureProjection(config.circuitProjection ?? true);
   const migrator = new LocalMigrator(local, logger);
   const crdt = new CrdtManager(config.schema, local, remote, logger, config.crdtDebounceMs ?? 50, config.crdtSendIntervalMs ?? 200);

@@ -11,6 +11,7 @@ import {
   createSignal,
   createStore,
   onCleanup,
+  untrack,
   type Accessor,
 } from 'solid-js';
 import { SyncedDb } from '..';
@@ -48,7 +49,9 @@ export type CreateQueryResult<TData> = {
    * Reactive result. Never suspends and never throws: born as an empty
    * committed value (`[]` / `null`) and reconciled in place (keyed by `id`) on
    * every live emission — unchanged rows keep identity, and coarse readers
-   * (`<For>`) are notified on add/remove/reorder.
+   * (`<For>`) are notified on add/remove/reorder. On a client that is not
+   * ready yet (an eager provider) it is born holding the rows the query showed
+   * the last time the app was open, when the local store kept them.
    */
   data: Accessor<TData>;
   /**
@@ -157,6 +160,35 @@ export function createQuery<
 
   const sp00ky = db.getSp00ky();
 
+  type Query = FinalQuery<S, TableName, T, RelatedFields, IsOne, Sp00kyQueryResultPromise>;
+  /**
+   * The rows a query showed the last time the app was open, as `data()` holds
+   * them: what to render while the client is not open yet (an eager provider)
+   * and the query cannot answer. Nothing once the client is ready, where the
+   * query's own first emission carries them, so `read` is not even called
+   * then. Painting early is a bonus: a peek that fails paints nothing.
+   */
+  const peek = (
+    read: () => Query | null | undefined
+  ): { hash: number; data: TData } | undefined => {
+    try {
+      if (sp00ky.isLocalReady()) return undefined;
+      const query = read();
+      const rows = query ? db.peekQuery(query) : null;
+      if (!query || !rows || rows.length === 0) return undefined;
+      return { hash: query.hash, data: (query.isOne ? rows[0] : rows) as TData };
+    } catch {
+      return undefined;
+    }
+  };
+  // What the first read shows: it comes before the effect below has applied.
+  let seed = untrack(() =>
+    peek(() => {
+      if (!(options?.enabled?.() ?? true)) return null;
+      return typeof finalQuery === 'function' ? finalQuery() : finalQuery;
+    })
+  );
+
   // Status channel. Written from subscription callbacks and generator
   // continuations, which run outside any tracking scope — `ownedWrite` opts
   // these signals out of Solid 2's owned-scope write guard.
@@ -166,7 +198,7 @@ export function createQuery<
   // An emission WITH data has been applied for the current identity. Together
   // with `isAuthoritative` this is what ends the cold-load state: a cached
   // paint ends it without the server, a server answer ends it without rows.
-  const [hasPainted, setHasPainted] = createSignal(false, { ownedWrite: true });
+  const [hasPainted, setHasPainted] = createSignal(seed !== undefined, { ownedWrite: true });
   const [isFetching, setIsFetching] = createSignal(false, { ownedWrite: true });
 
   // The hash of the currently-installed subscription, for opt-in deregister on
@@ -188,7 +220,18 @@ export function createQuery<
   //
   // Wrapped in an object so `one()` queries (row object or null) and list
   // queries share one store shape; `mergeRows` keys `value`'s contents by id.
-  const [store, setStore] = createStore<{ value: TData }>({ value: null as TData });
+  const [store, setStore] = createStore<{ value: TData }>({
+    value: seed ? seed.data : (null as TData),
+  });
+  // One way into the store, for an emission and for painted rows alike.
+  const show = (isOne: boolean, next: TData) =>
+    setStore((s) => {
+      if (isOne || next === null || !Array.isArray(s.value)) {
+        s.value = next;
+      } else {
+        mergeRows(s.value as any[], next as any[]);
+      }
+    });
 
   // Identity of the installed subscription, so a superseded run cannot write
   // results for a query the caller has already moved off.
@@ -212,15 +255,28 @@ export function createQuery<
     },
     ({ enabled, query }) => {
       const myRun = ++runId;
+      // The store was born with this identity's rows (`seed`): they are on
+      // screen already. Any other identity, while the client is still not
+      // open, gets its own.
+      const born = seed !== undefined && enabled && query?.hash === seed.hash;
+      const painted = born ? seed : peek(() => (enabled ? query : null));
+      seed = undefined;
       // A new identity starts clean: a previous identity's failure must not
       // keep this one out of its loading state.
       setIsAuthoritative(false);
-      setHasPainted(false);
+      setHasPainted(painted !== undefined);
       setError(undefined);
       if (!enabled || !query) return;
+      if (painted && !born) {
+        show(query.isOne, painted.data);
+        wakeReady();
+      }
 
       const cleanups: (() => void)[] = [];
       let disposed = false;
+      // Authority as last delivered. Kept here because a signal read right
+      // after its write still returns the old value.
+      let wasKnown = false;
       // `sp00ky.subscribe` resolves its unsubscribe asynchronously; the status
       // subscription returns one directly. Accept both, and if teardown already
       // happened while the promise was in flight, unsubscribe immediately.
@@ -279,13 +335,7 @@ export function createQuery<
                 }
 
                 const t0 = performance.now();
-                setStore((s) => {
-                  if (query.isOne || queryData === null || !Array.isArray(s.value)) {
-                    s.value = queryData;
-                  } else {
-                    mergeRows(s.value as any[], queryData as any[]);
-                  }
-                });
+                show(query.isOne, queryData);
                 sp00ky.reportFrontendTiming(hash, performance.now() - t0);
               },
               { immediate: true }
@@ -301,7 +351,10 @@ export function createQuery<
           // deliveries keep that order too). A flip back to false is a bucket
           // switch (a different principal): what is on screen is the previous
           // one's until the new store's render replaces it, so the paint
-          // latch goes with it.
+          // latch goes with it. Only a flip BACK does that: the "not answered
+          // yet" a fresh subscription delivers at once takes nothing from rows
+          // that are on screen already (the store's copy from the last session,
+          // which the core hands to the first rows callback just before).
           addCleanup(
             sp00ky.subscribeQueryAuthority(
               hash,
@@ -309,7 +362,8 @@ export function createQuery<
                 if (disposed || myRun !== runId) return;
                 setIsAuthoritative(known);
                 if (known) wakeReady();
-                else setHasPainted(false);
+                else if (wasKnown) setHasPainted(false);
+                wasKnown = known;
               },
               { immediate: true }
             )

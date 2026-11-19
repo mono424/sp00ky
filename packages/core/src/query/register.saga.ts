@@ -9,14 +9,18 @@ import type { ClientState, QueryEntry } from '../state/client-state';
 import { emptyTelemetry } from '../state/client-state';
 import { seedLifecycle } from '../state/lifecycle';
 import * as R from '../state/reducers';
-import { desiredRegistrations } from '../state/selectors';
+import { desiredRegistrations, overlay, vouched } from '../state/selectors';
+import type { Overlay } from '../state/selectors';
 import { parseDuration } from '../utils/index';
 import type { SagaEnv } from './env';
 import { listRefTable } from './env';
 import { queryHashInput, viewKeyInput } from './hash';
 import { FAILED, isResolvedBefore, parseViewRow, snapshotFromSingle } from './membership';
 import { applyMembership, applySubqueryChildren, markMembershipDirty } from './membership.saga';
+import { paintEffect, paintKeyOf, renderRead } from './materialize';
 import * as sql from './sql';
+
+const NONE: ReadonlySet<string> = new Set();
 
 export interface RegisterInput {
   tableName: string;
@@ -31,7 +35,39 @@ export interface RegisterInput {
  * row, build the SSP local view and publish the entry. Returns as soon as the
  * entry exists (the first paint comes from `materialize`); the remote
  * registration is dispatched, never awaited.
+ *
+ * Where the local store kept what this query's render read in an earlier page
+ * load (the row store's paint cache), the entry is born holding those rows,
+ * so the first subscriber renders them at once and never an empty list. They
+ * are rows to paint from, not a result: the entry is neither notified nor
+ * answered by them, and `materialize` runs as for any new query and replaces
+ * them when its read says otherwise.
  */
+/**
+ * The rows `materialize` is about to read for a new entry, as the store
+ * remembers them from the last page load: the same render set, the same
+ * read, the same rule for what may show. `null` when the store keeps none.
+ */
+function* paintedRows(entry: QueryEntry): Saga<Record<string, unknown>[] | null> {
+  const plan = entry.def.plan;
+  if (!plan) return null;
+  const [ov, known] = (yield fx.state.read((s) => [overlay(s), entry.lifecycle.phase === 'cold' ? vouched(s) : NONE])) as [
+    Overlay,
+    ReadonlySet<string>,
+  ];
+  const read = renderRead(entry, ov, known);
+  try {
+    const rows = (yield paintEffect(plan, entry.def.params, read.ids, paintKeyOf(entry.def, read.ids))) as
+      | Record<string, unknown>[]
+      | null
+      | undefined;
+    return Array.isArray(rows) && rows.length > 0 ? read.shows(rows) : null;
+  } catch {
+    // Painting early is a bonus: the render that follows does not depend on it.
+    return null;
+  }
+}
+
 export function* registerLocal(env: SagaEnv, input: RegisterInput): Saga<QueryHash> {
   const sessionId = (yield fx.state.read((s) => s.sessionId)) as string | null;
   const hash = (yield fx.hash(queryHashInput(input, sessionId))) as string;
@@ -90,7 +126,8 @@ export function* registerLocal(env: SagaEnv, input: RegisterInput): Saga<QueryHa
       viewLostRetryAt: null,
       telemetry: { ...emptyTelemetry(), registrationTimings: reg.timings },
     };
-    yield fx.state.update(R.putQuery(entry));
+    const painted = yield* paintedRows(entry);
+    yield fx.state.update(R.putQuery(painted ? { ...entry, records: painted } : entry));
     yield fx.dispatch({ type: 'EnsureRegistered' });
     return hash;
   } finally {

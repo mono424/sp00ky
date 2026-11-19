@@ -82,6 +82,8 @@ export type {
 export type { FailedMutationRow as FailedMutation } from './mutation/rows';
 export { semverGt } from './utils/semver';
 export { LocalOpTimeoutError, DEFAULT_LOCAL_OP_TIMEOUT_MS } from './services/database/errors';
+// Start the row store's worker ahead of the app (`localEngine: 'rows'`).
+export { prewarmRows, ROWS_PREWARM_SNIPPET } from './services/database/rows-cache-engine';
 export { fileToUint8Array, textToHtml } from './utils/index';
 export {
   blurhashSidecarPath,

@@ -75,10 +75,36 @@ collaborative fields and peer to peer channels. It needs Svelte 5.29 or newer.
     | `preload` | Awaited before the children render, to warm the local cache. A failure is logged and the UI is revealed anyway. |
     | `onReady` | Called with the client once it is ready. |
     | `onError` | Called if the client fails to start. |
+    | `eager` | Render the children at once, before the client is ready. See below. |
 
     A client that was handed to the tree is deliberately not closed when the provider is destroyed.
   </Step>
 </Steps>
+
+### Rendering before the client is ready
+
+By default nothing below the provider renders until the client has opened its local database.
+With `eager` the children render at once:
+
+<CodeBlock fileName="src/routes/+layout.svelte" code={eagerCode} lang="svelte" />
+
+With [`localEngine: 'rows'`](/docs/reference/client-config#localengine), `useQuery` then holds,
+on its very first read, the rows the query showed the last time the app was open, with
+`isLoading` false. The query starts as soon as the client is ready and replaces them when its
+answer differs. Until then `isAuthoritative` is `false`, as for any query still loading.
+
+What changes for your tree is that it mounts on a client that is not open yet:
+
+- Queries and writes made early wait for the client. Nothing has to be reordered.
+- Hooks that report state (`useSyncStatus`, `useFeatureFlag`) and `db.auth.subscribe` report their
+  not-known-yet value until the client is ready: signed out, the flag's fallback. Gate what a
+  signed-out visitor must not see on `await db.whenReady()`, or on `db.isReady` in a handler (it
+  is a plain getter, not reactive state).
+- `fallback` is never rendered, and `preload` no longer holds the UI back.
+- It is for client-rendered trees. A server render still produces the fallback.
+
+Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
+same browser, and not with `sharedTabs`.
 
 ## Queries
 
@@ -247,6 +273,10 @@ context with `setDbContext`; every hook below that layout then finds it through 
 
 <CodeBlock fileName="src/routes/+layout.svelte" code={byoSvelteCode} lang="svelte" />
 
+To [render before the client is ready](#rendering-before-the-client-is-ready) with this setup,
+create it with `new SyncedDb(dbConfig, { eager: true })` and start `init()` without awaiting it.
+No provider reports a failed `init()` then, so handle its rejection yourself.
+
 ## Next
 
 <CardGrid>
@@ -324,6 +354,10 @@ export const dbConfig: SyncedDbConfig<typeof schema> = {
     store: 'indexeddb',
   },
 };`;
+
+export const eagerCode = `<Sp00kyProvider config={dbConfig} eager>
+  {@render children()}
+</Sp00kyProvider>`;
 
 export const providerCode = `<script lang="ts">
   import { Sp00kyProvider } from '@spooky-sync/client-svelte';

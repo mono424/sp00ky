@@ -35,7 +35,8 @@ export type Settled<T = unknown> = { ok: true; value: T } | { ok: false; error: 
  */
 export type Effect =
   | { kind: 'local.query'; sql: string; vars?: Vars; epoch?: number }
-  | { kind: 'local.select'; plan: QueryPlan; params?: Vars }
+  | { kind: 'local.select'; plan: QueryPlan; params?: Vars; paintKey?: string }
+  | { kind: 'local.peekSelect'; plan: QueryPlan; params?: Vars; paintKey?: string }
   | { kind: 'local.execute'; query: SealedQuery<unknown>; vars?: Vars; epoch?: number }
   | { kind: 'local.getById'; table: string; id: unknown }
   | { kind: 'local.upsert'; table: string; id: unknown; data: Record<string, unknown>; mode: 'replace' | 'merge' }
@@ -121,7 +122,16 @@ export type ServiceName = keyof ServiceCalls;
 export const fx = {
   local: {
     query: (sql: string, vars?: Vars, epoch?: number): Effect => ({ kind: 'local.query', sql, vars, epoch }),
-    select: (plan: QueryPlan, params?: Vars): Effect => ({ kind: 'local.select', plan, params }),
+    /** `paintKey` names the read for the store's paint cache: the same key peeks at its last answer. */
+    select: (plan: QueryPlan, params?: Vars, paintKey?: string): Effect =>
+      paintKey === undefined ? { kind: 'local.select', plan, params } : { kind: 'local.select', plan, params, paintKey },
+    /** What `select` answered under `paintKey` in an earlier page load, at once, or `null`. Rows to paint from, not a result. */
+    peekSelect: (plan: QueryPlan, params: Vars | undefined, paintKey: string): Effect => ({
+      kind: 'local.peekSelect',
+      plan,
+      params,
+      paintKey,
+    }),
     execute: (query: SealedQuery<unknown>, vars?: Vars, epoch?: number): Effect => ({
       kind: 'local.execute',
       query,

@@ -28,7 +28,29 @@ import { Sp00kyProvider } from '@spooky-sync/client-solid2';
 </Sp00kyProvider>
 ```
 
-Props identical to client-solid: `config`, `fallback`, `preload` (awaited gate before revealing UI), `onReady`, `onError`.
+Props identical to client-solid: `config`, `fallback`, `preload` (awaited gate before revealing UI), `onReady`, `onError`, `eager`.
+
+### Rendering before the client is ready
+
+By default nothing below the provider renders until `init()` (and `preload`) is done. With `eager` the children render at once, on a `SyncedDb` that is not initialized yet:
+
+```tsx
+<Sp00kyProvider config={config} eager>
+  <MyApp />
+</Sp00kyProvider>
+```
+
+With `localEngine: 'rows'`, `createQuery` then has, the first time `data()` is read, the rows the query showed the last time the app was open, and `isLoading()` is `false`. The query starts as soon as the client is ready and replaces them when its answer differs. `isAuthoritative()` and `isSettled()` stay `false` until the query itself has delivered.
+
+What changes for the tree:
+
+- Queries and writes made early wait for the client. Nothing has to be reordered.
+- Hooks that report state (`useSyncStatus`, `useFeatureFlag`, auth) report their not-known-yet value until the client is ready. Gate what a signed-out visitor must not see on `await db.whenReady()` or on `db.isReady`.
+- `db.isReady` is a plain getter, not a signal. To render from it, set a signal when `db.whenReady()` resolves (it rejects if the client fails to start).
+- `fallback` is never rendered, and `preload` no longer holds the UI back.
+- Client-rendered trees only: a server render still produces the fallback.
+
+Rows only come back for queries that rendered in the first seconds of an earlier visit, on the same browser, and only while no write has touched their tables since.
 
 ## createQuery
 

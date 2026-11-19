@@ -7,6 +7,7 @@ export * from './events/index';
 export * from './cache-engine';
 export * from './surreal-cache-engine';
 export * from './sqlite-cache-engine';
+export * from './rows-cache-engine';
 export * from './relation-resolver';
 export * from './plan-render';
 export { createLocalEngine } from './engine-factory';

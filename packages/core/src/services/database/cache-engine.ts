@@ -76,7 +76,7 @@ export interface LocalCacheEngine extends RowFetcher {
    * Materialize a query, including its `.related()` tree (via §3
    * decomposition). Params bind `where` `paramRef`s and any windowing id-set.
    */
-  select(plan: QueryPlan, params?: Record<string, unknown>): Promise<Row[]>;
+  select(plan: QueryPlan, params?: Record<string, unknown>, opts?: { paintKey?: string }): Promise<Row[]>;
 
   /** Fetch rows by primary id, preserving `ids` order; missing ids are skipped. */
   selectByIds(table: string, ids: Id[], opts?: { select?: string[]; orderBy?: OrderBy }): Promise<Row[]>;
@@ -125,7 +125,7 @@ export interface LocalStore extends LocalCacheEngine {
   /** Which built-in backend this is. OPTIONAL: absent (custom engines) is
    *  reported as `'custom'` by DevTools. More robust than `instanceof` for
    *  engines constructed outside this package. */
-  readonly engineKind?: 'surrealdb' | 'sqlite';
+  readonly engineKind?: 'surrealdb' | 'sqlite' | 'rows';
   /** Engine-specific storage numbers for DevTools (DB file size, per-table
    *  row counts). OPTIONAL: only engines with something to report implement it. */
   getStorageDiagnostics?(opts?: { tableCounts?: boolean }): Promise<EngineStorageDiagnostics>;
@@ -167,6 +167,20 @@ export interface LocalStore extends LocalCacheEngine {
    * readable by follower tabs over the port transport. OPTIONAL: an engine
    * without it primes from `scanVersions` alone.
    */
+  /**
+   * What `select(plan, params)` / `selectByIds` answered the last time the app
+   * asked at startup, SYNCHRONOUSLY and before the store is open, or `null`.
+   * Something to paint from; the read itself stays the answer and must follow.
+   * OPTIONAL: only an engine that keeps such a copy (`'rows'`) has them.
+   */
+  peekSelect?(plan: QueryPlan, params?: Record<string, unknown>, opts?: { paintKey?: string }): Row[] | null;
+  /**
+   * The bucket `connect` is about to be called with, told ahead: a store that
+   * keeps rows to paint from can then answer {@link peekSelect} before it is
+   * open. Ignored by a store that keeps none.
+   */
+  expectBucket?(bucketId: string): void;
+  peekByIds?(table: string, ids: Id[], opts?: { select?: string[]; orderBy?: OrderBy }): Row[] | null;
   getSnapshot?(key: string): Promise<StoredSnapshot | null>;
   putSnapshot?(key: string, bytes: Uint8Array, meta: SnapshotMeta): Promise<void>;
   deleteSnapshot?(key: string): Promise<void>;
@@ -190,7 +204,7 @@ export interface StoredSnapshot {
 }
 
 /** Selected local cache backend. Mirrors the `persistenceClient` config pattern. */
-export type LocalEngineChoice = 'surrealdb' | 'sqlite' | LocalStore;
+export type LocalEngineChoice = 'surrealdb' | 'sqlite' | 'rows' | LocalStore;
 
 /** Thrown when relation decomposition nests past {@link MAX_RELATION_DEPTH} —
  *  a guard against a cyclic schema producing unbounded fan-out. */

@@ -51,6 +51,14 @@ export default function App() {
   );
 }`;
 
+export const eagerCode = `<Sp00kyProvider config={dbConfig} eager>
+  <MainContent />
+</Sp00kyProvider>`;
+
+export const eagerGateCode = `const db = useDb<typeof schema>();
+const [ready, setReady] = createSignal(db.isReady);
+db.whenReady().then(() => setReady(true), () => {});`;
+
 export const code3 = `import { For, Show } from 'solid-js';
 import { useDb, useQuery } from '@spooky-sync/client-solid';
 import type { schema } from '../schema.gen';
@@ -240,6 +248,49 @@ Initialize the database in your root component before rendering the app:
   lang="tsx"
   code={code4}
 />
+
+`<Sp00kyProvider>` takes these props:
+
+| Prop | Meaning |
+|---|---|
+| `config` | The client config. Read once, when the provider mounts. |
+| `fallback` | Rendered until the client is ready. |
+| `preload` | Awaited before the children render, to warm the local cache. A failure is logged and the UI is revealed anyway. |
+| `onReady` | Called with the client once it is ready. |
+| `onError` | Called if the client fails to start. |
+| `eager` | Render the children at once, before the client is ready. See below. |
+
+The client is initialized when the provider mounts, so a server render only produces the fallback.
+
+### Rendering before the client is ready
+
+By default nothing below the provider renders until the client has opened its local database.
+With `eager` the children render at once:
+
+<CodeBlock fileName="src/App.tsx" code={eagerCode} lang="tsx" />
+
+With [`localEngine: 'rows'`](/docs/reference/client-config#localengine), `useQuery` then has, the
+first time `data()` is read, the rows the query showed the last time the app was open, and
+`isLoading()` is `false`. The query starts as soon as the client is ready and replaces them when
+its answer differs. `isSettled()` stays `false` until the query itself has delivered.
+
+What changes for your tree is that it mounts on a client that is not open yet:
+
+- Queries and writes made early wait for the client. Nothing has to be reordered.
+- Hooks that report state (`useSyncStatus`, `useFeatureFlag`) and `db.auth.subscribe` report their
+  not-known-yet value until the client is ready. The auth context below, for one, reports no user
+  until then. Gate what a signed-out visitor must not see on `await db.whenReady()`, or on
+  `db.isReady`.
+- `fallback` is never rendered, and `preload` no longer holds the UI back.
+- It is for client-rendered trees. A server render still produces the fallback.
+
+`db.isReady` is a plain getter, not a signal, and `db.whenReady()` rejects if the client fails to
+start. To show something only once the client is ready, keep that in a signal:
+
+<CodeBlock code={eagerGateCode} lang="tsx" />
+
+Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
+same browser, and only while no write has touched their tables since.
 
 ## 5. Querying Data with useQuery
 

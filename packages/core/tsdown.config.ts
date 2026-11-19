@@ -61,12 +61,38 @@ const versionDefinePlugin = {
 const workerUrlPlugin = {
   name: 'sp00ky-worker-url',
   transform(code: string) {
-    if (!code.includes('sqlite-worker.ts') && !code.includes('tabs-broker-worker.ts')) return null;
+    if (
+      !code.includes('sqlite-worker.ts') &&
+      !code.includes('rows-worker.ts') &&
+      !code.includes('tabs-broker-worker.ts')
+    ) {
+      return null;
+    }
     return code
       .split('sqlite-worker.ts')
       .join('sqlite-worker.js')
+      .split('rows-worker.ts')
+      .join('rows-worker.js')
       .split('tabs-broker-worker.ts')
       .join('tabs-broker-worker.js');
+  },
+};
+
+// V8 compiles a function the first time it is called, on the thread calling
+// it. `//# allFunctionsCalledOnLoad` as a file's FIRST line (Chrome 136+) has
+// the whole file compiled while it loads, off that thread, and kept in the
+// code cache. Only for the row store's worker: a small file of which every
+// function runs within its first requests, and which a page is waiting for.
+// Measured: 0.6 to 1.5 ms off the worker's first `open`. An app's bundler
+// that minifies the worker drops the comment; the docs say how to keep it.
+const COMPILE_HINT = '//# allFunctionsCalledOnLoad\n';
+const compileHintPlugin = {
+  name: 'sp00ky-compile-hint',
+  generateBundle(_options: unknown, bundle: Record<string, { type: string; code?: string }>) {
+    for (const [name, file] of Object.entries(bundle)) {
+      if (name !== 'rows-worker.js') continue;
+      if (file.type === 'chunk' && typeof file.code === 'string' && !file.code.startsWith(COMPILE_HINT)) file.code = COMPILE_HINT + file.code;
+    }
   },
 };
 
@@ -119,5 +145,20 @@ export default defineConfig([
         ['pure.d', 'live.d', 'sw.d'].includes(chunk.name) ? '[name].js' : 'worker-[name].js',
     },
     plugins: [versionDefinePlugin],
+  },
+  // The row store's worker (`localEngine: 'rows'`), at `dist/rows-worker.js`
+  // like the SQLite one. A build of its own so the file holds everything the
+  // worker runs and nothing else: the compile hint on its first line then
+  // covers the store and its queries, and no page ever loads hinted code.
+  {
+    entry: { 'rows-worker': 'src/services/database/rows-worker.ts' },
+    format: ['esm'],
+    dts: true,
+    clean: false,
+    hash: false,
+    outputOptions: {
+      chunkFileNames: (chunk: { name: string }) => (chunk.name === 'rows-worker.d' ? '[name].js' : 'rows-worker-[name].js'),
+    },
+    plugins: [versionDefinePlugin, compileHintPlugin],
   },
 ]);

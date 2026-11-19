@@ -1,0 +1,17 @@
+{
+  "name": "@spooky-sync/storage-bench",
+  "version": "1.0.0-beta.7",
+  "description": "Browser benchmark of the local cache backends: IndexedDB, the SQLite engine and the row store",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "echo 'no lint configured'"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2",
+    "vite": "^5.0.0"
+  }
+}

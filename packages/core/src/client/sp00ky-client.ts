@@ -290,8 +290,8 @@ export class Sp00kyClient<S extends SchemaStructure> {
     // Unobserved, a failed boot must not also be an unhandled rejection.
     this.ready.promise.catch(() => {});
     // The bucket `boot` is about to open, so the store can paint from it now
-    // (`peekQuery`). Alone in the store only: see `LocalStore.expectBucket`.
-    if (!s.tabs) s.local.expectBucket?.(readBootBucketHint() ?? ANON_USER_ID);
+    // (`peekQuery`): see `LocalStore.expectBucket`.
+    s.local.expectBucket?.(readBootBucketHint() ?? ANON_USER_ID);
   }
 
   /** Adapter callbacks become runtime events; runtime events reach the legacy services. */
@@ -491,8 +491,9 @@ export class Sp00kyClient<S extends SchemaStructure> {
    * handed back at once and with no need for `init()` to have run: something
    * for a component to render on its first pass, where it would have rendered
    * an empty list. `null` when the local store keeps no such copy (only
-   * `localEngine: 'rows'` with its paint cache does, and not with shared
-   * tabs), or has none for this query.
+   * `localEngine: 'rows'` with its paint cache does), or has none for this
+   * query: it never rendered at startup, or a tab has written to one of its
+   * tables since.
    *
    * They are rows to paint from, not a result. The query still has to be run
    * and subscribed to; what that delivers is the answer, and it replaces these

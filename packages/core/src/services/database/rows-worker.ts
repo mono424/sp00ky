@@ -36,7 +36,8 @@ import {
   maintenance,
   visibleTables,
 } from './rows-exec';
-import { ROWS_AHEAD_ID, ROWS_AHEAD_OPS } from './rows-prewarm';
+import { ROWS_AHEAD_ID, ROWS_AHEAD_OPS, ROWS_PREWARM_OPEN_ID, ROWS_YIELD_CHANNEL } from './rows-prewarm';
+import { AheadStore, type YieldChannel } from './rows-yield';
 
 type PostTarget = Pick<MessagePort, 'postMessage'>;
 
@@ -179,7 +180,8 @@ async function openStore(
   bucketId: string,
   useOpfs: boolean,
   opts: OpenOptions = {},
-  mode: FileMode = 'own'
+  mode: FileMode = 'own',
+  leading = false
 ): Promise<{ persisted: boolean; opfsError?: string }> {
   reading = false;
   if (!useOpfs) {
@@ -203,6 +205,8 @@ async function openStore(
       closeFiles();
       lastError = errMessage(e);
       if (attempt === maxAttempts || lastError.includes('Missing required OPFS APIs')) break;
+      // The holder may be a worker some page started ahead of itself.
+      if (leading) aheadStore.ask(bucketId);
       await new Promise((resolve) => setTimeout(resolve, backoffMs[Math.min(attempt - 1, backoffMs.length - 1)] ?? 0));
     }
   }
@@ -221,6 +225,18 @@ async function openStore(
   exec = new RowsExec(store);
   return { persisted: false, opfsError: lastError };
 }
+
+// ---- a store opened ahead of the page ----
+// See `rows-yield.ts`: a store `prewarmRows` opened and no page has claimed is
+// given up to the worker of the tab that leads, which asks when its open fails.
+
+const aheadStore = new AheadStore({
+  channel: () => (typeof BroadcastChannel === 'function' ? (new BroadcastChannel(ROWS_YIELD_CHANNEL) as unknown as YieldChannel) : null),
+  openBucket: () => (store !== null && opened !== null ? opened.dbName : null),
+  enqueue: (fn) => void enqueue(fn),
+  closeStore: () => closeStore(),
+  tellPage: (message) => (self as unknown as Worker).postMessage(message),
+});
 
 /** Persist the index and let go of the files. */
 function closeStore(): void {
@@ -481,7 +497,7 @@ async function handle(type: string, payload: any, source: 'owner' | 'client'): P
         store !== null && opened !== null && opened.dbName === payload.dbName && opened.useOpfs === payload.useOpfs && opened.mode === mode;
       if (!same) {
         closeStore();
-        const result = await openStore(payload.dbName, payload.useOpfs, payload.openOptions, mode);
+        const result = await openStore(payload.dbName, payload.useOpfs, payload.openOptions, mode, Boolean(payload.workerLockName));
         opened = { dbName: payload.dbName, useOpfs: payload.useOpfs, mode, result };
       }
       return { result: { ...opened!.result, proto: ROWS_PROTOCOL, workerUrl: self.location.href } };
@@ -554,6 +570,7 @@ function dispatch(target: PostTarget, data: any, source: 'owner' | 'client'): vo
     try {
       if (thawVerification) await thawVerification;
       const { result, transfer } = await handle(type, payload, source);
+      if (id === ROWS_PREWARM_OPEN_ID && type === 'open' && source === 'owner') aheadStore.openedAhead();
       // `wt` is the time spent in here, so the page can tell work from transit.
       target.postMessage({ id, ok: true, wt: performance.now() - t0, ...result }, transfer ?? []);
     } catch (err) {
@@ -564,6 +581,8 @@ function dispatch(target: PostTarget, data: any, source: 'owner' | 'client'): vo
 
 self.onmessage = (ev: MessageEvent) => {
   const data = ev.data ?? {};
+  // Everything a prewarm sends goes under a negative id (`rows-prewarm.ts`).
+  if (typeof data.id === 'number' && data.id > 0) aheadStore.claim();
   // Handled off the chain: registering a port must not wait behind a long op,
   // or the follower's first requests would deadlock its attach.
   if (data.type === 'add-client') {

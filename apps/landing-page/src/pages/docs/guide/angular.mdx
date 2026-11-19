@@ -133,8 +133,8 @@ keep that in a signal:
 <CodeBlock code={eagerGateCode} lang="typescript" />
 
 Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
-same browser, and only while no write has touched their tables since. With `sharedTabs` none are
-kept.
+same browser, and only while no write has touched their tables since. That includes writes made
+in another tab when `sharedTabs` is on.
 
 ## Queries
 

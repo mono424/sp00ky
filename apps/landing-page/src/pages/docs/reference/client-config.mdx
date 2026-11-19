@@ -114,12 +114,18 @@ the last user's store while the bundle downloads and parses, and the client adop
 connects. A worker it cannot use (a new release, another user, a failed start) is replaced by a
 fresh one.
 
+With `sharedTabs` the page cannot know yet which tab will lead. When it is this one (a reload of
+the only tab, or of the leading one), its client adopts the worker exactly as above. When another
+tab leads, that tab's worker asks for the store and the one started here hands it over within
+milliseconds; this tab then follows as usual.
+
 The same script reads ahead: it asks the worker again for the reads the app made in its first
 seconds last time (up to 24 of them), and their answers wait in the page. When the client then
 makes one of those reads, it has the answer without a trip to the worker. These are answers from
 the store itself, read after it was opened, so they are what the client would have got by asking.
-Whatever is left of them is dropped the moment the tab writes, and nothing is read ahead with
-`sharedTabs`, where other tabs write to the same store.
+Whatever is left of them is dropped the moment the tab writes. With `sharedTabs` they serve the
+tab that leads, and are also dropped the moment another tab attaches to it, since that tab writes
+to the same store.
 
 <CodeBlock code={prewarmCode} lang="typescript" fileName="vite.config.ts" />
 
@@ -144,9 +150,11 @@ list it showed last time, not an empty one, and the component renders once where
 twice. The read that follows is the answer, as always, and replaces the rows when the store says
 otherwise; until then the query reports itself unanswered, as any query still loading does.
 
-A copy is dropped the moment this tab writes to a table it came from and taken again from the
-query's next render, so it holds what the query last showed. Not used with `sharedTabs`. Set
-`false` to keep nothing in localStorage.
+A copy is dropped the moment a table it came from is written to, and taken again from the
+query's next render, so it holds what the query last showed. With `sharedTabs` that holds across
+tabs: every tab keeps its copies in the same place, a write in any tab drops the copies of that
+table for all of them, and a tab that opens next paints from what any of them kept. Set `false` to
+keep nothing in localStorage.
 
 By default a provider renders nothing until the client is open, so those rows reach a component
 when its query registers, a moment after startup. A provider's `eager` option renders the app at

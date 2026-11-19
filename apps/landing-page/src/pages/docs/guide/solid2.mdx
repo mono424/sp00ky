@@ -89,7 +89,8 @@ start. To show something only once the client is ready, keep that in a signal:
 <CodeBlock code={eagerGateCode} lang="tsx" />
 
 Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
-same browser, and only while no write has touched their tables since.
+same browser, and only while no write has touched their tables since. That includes writes made
+in another tab when `sharedTabs` is on.
 
 ## Queries
 

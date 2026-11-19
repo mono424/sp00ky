@@ -174,6 +174,8 @@ export interface Sp00kyConfig<S extends SchemaStructure> {
      * `localEngine: 'rows'` only. Keep a copy of the rows the app reads at
      * startup in localStorage (up to about 1 MB), so `peekSelect` / `peekByIds`
      * can hand a screen what it showed last time before the store is open.
+     * Works with `sharedTabs`: a copy is dropped for every tab as soon as any
+     * tab writes to a table it was read from.
      * Default `true` for a durable store; `false` turns it off.
      */
     paintCache?: boolean;

@@ -12,6 +12,12 @@
  *
  * The engine (`rows-cache-engine.ts`) adopts all three when it connects, and
  * starts its own worker when anything about them is wrong.
+ *
+ * With shared tabs the page does not know yet which tab will lead. If it is
+ * this one, its engine adopts the worker as it would alone. If it is another,
+ * that tab's worker finds the files held, asks for them (`rows-worker.ts`,
+ * `ROWS_YIELD_CHANNEL`), and the worker started here closes its store and
+ * says so under the open's id, so nothing here goes on believing it is open.
  */
 
 /** localStorage key under which the engine leaves what {@link prewarmRows} needs. */
@@ -21,6 +27,13 @@ export const ROWS_PREWARM_KEY = 'sp00ky.rows.prewarm';
 export const ROWS_PREWARM_OPEN_ID = -1;
 /** Read `i` of a prewarm goes out as message `ROWS_AHEAD_ID - i`. The worker answers reads only under these ids. */
 export const ROWS_AHEAD_ID = -10;
+
+/**
+ * BroadcastChannel on which a worker that leads a bucket and finds its files
+ * held asks for them: `{ bucket }`. A worker holding that store for a page
+ * that has not claimed it yet (a prewarm) lets go.
+ */
+export const ROWS_YIELD_CHANNEL = 'sp00ky.rows.yield';
 
 /** The worker ops a prewarm may ask ahead: the ones that answer rows and change nothing. */
 export const ROWS_AHEAD_OPS: ReadonlySet<string> = new Set(['select', 'by-ids', 'relation']);
@@ -91,6 +104,14 @@ export function prewarmRows(): void {
       if (!data) return;
       if (data.id === ROWS_PREWARM_OPEN_ID) {
         if (data.ok === true) pre.opened = data;
+        else {
+          // A second word under the open's id takes the first back: the worker
+          // gave its store to the tab that leads (`ROWS_YIELD_CHANNEL`). That
+          // tab writes to it from here on, so nothing read ahead stands either.
+          pre.opened = undefined;
+          pre.reads = [];
+          pre.replies = {};
+        }
       } else if (data.id <= ROWS_AHEAD_ID) pre.replies[ROWS_AHEAD_ID - data.id] = data;
     };
     // One attempt and no memory fallback: if the files are held (another tab
@@ -115,7 +136,8 @@ export const ROWS_PREWARM_SNIPPET =
   `var r=Array.isArray(p.reads)?p.reads:[],s={worker:new Worker(p.url,{type:"module"}),bucket:p.bucket,failed:false,reads:r,replies:{}};` +
   `s.worker.onerror=function(){s.failed=true};` +
   `s.worker.onmessage=function(e){var d=e.data;if(!d)return;` +
-  `if(d.id===${ROWS_PREWARM_OPEN_ID}){if(d.ok===true)s.opened=d}else if(d.id<=${ROWS_AHEAD_ID})s.replies[${ROWS_AHEAD_ID}-d.id]=d};` +
+  `if(d.id===${ROWS_PREWARM_OPEN_ID}){if(d.ok===true)s.opened=d;else{s.opened=void 0;s.reads=[];s.replies={}}}` +
+  `else if(d.id<=${ROWS_AHEAD_ID})s.replies[${ROWS_AHEAD_ID}-d.id]=d};` +
   `s.worker.postMessage({id:${ROWS_PREWARM_OPEN_ID},type:"open",payload:{dbName:p.bucket,useOpfs:true,openOptions:{maxAttempts:1,disallowMemoryFallback:true}}});` +
   `for(var i=0;i<r.length;i++)s.worker.postMessage({id:${ROWS_AHEAD_ID}-i,type:r[i][0],payload:r[i][1]});` +
   `s.worker.postMessage({id:-2,type:"warm"});g.__sp00kyRowsPrewarm=s}catch(e){}})();`;
@@ -155,8 +177,9 @@ export function jsonSafe(value: unknown): boolean {
  * Why the answer is the one the worker would give now: it read the store
  * after opening it and before this page asked for anything, and nothing has
  * written since. The engine drops everything left here the moment it sends a
- * write (or anything else that is not a plain read), and never uses this at
- * all when other tabs write through the same worker.
+ * write (or anything else that is not a plain read), and the moment another
+ * tab can write through the same worker (a follower's port handed to a
+ * shared-tabs leader).
  */
 export class ReadAhead {
   private wanted = new Map<string, number>();
@@ -180,6 +203,9 @@ export class ReadAhead {
   }
 
   private arrived(data: PrewarmReply): void {
+    // The worker gave the store away after all (see `prewarmRows`): another
+    // tab writes to it now, and what was read before that is not its state.
+    if (data.id === ROWS_PREWARM_OPEN_ID && !data.ok) return this.drop();
     if (data.id > ROWS_AHEAD_ID) return;
     const i = ROWS_AHEAD_ID - data.id;
     const waiter = this.waiting.get(i);

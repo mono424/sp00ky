@@ -81,12 +81,30 @@ const ROWS_READ_OPS: ReadonlySet<string> = new Set([
 const PAINT_MAX_KEYS = 64;
 const PAINT_MAX_ENTRY_CHARS = 256_000;
 const PAINT_FLUSH_MS = 1500;
+/** What a kept read starts with: this layout. A copy that starts otherwise is another release's, and is not read. */
+const PAINT_FORMAT = '2';
 
 interface PaintEntry {
   tables: string[];
-  /** `0` or `1` (bytes to revive), then the rows as JSON text. */
+  /** {@link PAINT_FORMAT}, the header (see {@link paintHead}), a newline, then the rows as JSON text. */
   text: string;
   dirty: boolean;
+}
+
+/** A table and its mark (see {@link PaintCache}) at the time a read of it was kept. */
+type PaintMark = [table: string, mark: string | null];
+
+/** A kept read's header: whether it holds bytes to revive, the marks it was read under, and where its rows start. */
+function paintHead(text: string): { u8: boolean; marks: PaintMark[]; body: number } | null {
+  if (text[0] !== PAINT_FORMAT) return null;
+  const end = text.indexOf('\n');
+  if (end < 0) return null;
+  try {
+    const [u8, marks] = JSON.parse(text.slice(1, end)) as [number, PaintMark[]];
+    return Array.isArray(marks) ? { u8: u8 === 1, marks, body: end + 1 } : null;
+  } catch {
+    return null;
+  }
 }
 
 function hashKey(text: string): string {
@@ -108,25 +126,48 @@ function hashKey(text: string): string {
  * while the store opens.
  *
  * What it holds is a copy, and the contract says so: a peek is something to
- * paint from, the read that follows is the answer. The copy is dropped the
- * moment this tab writes to a table it came from, and written again from the
- * next read of the same thing, so in practice the two agree; when they do not
- * (another tab wrote, the browser died before the drop reached the disk) the
- * read that follows corrects the screen a few milliseconds later.
+ * paint from, the read that follows is the answer.
+ *
+ * Several tabs keep copies in the same place and write to the same store
+ * (shared tabs), so a copy says what it was read under. Every table has a
+ * mark in localStorage, and a tab that writes to a table leaves a new one
+ * there, once before the write is sent and once after the store has taken it.
+ * A copy carries the marks its tables had when it was read and is handed out
+ * only while they still stand, whichever tab wrote. The same marks tell a tab
+ * that a read of its own was overtaken by another tab's write (see
+ * {@link stamp}). What is left is a tab that dies between a write and its
+ * second mark, a write given up on (its deadline passed) that the store takes
+ * after all, and a browser that dies before a mark reaches the disk: the read
+ * that follows the peek then corrects the screen a moment later.
+ *
+ * A tab that is alone in the store (no shared tabs) leaves no marks: nobody
+ * else writes to it, and dropping its own copies as it writes is enough.
  */
 export class PaintCache {
   private entries = new Map<string, PaintEntry>();
   /** Reads this session made at startup: the ones worth keeping a copy of, whenever they run again. */
   private known = new Set<string>();
-  /** table -> keys, for the entries of earlier sessions too. */
+  /** table -> keys, for the entries of earlier sessions and of other tabs too. */
   private byTable: Map<string, Set<string>> | null = null;
-  /** table -> writes this tab made to it, to tell a read sent before a write from one sent after. */
+  /** table -> writes this tab knows of: its own, and another tab's each time the table's mark was found moved. */
   private writes = new Map<string, number>();
+  /** table -> its mark as this tab last read it. */
+  private seen = new Map<string, string | null>();
+  /** table -> the mark this tab last left there. */
+  private mine = new Map<string, string>();
+  private readonly tab = Math.random().toString(36).slice(2, 10);
+  private marked = 0;
+  /** Moves with the bucket, so a read sent under one is never kept under the next. */
+  private era = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private bucket = '';
   private since = 0;
 
-  constructor(private maxChars: number) {
+  /** `shared`: other tabs write to the same store, so writes are marked for them. */
+  constructor(
+    private maxChars: number,
+    private shared = true
+  ) {
     if (typeof addEventListener === 'function') {
       // localStorage is synchronous, so the last state can still be saved as the page goes.
       addEventListener('pagehide', () => this.flush());
@@ -142,32 +183,68 @@ export class PaintCache {
   start(bucket: string): void {
     if (bucket !== this.bucket) {
       this.flush();
-      this.entries.clear();
-      this.known.clear();
-      this.byTable = null;
+      this.forget();
     }
     this.bucket = bucket;
     this.since = Date.now();
+  }
+
+  /**
+   * {@link start} for a tab that is handed its store more than once (shared
+   * tabs: a new role over the same bucket). Only the first hand-over of a
+   * bucket starts a session; what the tab reads after a later one is not what
+   * it reads at startup.
+   */
+  adopt(bucket: string): void {
+    if (bucket !== this.bucket || this.since === 0) this.start(bucket);
+  }
+
+  /** The store turned out to live in memory: nothing read from it is worth showing next time. */
+  stop(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.forget();
+    this.bucket = '';
+    this.since = 0;
+  }
+
+  private forget(): void {
+    this.entries.clear();
+    this.known.clear();
+    this.byTable = null;
+    this.seen.clear();
+    this.mine.clear();
+    this.era++;
   }
 
   private name(key: string): string {
     return `sp00ky.paint.${this.bucket}.${key}`;
   }
 
+  /** Where `table`'s mark is kept. A key is a hash and has no dot, so the two never meet. */
+  private markName(table: string): string {
+    return `sp00ky.paint.${this.bucket}.t.${table}`;
+  }
+
   private index(): Map<string, Set<string>> {
     if (this.byTable) return this.byTable;
     this.byTable = new Map();
-    try {
-      const saved = JSON.parse(localStorage.getItem(`sp00ky.paint.${this.bucket}`) ?? '{}') as Record<string, string[]>;
-      for (const [key, tables] of Object.entries(saved)) this.link(key, tables);
-    } catch {
-      /* an unreadable index only means nothing gets dropped that is not there */
-    }
+    this.readIndex();
     return this.byTable;
   }
 
+  /** Take in the keys kept by earlier sessions, and by other tabs since this one last looked. */
+  private readIndex(): void {
+    try {
+      const saved = JSON.parse(localStorage.getItem(`sp00ky.paint.${this.bucket}`) ?? '{}') as Record<string, string[]>;
+      for (const [key, tables] of Object.entries(saved)) if (Array.isArray(tables)) this.link(key, tables);
+    } catch {
+      /* an unreadable index only means nothing gets dropped that is not there */
+    }
+  }
+
   private link(key: string, tables: string[]): void {
-    const index = this.byTable!;
+    const index = this.index();
     for (const table of tables) {
       let keys = index.get(table);
       if (!keys) index.set(table, (keys = new Set()));
@@ -175,25 +252,114 @@ export class PaintCache {
     }
   }
 
+  /**
+   * Read `table`'s mark. One that moved, and not to what this tab left there,
+   * is another tab's write.
+   */
+  private look(table: string): void {
+    let now: string | null = null;
+    try {
+      now = localStorage.getItem(this.markName(table));
+    } catch {
+      /* no storage: no other tab to hear from */
+    }
+    if (now === (this.seen.get(table) ?? null)) return;
+    this.seen.set(table, now);
+    if (now !== this.mine.get(table)) this.writes.set(table, (this.writes.get(table) ?? 0) + 1);
+  }
+
+  /** Leave a new mark on `table`: every copy read under the old one is void, in every tab. */
+  private leave(table: string): void {
+    if (!this.shared) return;
+    // Another tab's write is counted before its mark is covered.
+    this.look(table);
+    let mark: string | null = `${this.tab}.${++this.marked}`;
+    try {
+      try {
+        localStorage.setItem(this.markName(table), mark);
+      } catch {
+        // No room for it. The copies are what fills the room and what the mark
+        // protects: without them it fits, and there is nothing left to go stale.
+        this.empty();
+        localStorage.setItem(this.markName(table), mark);
+      }
+    } catch {
+      // Still none (the storage is someone else's, or gone). Taking the old mark away says as much.
+      mark = null;
+      try {
+        localStorage.removeItem(this.markName(table));
+      } catch {
+        /* no storage: no other tab reads it either */
+      }
+    }
+    if (mark === null) this.mine.delete(table);
+    else this.mine.set(table, mark);
+    this.seen.set(table, mark);
+  }
+
+  /** Every copy kept for this bucket, by any tab, whether the index knows it or not. Marks stay. */
+  private copies(): string[] {
+    const prefix = `sp00ky.paint.${this.bucket}.`;
+    const out: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const name = localStorage.key(i);
+      if (name !== null && name.startsWith(prefix) && !name.startsWith(prefix + 't.')) out.push(name.slice(prefix.length));
+    }
+    return out;
+  }
+
+  /** Let go of every copy of this bucket, this tab's and the others'. */
+  private empty(): void {
+    this.entries.clear();
+    this.byTable = new Map();
+    try {
+      for (const key of this.copies()) localStorage.removeItem(this.name(key));
+      localStorage.removeItem(`sp00ky.paint.${this.bucket}`);
+    } catch {
+      /* no storage */
+    }
+  }
+
+  /** Whether no tab has written to these tables since they were read. Throws without storage. */
+  private holds(marks: PaintMark[]): boolean {
+    for (const [table, mark] of marks) if (localStorage.getItem(this.markName(table)) !== mark) return false;
+    return true;
+  }
+
   get(key: string, revive: (b64: string) => Uint8Array): Row[] | null {
     if (!this.bucket) return null;
     try {
-      const text = this.entries.get(key)?.text ?? localStorage.getItem(this.name(key));
-      if (!text) return null;
-      if (text[0] === '0') return JSON.parse(text.slice(1)) as Row[];
-      return JSON.parse(text.slice(1), (_k, v) =>
-        v && typeof v === 'object' && typeof (v as { __u8?: unknown }).__u8 === 'string' ? revive((v as { __u8: string }).__u8) : v
-      ) as Row[];
+      // This tab's own copy first. When that one no longer stands, another tab may have kept a newer one.
+      const own = this.entries.get(key)?.text;
+      for (const text of own ? [own, null] : [null]) {
+        const kept = text ?? localStorage.getItem(this.name(key));
+        const head = kept ? paintHead(kept) : null;
+        if (!kept || !head || !this.holds(head.marks)) continue;
+        const rows = kept.slice(head.body);
+        if (!head.u8) return JSON.parse(rows) as Row[];
+        return JSON.parse(rows, (_k, v) =>
+          v && typeof v === 'object' && typeof (v as { __u8?: unknown }).__u8 === 'string' ? revive((v as { __u8: string }).__u8) : v
+        ) as Row[];
+      }
+      return null;
     } catch {
       return null;
     }
   }
 
-  /** How many writes `tables` have seen: taken when a read is sent, checked when it answers. */
-  stamp(tables: string[]): number {
+  /**
+   * What is known of the writes to `tables`: taken when a read is sent,
+   * checked when it answers. It moves with every write this tab sends and
+   * with every write of another tab that this one has seen the mark of.
+   */
+  stamp(tables: string[]): string {
+    if (!this.bucket) return '';
     let n = 0;
-    for (const table of tables) n += this.writes.get(table) ?? 0;
-    return n;
+    for (const table of tables) {
+      this.look(table);
+      n += this.writes.get(table) ?? 0;
+    }
+    return `${this.era}.${n}`;
   }
 
   /**
@@ -201,22 +367,35 @@ export class PaintCache {
    * before. `sentAt` is {@link stamp} from when it was sent; a write to its
    * tables since then means the answer may already be old, and it is let go.
    */
-  note(key: string, tables: string[], rows: string, u8: boolean, sentAt: number): void {
+  note(key: string, tables: string[], rows: string, u8: boolean, sentAt: string): void {
     if (!this.bucket || sentAt !== this.stamp(tables)) return;
     if (!this.known.has(key)) {
       if (Date.now() - this.since > PAINT_CAPTURE_MS || this.known.size >= PAINT_MAX_KEYS) return;
       this.known.add(key);
     }
     if (rows.length > PAINT_MAX_ENTRY_CHARS) return;
-    this.entries.set(key, { tables, text: (u8 ? '1' : '0') + rows, dirty: true });
+    // `stamp` has just read every one of these marks.
+    const head = JSON.stringify([u8 ? 1 : 0, tables.map((table): PaintMark => [table, this.seen.get(table) ?? null])]);
+    this.entries.set(key, { tables, text: `${PAINT_FORMAT}${head}\n${rows}`, dirty: true });
+    this.link(key, tables);
     this.timer ??= setTimeout(() => this.flush(), PAINT_FLUSH_MS);
   }
 
-  /** This tab is about to write to `tables`: what was read from them is no longer what they hold. */
-  touch(tables: Iterable<string>): void {
+  /**
+   * This tab writes to `tables`: what was read from them is no longer what
+   * they hold. Called as the write is sent, and again with `done` once the
+   * store has answered it. The first call drops this tab's copies and fails
+   * its reads still on their way. The second only leaves a new mark: a tab
+   * that read between the two (it saw the first mark, the store had not yet
+   * taken the write) holds a copy that mark makes void, while this tab's own
+   * reads, queued behind its write and answered after it, are kept.
+   */
+  touch(tables: Iterable<string>, done = false): void {
     if (!this.bucket) return;
-    const index = this.index();
+    const index = done ? null : this.index();
     for (const table of tables) {
+      this.leave(table);
+      if (!index) continue;
       this.writes.set(table, (this.writes.get(table) ?? 0) + 1);
       const keys = index.get(table);
       if (!keys || keys.size === 0) continue;
@@ -232,35 +411,72 @@ export class PaintCache {
     }
   }
 
-  /** Write what changed, newest reads first, up to the budget. */
+  /**
+   * Write what changed, newest reads first, up to the budget, and clear out
+   * what no longer stands: the budget is one for all tabs of the bucket.
+   */
   flush(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (!this.bucket) return;
+    const known = this.byTable !== null;
     const index = this.index();
+    if (known) this.readIndex();
     try {
       let used = 0;
       const kept: Record<string, string[]> = {};
       for (const [key, entry] of [...this.entries].reverse()) {
+        // Written to by another tab since: whatever sits under the key now is judged below.
+        if (!this.holds(paintHead(entry.text)?.marks ?? [])) {
+          this.entries.delete(key);
+          continue;
+        }
         if (used + entry.text.length > this.maxChars) {
           this.entries.delete(key);
           localStorage.removeItem(this.name(key));
+          for (const keys of index.values()) keys.delete(key);
           continue;
+        }
+        if (entry.dirty) {
+          try {
+            localStorage.setItem(this.name(key), entry.text);
+            entry.dirty = false;
+          } catch {
+            // No room for this one. It must not cost the others their place in the index.
+            this.entries.delete(key);
+            localStorage.removeItem(this.name(key));
+            for (const keys of index.values()) keys.delete(key);
+            continue;
+          }
         }
         used += entry.text.length;
         kept[key] = entry.tables;
-        if (entry.dirty) {
-          localStorage.setItem(this.name(key), entry.text);
-          entry.dirty = false;
-          this.link(key, entry.tables);
-        }
       }
-      // Entries of earlier sessions that this one never read again stay until a write drops them.
-      for (const [table, keys] of index) {
-        for (const key of keys) {
-          const tables = (kept[key] ??= []);
-          if (!tables.includes(table)) tables.push(table);
+      // Copies this tab does not hold: other tabs', earlier sessions' that this
+      // one never read again, and any the index lost track of (two tabs saving
+      // at once), which nothing else would ever let go of.
+      const others = new Set<string>();
+      for (const keys of index.values()) for (const key of keys) if (!(key in kept)) others.add(key);
+      // Without marks nothing says whether such a stray is still true: it goes.
+      const strays = new Set<string>();
+      for (const key of this.copies()) {
+        if (key in kept || others.has(key)) continue;
+        if (this.shared) others.add(key);
+        else strays.add(key);
+      }
+      for (const key of strays) localStorage.removeItem(this.name(key));
+      for (const key of others) {
+        const text = localStorage.getItem(this.name(key));
+        const head = text ? paintHead(text) : null;
+        if (!text || !head || !this.holds(head.marks) || used + text.length > this.maxChars) {
+          if (text) localStorage.removeItem(this.name(key));
+          for (const keys of index.values()) keys.delete(key);
+          continue;
         }
+        used += text.length;
+        const tables = head.marks.map((mark) => mark[0]);
+        kept[key] = tables;
+        this.link(key, tables);
       }
       localStorage.setItem(`sp00ky.paint.${this.bucket}`, JSON.stringify(kept));
     } catch {
@@ -405,9 +621,11 @@ export class RowsCacheEngine extends SqliteCacheEngine {
   override readonly engineKind = 'rows' as const;
   /** The transport in use wraps a worker `prewarmRows` started. */
   private adopted = false;
+  /** Drops what the adopted worker read ahead of the app, while any of it is still held. */
+  private forgetAhead: (() => void) | null = null;
   /** Last-seen startup reads, for {@link peekByIds} / {@link peekSelect}. Off for a memory store. */
   private paint: PaintCache | null =
-    this.useOpfs && this.config.paintCache !== false && typeof localStorage !== 'undefined' ? new PaintCache(1_000_000) : null;
+    this.useOpfs && this.config.paintCache !== false && typeof localStorage !== 'undefined' ? new PaintCache(1_000_000, this.shared) : null;
 
   protected override createTransport(): SqliteTransport {
     const pre = takePrewarmed();
@@ -427,6 +645,7 @@ export class RowsCacheEngine extends SqliteCacheEngine {
       ahead?.drop();
       ahead = null;
     };
+    this.forgetAhead = forget;
     if (ahead) background(setTimeout(forget, PAINT_CAPTURE_MS));
     let opens = 0;
     // Every open is checked: a worker from another release must not be talked to.
@@ -434,19 +653,23 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     transport.call = async <T>(type: string, payload?: unknown, transfer?: Transferable[]): Promise<T> => {
       if (type === 'open') {
         // The prewarm's work stands only for the first open, of the store it
-        // was started on, with nothing more asked of the worker (under a
-        // role's lock other tabs write through this worker too).
+        // was started on. Under a role's lock too (a shared-tabs leader): the
+        // worker keeps the store it has open, and until a follower's port is
+        // handed to it (`exposeClientPort`) nobody else writes through it.
         const asked = payload as { dbName: string; useOpfs: boolean; workerLockName?: string; share?: boolean };
         // A leader whose followers read the file themselves opens it for sharing.
         if (asked.workerLockName && asked.useOpfs && this.config.followerReads === 'direct') {
           asked.share = true;
         }
-        const mine = ahead !== null && opens++ === 0 && asked.useOpfs && asked.dbName === pre!.bucket && !asked.workerLockName;
+        const mine = ahead !== null && opens++ === 0 && asked.useOpfs && asked.dbName === pre!.bucket;
         const answered = pre?.opened as (OpenReply & { ok?: boolean }) | undefined;
         if (pre) pre.opened = undefined;
         if (!mine) forget();
-        else if (answered?.persisted) {
+        else if (answered?.persisted && !asked.workerLockName && !this.shared) {
           // The worker answered this very open already: no need to ask again.
+          // Never with shared tabs: there the open is also what takes the
+          // role's lock, and what tells the worker that its store, which it
+          // would give up to another tab's leader, has an owner.
           this.opened(transport, asked, answered);
           return answered as T;
         }
@@ -495,7 +718,7 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     this.paint?.start(bucketId);
     try {
       await super.connect(bucketId);
-      this.beginStartupReads();
+      this.sessionBegan();
     } catch (error) {
       if (!this.adopted) throw error;
       this.adopted = false;
@@ -510,7 +733,7 @@ export class RowsCacheEngine extends SqliteCacheEngine {
       );
       await this.close();
       await super.connect(bucketId);
-      this.beginStartupReads();
+      this.sessionBegan();
     }
   }
 
@@ -518,6 +741,19 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     this.dropReader('bucket switch');
     await super.switchBucket(bucketId);
     this.paint?.start(bucketId);
+    this.sessionBegan();
+  }
+
+  /**
+   * The store is open. One that fell back to memory keeps no copies: its rows
+   * are gone with the tab, and it must not write over what a tab with the
+   * real store has kept.
+   */
+  private sessionBegan(): void {
+    if (this.useOpfs && this.storageHealth.status !== 'persistent') {
+      this.paint?.stop();
+      return;
+    }
     this.beginStartupReads();
   }
 
@@ -529,10 +765,12 @@ export class RowsCacheEngine extends SqliteCacheEngine {
   ): Promise<void> {
     takePrewarmed()?.worker.terminate();
     this.dropReader('attaching to a leader');
+    const durable = this.useOpfs && snapshot.storageHealth.status === 'persistent';
+    // Before the port is in use, as in `connect`: a peek needs no store.
+    if (durable) this.paint?.adopt(snapshot.bucketId);
     await super.adoptAttached(dbPort, snapshot, onPortDead);
-    if (this.config.followerReads === 'direct' && this.useOpfs && snapshot.storageHealth.status === 'persistent') {
-      await this.startReader(snapshot.bucketId);
-    }
+    this.sessionBegan();
+    if (this.config.followerReads === 'direct' && durable) await this.startReader(snapshot.bucketId);
   }
 
   // ---- a follower's own reader ------------------------------------------------
@@ -604,9 +842,41 @@ export class RowsCacheEngine extends SqliteCacheEngine {
       .finally(() => clearTimeout(timer));
   }
 
+  /**
+   * A leader's store is this tab's own worker, as alone: one started ahead of
+   * the app is adopted (`createTransport`), and replaced when it turns out to
+   * be another release's.
+   */
   override async adoptOwner(...args: Parameters<SqliteCacheEngine['adoptOwner']>): ReturnType<SqliteCacheEngine['adoptOwner']> {
     this.dropReader('becoming the leader');
-    return super.adoptOwner(...args);
+    this.paint?.adopt(args[0]);
+    let health: StorageHealth;
+    try {
+      health = await super.adoptOwner(...args);
+    } catch (error) {
+      // Only when the worker itself is the trouble: a lock or a file that
+      // cannot be had would fail a second worker the same way.
+      if (!this.adopted || !String(error).includes('worker protocol')) throw error;
+      this.adopted = false;
+      try {
+        localStorage.removeItem(ROWS_PREWARM_KEY);
+      } catch {
+        /* ignore */
+      }
+      this.logger.warn(
+        { error, Category: 'sp00ky-client::RowsCacheEngine::adoptOwner' },
+        'Prewarmed row worker was unusable; starting a fresh one'
+      );
+      health = await super.adoptOwner(...args);
+    }
+    this.sessionBegan();
+    return health;
+  }
+
+  /** Another tab is about to write through this worker: what it read ahead of the app no longer stands. */
+  override async exposeClientPort(clientId: string, port: MessagePort): Promise<void> {
+    this.forgetAhead?.();
+    return super.exposeClientPort(clientId, port);
   }
 
   override async releaseOwnership(): Promise<void> {
@@ -638,11 +908,15 @@ export class RowsCacheEngine extends SqliteCacheEngine {
   private startupUntil = 0;
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
   private startupHooked = false;
+  /** The bucket whose startup reads were last begun. */
+  private startupBucket: string | null = null;
 
   private beginStartupReads(): void {
-    // Not with shared tabs: other tabs write through the leader's worker, and
-    // an answer read ahead of them could be older than what they wrote.
-    if (!this.useOpfs || this.shared || typeof localStorage === 'undefined') return;
+    if (!this.useOpfs || typeof localStorage === 'undefined') return;
+    // With shared tabs a tab is handed its store again with every change of
+    // role. Only the first time is a session's start.
+    if (this.shared && this.startupBucket === this.bucketId) return;
+    this.startupBucket = this.bucketId;
     if (!this.startupHooked && typeof addEventListener === 'function') {
       // localStorage is synchronous, so the list can still be saved as the page goes.
       addEventListener('pagehide', () => this.saveStartupReads());
@@ -681,7 +955,7 @@ export class RowsCacheEngine extends SqliteCacheEngine {
 
   /** A read that answers rows. `paint` names it for the paint cache, when it is worth keeping. */
   private async rows(type: string, payload: unknown, paint?: { key: string; tables: string[] }): Promise<Row[]> {
-    const sentAt = paint && this.paint ? this.paint.stamp(paint.tables) : 0;
+    const sentAt = paint && this.paint ? this.paint.stamp(paint.tables) : '';
     const reply = await this.call<RowsReply>(type, payload);
     this.noteStartupRead(type, payload, reply.buf?.byteLength ?? 0);
     if (!reply.buf) return [];
@@ -718,9 +992,10 @@ export class RowsCacheEngine extends SqliteCacheEngine {
   /**
    * What `select(plan, params)` answered the last time the app asked at
    * startup, synchronously, or `null`. Available as soon as `connect` was
-   * CALLED: it reads localStorage, not the store. Paint from it, then run the
-   * real `select`, which is the answer; they differ only when something wrote
-   * to these tables that this tab did not see.
+   * CALLED (or a role was handed over, or `expectBucket` said which bucket):
+   * it reads localStorage, not the store. Paint from it, then run the real
+   * `select`, which is the answer. A copy is not handed out once any tab has
+   * written to a table it read (see {@link PaintCache}).
    */
   peekSelect(plan: QueryPlan, params: Record<string, unknown> = {}, opts?: { paintKey?: string }): Row[] | null {
     if (!this.paint) return null;
@@ -729,12 +1004,9 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     return this.paint.get(this.selectKey(payload, opts), fromBase64);
   }
 
-  /**
-   * See `LocalStore.expectBucket`. Not with shared tabs: the paint cache is
-   * not kept there (other tabs write to the store unseen by this one).
-   */
+  /** See `LocalStore.expectBucket`. */
   expectBucket(bucketId: string): void {
-    if (!this.shared) this.paint?.expect(bucketId);
+    this.paint?.expect(bucketId);
   }
 
   /** {@link peekSelect} for `selectByIds`. */
@@ -790,7 +1062,11 @@ export class RowsCacheEngine extends SqliteCacheEngine {
     const plan = planColumnReset(stored, fingerprints, new Set(tables), keep);
     if (plan.statements.length === 0) return plan.changed;
     this.paint?.touch(plan.changed);
-    if (plan.changed.length > 0) await this.call('reset-versions', { tables: plan.changed, keep: [...keep] });
+    try {
+      if (plan.changed.length > 0) await this.call('reset-versions', { tables: plan.changed, keep: [...keep] });
+    } finally {
+      this.paint?.touch(plan.changed, true);
+    }
     // Recorded last: a tab that dies between the two redoes the reset, which is harmless.
     const body = encoder.encode(JSON.stringify(fingerprints));
     const buf = body.buffer as ArrayBuffer;
@@ -839,8 +1115,14 @@ export class RowsCacheEngine extends SqliteCacheEngine {
   private async write(items: WriteItem[]): Promise<void> {
     const { wire, buf, sync } = packWrites(items);
     if (wire.length === 0) return;
-    this.paint?.touch(new Set(items.map((item) => item.table)));
-    await this.call('write', { ops: wire, buf, sync }, buf ? [buf] : undefined);
+    const tables = new Set(items.map((item) => item.table));
+    this.paint?.touch(tables);
+    try {
+      await this.call('write', { ops: wire, buf, sync }, buf ? [buf] : undefined);
+    } finally {
+      // Whether or not it was taken: other tabs are told once more, now that it is over.
+      this.paint?.touch(tables, true);
+    }
   }
 
   protected override runWriteBatch(ops: SqlOp[]): Promise<void> {

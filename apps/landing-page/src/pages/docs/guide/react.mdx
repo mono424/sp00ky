@@ -100,7 +100,8 @@ What changes for your tree is that it mounts on a client that is not open yet:
 - It is for client-rendered trees. A server render still produces the fallback.
 
 Rows only come back for queries that rendered in the first seconds of an earlier visit, on the
-same browser, and only while no write has touched their tables since.
+same browser, and only while no write has touched their tables since. That includes writes made
+in another tab when `sharedTabs` is on.
 
 ## Queries
 

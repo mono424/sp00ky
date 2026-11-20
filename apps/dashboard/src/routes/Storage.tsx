@@ -4,7 +4,9 @@ import { api, ApiError, currentMode } from '../api/client';
 import { confirm, toast } from '../components/Actions';
 import { PageHead } from '../components/Chrome';
 import { CopyText, DataError, enc, useCanWrite } from '../components/DataParts';
+import { Sk } from '../components/Skeleton';
 import { formatBytes, formatStamp, relativeStamp } from '../lib/format';
+import { StorageSkeleton } from '../skeletons/Storage';
 import {
   base64ToBytes,
   childOn,
@@ -98,6 +100,7 @@ export function Storage() {
   return (
     <>
       <PageHead title="Storage" />
+      <Show when={list()} fallback={<StorageSkeleton bucket={params.bucket} />}>
       <div class="dx-page dx-split st-page">
         <aside class="dx-side">
           <div class="dx-side-find dx-side-title">
@@ -134,6 +137,7 @@ export function Storage() {
           </Show>
         </div>
       </div>
+      </Show>
     </>
   );
 }
@@ -693,7 +697,8 @@ function FolderPane(props: {
     <aside class="st-pane st-folder">
       <div class="st-folder-mark"><Glyph kind="folder" /></div>
       <h2 class="st-title">{title()}</h2>
-      <Show when={props.summary}>
+      {/* Held open while the column lists, so the facts below do not drop when it answers. */}
+      <Show when={props.summary} fallback={<p class="st-holds"><Sk w="6em" /></p>}>
         {(s) => (
           <p class="st-holds">
             {folderSummary(s().folders, s().files, s().more)}

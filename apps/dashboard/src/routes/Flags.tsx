@@ -6,6 +6,7 @@ import { PageHead } from '../components/Chrome';
 import { DataError, enc, useCanWrite } from '../components/DataParts';
 import { FxCell, Sheet, SheetSection, Sq } from '../components/Frame';
 import { formatStamp, relativeStamp } from '../lib/format';
+import { FlagsSkeleton } from '../skeletons/Flags';
 import {
   rolloutShares,
   type EvaluatePage,
@@ -134,6 +135,8 @@ export function Flags() {
           </Show>
         }
       />
+      {/* Nothing below is drawn before the answer, so the page's shape stands in for it. */}
+      <Show when={result.latest} fallback={<FlagsSkeleton />}>
       <div class="fx-page">
         <Show when={result.latest && !result.latest.ok}>
           <section class="fx-row"><FxCell><DataError message={(result.latest as { ok: false; message: string }).message} /></FxCell></section>
@@ -219,6 +222,7 @@ export function Flags() {
           </section>
         </Show>
       </div>
+      </Show>
 
       <Show when={query.key} keyed>
         {(key) => <FlagSheet flagKey={key} canWrite={canWrite() && !!answer()?.evaluator} onClose={() => setQuery({ key: undefined })} onChanged={reload} />}

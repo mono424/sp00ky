@@ -16,6 +16,7 @@ import {
 import { decodeParam, formatCount, formatMs, formatRelativeTime, formatStamp, formatUptime, isAbsent } from '../lib/format';
 import { backendTone } from '../lib/status';
 import type { BackendDetail, BackendSummary, Overview } from '../api/types';
+import { BackendDetailSkeleton, BackendsSkeleton } from '../skeletons/Backends';
 
 /**
  * The backends the scheduler routes work to, for any number of them.
@@ -130,7 +131,7 @@ export function Backends(props: { overview: Overview | undefined }) {
         </section>
       </Show>
 
-      <Show when={data() || props.overview} fallback={<div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div>}>
+      <Show when={data() || props.overview} fallback={<BackendsSkeleton />}>
         <div class="fx-page">
           <Show
             when={backends().length > 0}
@@ -477,7 +478,7 @@ export function BackendDetailView(props: { overview: Overview | undefined }) {
         }
       />
       <Show when={!error()} fallback={<section class="fx-row"><FxCell><div class="fx-log bad"><span class="fx-what">{error()}</span></div></FxCell></section>}>
-        <Show when={data()} fallback={<div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div>}>
+        <Show when={data()} fallback={<BackendDetailSkeleton />}>
           {(b) => (
             <div class="fx-page">
               <BackendRow backend={b()} detail={b()} use={cloud.byName(name())} overview={props.overview} now={now()} />

@@ -1,7 +1,8 @@
-import { For, Show, type JSX } from 'solid-js';
-import { A } from '@solidjs/router';
+import { For, Show, createEffect, createSignal, on, onCleanup, type JSX } from 'solid-js';
+import { Portal } from 'solid-js/web';
+import { A, useLocation } from '@solidjs/router';
 import { currentMode } from '../api/client';
-import { projectTone, useConsoleChrome } from '../console/chrome';
+import { ProjectSwitcher, useConsoleChrome, useMedia, useMobileHeadSlot } from '../console/chrome';
 
 /** Small shared pieces of the panel chrome. */
 
@@ -18,15 +19,75 @@ export function PageHead(props: {
   // In the console it names the project (or workspace); the rail switches.
   const slug = () => currentMode().config?.project_slug ?? currentMode().config?.scheduler_id ?? 'sp00ky';
   const cx = useConsoleChrome();
+  // On a phone, in the console, the head moves into the top bar.
+  const slot = useMobileHeadSlot();
+  const phone = useMedia('(max-width: 860px)');
+  return (
+    <Show
+      when={cx && phone() && slot()}
+      fallback={<DeskHead {...props} slug={slug()} console={!!cx} />}
+    >
+      {(el) => (
+        <Portal mount={el()}>
+          <PhoneHead crumb={props.crumb} crumbHref={props.crumbHref} title={props.title} actions={props.actions} />
+        </Portal>
+      )}
+    </Show>
+  );
+}
+
+/** The page's head in the bar on top of a phone: the page, its actions under ⋮, the project. */
+function PhoneHead(props: { crumb?: string; crumbHref?: string; title: string; actions?: JSX.Element }) {
+  const [open, setOpen] = createSignal(false);
+  const location = useLocation();
+  let wrap: HTMLDivElement | undefined;
+  const onDoc = (e: MouseEvent) => {
+    if (open() && wrap && !wrap.contains(e.target as Node) && !(e.target as Element).closest?.('.split-menu, .menu, [role="menu"], .confirm, .modal')) setOpen(false);
+  };
+  const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false);
+  document.addEventListener('click', onDoc);
+  window.addEventListener('keydown', onKey);
+  onCleanup(() => {
+    document.removeEventListener('click', onDoc);
+    window.removeEventListener('keydown', onKey);
+  });
+  // Moving to another page closes the menu.
+  createEffect(on(() => location.pathname, () => setOpen(false), { defer: true }));
+  return (
+    <div class="mh">
+      <div class="mh-title">
+        <Show when={props.crumb}>
+          <A class="mh-crumb" href={props.crumbHref ?? `/${props.crumb!.toLowerCase()}`}>{props.crumb}</A>
+          <span class="mh-sep">/</span>
+        </Show>
+        <h1>{props.title}</h1>
+      </div>
+      <span class="mh-proj"><ProjectSwitcher /></span>
+      <Show when={props.actions}>
+        <div class="mh-more" ref={wrap}>
+          <button class="mh-btn" classList={{ on: open() }} aria-label="Page actions" aria-haspopup="menu" aria-expanded={open()} onClick={() => setOpen(!open())}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <circle cx="12" cy="5" r="1.9" /><circle cx="12" cy="12" r="1.9" /><circle cx="12" cy="19" r="1.9" />
+            </svg>
+          </button>
+          <div class="mh-panel" classList={{ open: open() }} role="menu">{props.actions}</div>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+/** The page's head as a bar on top of the page. */
+function DeskHead(props: { crumb?: string; crumbHref?: string; title: string; subtitle?: JSX.Element; actions?: JSX.Element; slug: string; console: boolean }) {
+  const slug = () => props.slug;
+  const cx = props.console;
   return (
     <div class="page-head">
       <div class="ph-crumb cap">
         <Show when={cx} fallback={<span>{slug()}</span>}>
-          {/* The rail switches workspaces and projects; the crumb only says where this is. */}
+          {/* The project's name switches projects (⌘P); the rail's foot switches workspaces. */}
           <span class="ph-ctx">
-            <Show when={cx!.project()} fallback={<b>{cx!.workspace()?.name ?? 'sp00ky'}</b>}>
-              {(p) => <><span class={`fx-sq ${projectTone(p())}`} /><b>{p().slug}</b></>}
-            </Show>
+            <ProjectSwitcher />
           </span>
         </Show>
         <Show when={props.crumb}>

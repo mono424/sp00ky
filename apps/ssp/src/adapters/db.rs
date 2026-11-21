@@ -156,14 +156,12 @@ impl Db for SurrealSdkDb {
         let mut response = self.bounded(surql, q).await?;
 
         let n = response.num_statements();
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let val: surrealdb::types::Value = response
-                .take(i)
-                .map_err(|e| DbError::Query(e.to_string()))?;
-            out.push(val.into_json_value());
-        }
-        Ok(out)
+        statement_results((0..n).map(|i| {
+            response
+                .take::<surrealdb::types::Value>(i)
+                .map(|val| val.into_json_value())
+                .map_err(|e| e.to_string())
+        }))
     }
 
     async fn version(&self) -> Result<String, DbError> {
@@ -180,5 +178,62 @@ impl Db for SurrealSdkDb {
                 consecutive_timeouts,
             },
         }
+    }
+}
+
+/// One query's per-statement results as the port's answer: every value, or
+/// the first SPECIFIC error. Inside a transaction every statement before the
+/// failing one answers "The query was not executed due to a failed
+/// transaction" and the real error sits further on, so the first error alone
+/// hid it (and read as a write conflict to `db_retry`, which then never let
+/// the publisher see the refusal). `HttpSqlDb` already chose this way.
+fn statement_results(
+    results: impl IntoIterator<Item = Result<serde_json::Value, String>>,
+) -> Result<Vec<serde_json::Value>, DbError> {
+    let mut out = Vec::new();
+    let mut generic: Option<String> = None;
+    for result in results {
+        match result {
+            Ok(val) => out.push(val),
+            Err(msg) if ssp_node::http_sql_db::is_generic_tx_error(&msg) => {
+                generic.get_or_insert(msg);
+            }
+            Err(msg) => return Err(DbError::Query(msg)),
+        }
+    }
+    match generic {
+        Some(msg) => Err(DbError::Query(msg)),
+        None => Ok(out),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The order the SDK reports a failed transaction in, as SurrealDB 4.0.1
+    /// answers `BEGIN; LET ..; CREATE ..; THROW ..; CREATE ..; COMMIT;`.
+    #[test]
+    fn a_failed_transaction_reports_the_statement_that_failed() {
+        let generic = |m: &str| Err(m.to_string());
+        let err = statement_results([
+            Ok(serde_json::Value::Null),
+            generic("The query was not executed due to a failed transaction"),
+            generic("The query was not executed due to a failed transaction"),
+            Err("A record of table 't' names generation 47, outside the table's generations 48 to 48".into()),
+            generic("The query was not executed due to a cancelled transaction"),
+            generic("Cannot COMMIT: the transaction was aborted due to a prior error"),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, DbError::Query(ref m) if m.contains("generation 47")), "{err:?}");
+    }
+
+    #[test]
+    fn only_generic_errors_still_fail_and_success_returns_every_value() {
+        let err = statement_results([Err("The query was not executed due to a failed transaction".into())])
+            .unwrap_err();
+        assert!(matches!(err, DbError::Query(ref m) if m.contains("failed transaction")));
+        let ok = statement_results([Ok(serde_json::json!(1)), Ok(serde_json::json!([2]))]).unwrap();
+        assert_eq!(ok, vec![serde_json::json!(1), serde_json::json!([2])]);
     }
 }

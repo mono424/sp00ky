@@ -468,7 +468,7 @@ pub(crate) async fn register_views_from_db(db: &dyn Db, processor: &Arc<RwLock<C
 }
 
 /// The `_00_query` columns a persisted view is rebuilt from.
-pub const PERSISTED_VIEW_FIELDS: &str = "id, surql, clientId, auth_id, ttl, lastActiveAt, params";
+pub const PERSISTED_VIEW_FIELDS: &str = "id, surql, clientId, auth_id, ttl, lastActiveAt, params, quarantinedAt";
 
 /// The key of a `_00_query` row (`abc` of `_00_query:abc`), the form the
 /// circuit and `ViewDelta.query_id` use. `None` without an id.
@@ -484,10 +484,17 @@ pub fn persisted_view_key(view_row: &Value) -> Option<String> {
 /// prepared against the circuit's current schema, attached to an existing
 /// graph when merging finds one computing the same thing, and with no
 /// publication (the caller decides what, if anything, to publish). Returns
-/// the canonical registration id, or `None` when the row is unusable or its
-/// registration is refused (logged).
+/// the canonical registration id, or `None` when the row is unusable,
+/// quarantined, or its registration is refused (logged).
 pub fn register_persisted_view(circuit: &mut Circuit, view_row: &Value) -> Option<String> {
     let raw_id = persisted_view_key(view_row)?;
+    // Quarantined by an earlier process: its edges cannot be written, so a
+    // graph for it would only produce publications that fail (see
+    // `EdgePublisher::quarantine`). The row stays until it is repaired.
+    if view_row.get("quarantinedAt").is_some_and(|v| !v.is_null()) {
+        warn!(view_id = %raw_id, "Skipping quarantined view");
+        return None;
+    }
     let Some(surql) = view_row.get("surql").and_then(|v| v.as_str()) else {
         warn!(view_id = %raw_id, "Skipping view with missing surql");
         return None;

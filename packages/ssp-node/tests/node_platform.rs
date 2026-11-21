@@ -54,12 +54,23 @@ impl Db for MemDb {
         let mut response = q.await.map_err(|e| DbError::Transport(e.to_string()))?;
         let n = response.num_statements();
         let mut out = Vec::with_capacity(n);
+        // As the SSP's own adapter does: inside a failed transaction the
+        // statements before the failing one only echo "failed transaction",
+        // so the first specific error is the one reported.
+        let mut generic = None;
         for i in 0..n {
-            let val: surrealdb::types::Value =
-                response.take(i).map_err(|e| DbError::Query(e.to_string()))?;
-            out.push(val.into_json_value());
+            match response.take::<surrealdb::types::Value>(i) {
+                Ok(val) => out.push(val.into_json_value()),
+                Err(e) if ssp_node::http_sql_db::is_generic_tx_error(&e.to_string()) => {
+                    generic.get_or_insert(e.to_string());
+                }
+                Err(e) => return Err(DbError::Query(e.to_string())),
+            }
         }
-        Ok(out)
+        match generic {
+            Some(e) => Err(DbError::Query(e)),
+            None => Ok(out),
+        }
     }
     async fn version(&self) -> Result<String, DbError> {
         Ok("mem-test".to_string())
@@ -4672,4 +4683,74 @@ async fn admin_lists_and_kills_jobs_through_the_node() {
     assert_eq!(overview["backends"][0]["tables"], json!(["job"]));
     assert_eq!(overview["jobs"]["counts"]["failed"], 1, "{overview}");
     assert_eq!(overview["jobs"]["counts"]["pending"], 1, "{overview}");
+}
+
+/// A view whose edges cannot be written (quarantined, see
+/// `EdgePublisher::quarantine`) gets a definite answer instead of a place in
+/// a queue it would only clog again, and nothing is written for it. Deleting
+/// its row, which needs its edges repaired first, lets it register afresh.
+#[tokio::test]
+async fn a_quarantined_view_is_refused_until_its_row_is_deleted() {
+    let h = thread_harness().await;
+    assert!(h.node.edge_update_tx.mark_quarantined("_00_query:v1", "names generation 47"));
+    let r = h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap();
+    assert_eq!(r.status, 409, "{:?}", json_of(&r));
+    assert_eq!(json_of(&r)["code"], "view_quarantined");
+    assert!(json_of(&r)["message"].as_str().unwrap().contains("generation 47"), "{:?}", json_of(&r));
+    assert_eq!(h.node.processor.read().await.view_count(), 0, "nothing registered");
+    let row: Option<Value> = h.raw_db.query("SELECT VALUE id FROM ONLY _00_query:v1").await.unwrap().take(0).unwrap_or(None);
+    assert!(row.is_none(), "nothing written");
+
+    let r = h.node.route(authed(Method::Post, "/view/unregister", json!({ "id": "_00_query:v1" }))).await.unwrap();
+    assert_eq!(r.status, 200);
+    assert!(h.node.edge_update_tx.quarantined("v1").is_none());
+    let r = h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap();
+    assert_eq!(r.status, 200, "{:?}", json_of(&r));
+}
+
+/// The restart side of the whitepawn outage: a view whose edges the database
+/// refuses used to fail the boot's membership repair, so the SSP never came
+/// up, and its `_00_query` row (which cannot be deleted either) brought it
+/// back on every boot. The repair quarantines it and the boot completes; the
+/// verdict is on the row, so the next boot leaves the view out.
+#[tokio::test]
+async fn the_boot_repair_quarantines_a_refused_view_and_the_next_boot_leaves_it_out() {
+    let h = thread_harness().await;
+    // The database refuses every edge to `thread:poison`, as it refused every
+    // edge of the poisoned table.
+    h.raw_db
+        .query("DEFINE FIELD OVERWRITE out ON TABLE _00_list_ref TYPE record ASSERT $value != thread:poison; \
+                CREATE thread:poison SET title = 'bad'; CREATE thread:ok SET title = 'ok';")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    let ok = json!({ "id": "_00_query:v2", "surql": "SELECT * FROM thread WHERE title = 'ok'", "clientId": "tab-a",
+        "ttl": "30m", "lastActiveAt": "2024-01-01T00:00:00Z", "params": { "auth": { "id": "user:alice" } } });
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap().status, 200);
+    assert_eq!(h.node.route(authed(Method::Post, "/view/register", ok)).await.unwrap().status, 200);
+    for (id, title) in [("thread:poison", "bad"), ("thread:ok", "ok")] {
+        let ingest = json!({ "table": "thread", "op": "CREATE", "id": id, "record": { "title": title } });
+        assert_eq!(h.node.route(authed(Method::Post, "/ingest", ingest)).await.unwrap().status, 200);
+    }
+
+    h.node.republish_restored_views().await.expect("a refused view no longer fails the repair");
+    let error = h.node.edge_update_tx.quarantined("v1").expect("v1 quarantined");
+    assert!(error.contains("thread:poison"), "{error}");
+    assert!(!h.node.processor.read().await.is_registered("v1"));
+    assert!(h.node.processor.read().await.is_registered("v2"), "the other view is untouched");
+    let flagged: Option<Value> = h.raw_db
+        .query("SELECT VALUE quarantinedAt FROM ONLY _00_query:v1").await.unwrap().take(0).unwrap_or(None);
+    assert!(flagged.is_some_and(|v| !v.is_null()), "the verdict is persisted on the row");
+    publication_drained(&h).await;
+    assert_eq!(edge_count_of(&h, "v2").await, 1);
+
+    // A restart: nothing in memory, the row's flag alone keeps it out.
+    h.node.edge_update_tx.release_quarantine("v1");
+    h.node.reload().await.expect("the next boot completes");
+    assert!(!h.node.processor.read().await.is_registered("v1"), "not registered again");
+    assert!(h.node.processor.read().await.is_registered("v2"));
+    assert!(h.node.edge_update_tx.quarantined("v1").is_some(), "learned back from its row");
+    let r = h.node.route(authed(Method::Post, "/view/register", thread_register("_00_query:v1"))).await.unwrap();
+    assert_eq!(r.status, 409, "{:?}", json_of(&r));
 }

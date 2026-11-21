@@ -273,9 +273,10 @@ fn parse_rpc_response(body: &str) -> Result<Vec<Value>, DbError> {
 
 /// The per-statement message SurrealDB gives every statement a transaction
 /// rolled back; it carries no information about what actually failed.
-fn is_generic_tx_error(msg: &str) -> bool {
+pub fn is_generic_tx_error(msg: &str) -> bool {
     msg.starts_with("The query was not executed due to a failed transaction")
         || msg.starts_with("The query was not executed due to a cancelled transaction")
+        || msg.starts_with("Cannot COMMIT: the transaction was aborted due to a prior error")
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]

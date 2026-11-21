@@ -26,12 +26,58 @@ use crate::db_retry::query_retrying;
 use ssp::circuit::{Circuit, SubqueryOp, ViewDelta};
 use ssp_protocol::RefMode;
 
-use crate::ports::{Db, Scheduler, Telemetry};
+use crate::ports::{Db, DbError, Scheduler, Telemetry};
 use crate::tables;
 
 /// Cap on buffered deltas between flushes. A sustained flood flushes early once
 /// it crosses this, so the buffer (and resulting transaction) stay bounded.
 pub const MAX_EDGE_BATCH: usize = 4096;
+
+/// Publication rounds in a row in which the database refused a view's edge
+/// write ([`is_refusal`]) before the view is quarantined, and in which it
+/// refused a cleanup before that cleanup is given up. A parked round retries
+/// every 5 s, so this is about a minute.
+///
+/// Unbounded, one view whose edges SurrealDB could no longer read (rows left
+/// in a retired table generation) was retried every 5 s for three hours on
+/// whitepawn (2026-11-21). Its parked work sat at the front of the queue,
+/// every cleanup behind it waited (cleanup is a global barrier), the queue
+/// grew to 10,522 operations, and the SSP answered every registration of
+/// every user `503 publication_backlog`.
+pub const QUARANTINE_AFTER_REFUSED_ROUNDS: u32 = 12;
+
+/// Why an edge write or a publication cleanup did not land.
+#[derive(Clone, Debug)]
+pub struct WriteFailure {
+    pub error: String,
+    /// The database ran the statement and refused it ([`is_refusal`]). Only
+    /// these count toward quarantine.
+    pub refused: bool,
+}
+impl WriteFailure {
+    fn of(e: &DbError) -> Self {
+        Self { error: e.to_string(), refused: is_refusal(e) }
+    }
+    fn of_anyhow(e: &anyhow::Error) -> Self {
+        Self { error: format!("{e:#}"), refused: e.downcast_ref::<DbError>().is_some_and(is_refusal) }
+    }
+}
+
+/// Whether the database ran a statement and refused it, which says something
+/// about the statement or the rows it touches. A lost optimistic race (or the
+/// "failed transaction" echo of one), a timeout, a dropped connection and an
+/// auth lapse say nothing of the kind and would hit every other view as well:
+/// they never bring a view closer to quarantine, so an outage of the database
+/// cannot quarantine everything at once.
+pub fn is_refusal(e: &DbError) -> bool {
+    match e {
+        DbError::Query(m) => {
+            let m = m.to_ascii_lowercase();
+            !crate::db_retry::is_write_conflict(e) && !m.contains("timeout") && !m.contains("timed out")
+        }
+        DbError::Transport(_) | DbError::Auth(_) => false,
+    }
+}
 
 /// Looks up the stored version for a record key. Abstracts `Circuit.store` so
 /// [`build_edge_batch`] is pure and unit-testable without a circuit.
@@ -77,7 +123,7 @@ pub async fn write_deltas_unlocked(
     publication_gate: &tokio::sync::Mutex<()>,
     mode: RefMode,
     telemetry: &dyn Telemetry,
-) -> Vec<ViewDelta> {
+) -> Unwritten {
     let _publication = publication_gate.lock().await;
     let wait = web_time::Instant::now();
     let versions = {
@@ -100,6 +146,11 @@ pub async fn write_deltas_unlocked(
     telemetry.histogram_ms("edge_publish", start.elapsed().as_secs_f64() * 1000.0);
     left
 }
+
+/// The deltas a write left unwritten, and why, per canonical view id, for the
+/// views the database refused (a delta held back behind its view's earlier
+/// failure has no entry of its own).
+pub type Unwritten = (Vec<ViewDelta>, HashMap<String, WriteFailure>);
 
 
 // Cooperative yield without depending on Tokio's native runtime feature.
@@ -174,6 +225,13 @@ struct PublicationState {
     queue: std::collections::VecDeque<PublicationWork>,
     last_success: Option<u64>,
     overloaded: u64,
+    /// Rounds in a row the database refused each view's edge write, by
+    /// canonical view id. Cleared by a round that lands the view.
+    strikes: HashMap<String, u32>,
+    /// Views set aside for good, by canonical id, with the database's error:
+    /// their deltas are dropped at the door and a registration of the id is
+    /// refused ([`EdgePublisher::quarantined`]).
+    quarantined: HashMap<String, String>,
 }
 struct PublicationLeaseStats {
     at: u64,
@@ -231,6 +289,16 @@ pub enum PublicationCleanup {
     DropViewEdges { table: String, view: String },
 }
 impl PublicationCleanup {
+    /// A short description for the log.
+    fn label(&self) -> String {
+        match self {
+            Self::Statement(sql) => format!("statement {}", sql.chars().take(120).collect::<String>()),
+            Self::EnsureUser(user) => format!("define the edge table of {user}"),
+            Self::DropUser(user) => format!("drop the edge table of {user}"),
+            Self::DropEdgesTo { table, record } => format!("drop {table} edges to {record}"),
+            Self::DropViewEdges { table, view } => format!("drop {table} edges of {view}"),
+        }
+    }
     fn bytes(&self) -> u64 {
         match self {
             Self::Statement(s) | Self::EnsureUser(s) | Self::DropUser(s) => s.capacity() as u64,
@@ -272,10 +340,10 @@ impl EdgeDrops {
 /// [`PublicationCleanup::DropEdgesTo`] and [`PublicationCleanup::DropViewEdges`]
 /// into one statement per table.
 ///
-/// All or nothing: on the first failure it stops and reports `false`, and the
+/// All or nothing: on the first failure it stops and reports why, and the
 /// caller keeps every item's cleanup for the retry. Every step is idempotent,
 /// so re-running the ones that already succeeded is harmless.
-async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]) -> bool {
+async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]) -> Result<(), WriteFailure> {
     let mut drops = EdgeDrops::default();
     for cleanup in items.iter().flat_map(|c| c.iter()) {
         match cleanup {
@@ -290,9 +358,7 @@ async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]
             _ => {}
         }
         // Anything else is ordered against the drops before it.
-        if !flush_edge_drops(db, &mut drops).await {
-            return false;
-        }
+        flush_edge_drops(db, &mut drops).await?;
         let result = match cleanup {
             PublicationCleanup::Statement(sql) => query_retrying(db, sql, &[]).await.map(|_| ()).map_err(anyhow::Error::from),
             PublicationCleanup::EnsureUser(user) => tables::ensure_user_tables(db, mode, user).await,
@@ -302,14 +368,14 @@ async fn run_cleanup(db: &dyn Db, mode: RefMode, items: &[&[PublicationCleanup]]
         if let Err(e) = result {
             if !tables::is_missing_table_error(&e.to_string()) {
                 warn!(target: "ssp::edges", error = %e, "Publication cleanup failed; the round stays pending");
-                return false;
+                return Err(WriteFailure::of_anyhow(&e));
             }
         }
     }
     flush_edge_drops(db, &mut drops).await
 }
 
-async fn flush_edge_drops(db: &dyn Db, drops: &mut EdgeDrops) -> bool {
+async fn flush_edge_drops(db: &dyn Db, drops: &mut EdgeDrops) -> Result<(), WriteFailure> {
     for (table, views) in drops.of_views.drain(..) {
         for chunk in views.chunks(MAX_EDGE_DROP_RECORDS) {
             // The views are bound (any key), the table is a validated
@@ -320,7 +386,7 @@ async fn flush_edge_drops(db: &dyn Db, drops: &mut EdgeDrops) -> bool {
                 if !tables::is_missing_table_error(&e.to_string()) {
                     warn!(target: "ssp::edges", table = %table, views = chunk.len(), error = %e,
                         "Dropping edges of unregistered views failed; the round stays pending");
-                    return false;
+                    return Err(WriteFailure::of(&e));
                 }
             }
         }
@@ -339,12 +405,12 @@ async fn flush_edge_drops(db: &dyn Db, drops: &mut EdgeDrops) -> bool {
                 if !tables::is_missing_table_error(&e.to_string()) {
                     warn!(target: "ssp::edges", table = %table, records = chunk.len(), error = %e,
                         "Dropping edges of deleted records failed; the round stays pending");
-                    return false;
+                    return Err(WriteFailure::of(&e));
                 }
             }
         }
     }
-    true
+    Ok(())
 }
 
 /// Work a round skips and drops: its generation or every view epoch it was
@@ -367,7 +433,7 @@ fn work_selectable(work: &PublicationWork, now: web_time::Instant) -> bool {
 /// Work that can share a round. Table lifecycle (and free-form statements)
 /// keeps a round of its own, so no delta ahead of it is written after it.
 fn work_mergeable(work: &PublicationWork) -> bool {
-    work.cleanup.iter().all(|c| matches!(c, PublicationCleanup::DropEdgesTo { .. } | PublicationCleanup::DropViewEdges { .. }))
+    !work.solo && work.cleanup.iter().all(|c| matches!(c, PublicationCleanup::DropEdgesTo { .. } | PublicationCleanup::DropViewEdges { .. }))
 }
 
 /// A queued item's edge statements, for sizing a round.
@@ -387,6 +453,12 @@ struct PublicationWork {
     cleanup: Vec<PublicationCleanup>,
     ready: Arc<std::sync::atomic::AtomicU8>,
     retry_at: Option<web_time::Instant>,
+    /// Rounds in a row, on its own, in which the database refused this
+    /// item's cleanup.
+    cleanup_strikes: u32,
+    /// Its cleanup failed in a merged round: it runs alone from now on, so a
+    /// refusal is pinned on the item that caused it.
+    solo: bool,
 }
 impl Drop for PublicationWork {
     fn drop(&mut self) { self.source_cancel.notify_one(); }
@@ -541,6 +613,7 @@ impl EdgePublisher {
         let mut state = self.0.state.lock().unwrap();
         state.generation += 1;
         state.epochs.clear();
+        state.strikes.clear();
         drop(state);
         self.0.wake.notify_one();
     }
@@ -548,12 +621,86 @@ impl EdgePublisher {
     /// publication gate before unregistering. Reused IDs receive a new epoch.
     pub fn invalidate_view(&self, query_id: &str) {
         let mut state = self.0.state.lock().unwrap();
-        state.epochs.remove(&ssp::canonical_query_id(query_id));
+        let id = ssp::canonical_query_id(query_id);
+        state.epochs.remove(&id);
+        state.strikes.remove(&id);
         drop(state);
         self.0.wake.notify_one();
     }
     pub fn prune_epochs(&self, circuit: &Circuit) {
         self.0.state.lock().unwrap().epochs.retain(|id, _| circuit.is_registered(id));
+    }
+    /// The database error a view was quarantined for, if it was. A
+    /// registration of a quarantined id is refused instead of being admitted
+    /// into a queue it can only clog again.
+    pub fn quarantined(&self, query_id: &str) -> Option<String> {
+        let state = self.0.state.lock().unwrap();
+        if state.quarantined.is_empty() {
+            return None;
+        }
+        state.quarantined.get(&ssp::canonical_query_id(query_id)).cloned()
+    }
+    /// Every quarantined view, by canonical id.
+    pub fn quarantined_ids(&self) -> Vec<String> {
+        self.0.state.lock().unwrap().quarantined.keys().cloned().collect()
+    }
+    /// Set a view aside without waiting for its rounds to fail: one a
+    /// previous process quarantined (`_00_query.quarantinedAt`). `true` when
+    /// it was not quarantined yet.
+    pub fn mark_quarantined(&self, query_id: &str, error: &str) -> bool {
+        let id = ssp::canonical_query_id(query_id);
+        let mut state = self.0.state.lock().unwrap();
+        state.strikes.remove(&id);
+        // Its queued work, if any, is now obsolete and goes on the next turn.
+        state.epochs.remove(&id);
+        let fresh = state.quarantined.insert(id, error.to_string()).is_none();
+        drop(state);
+        self.0.wake.notify_one();
+        fresh
+    }
+    /// The view's `_00_query` row is gone (it was deleted, so whatever kept
+    /// its edges unwritable is repaired): a new registration of the id starts
+    /// afresh.
+    pub fn release_quarantine(&self, query_id: &str) {
+        let mut state = self.0.state.lock().unwrap();
+        if !state.quarantined.is_empty() {
+            state.quarantined.remove(&ssp::canonical_query_id(query_id));
+        }
+    }
+    /// Quarantine a view whose edges the database keeps refusing: drop its
+    /// queued and parked work (their reservations go with it), release it from
+    /// the circuit so it computes no more deltas, persist the verdict on its
+    /// `_00_query` row so a restart does not register it again, and log it
+    /// once. Its edges are left as they are: they are what the database
+    /// cannot touch.
+    pub async fn quarantine(&self, query_id: &str, error: &str, db: &dyn Db, processor: &RwLock<Circuit>,
+        telemetry: &dyn Telemetry) {
+        let id = ssp::canonical_query_id(query_id);
+        if !self.mark_quarantined(&id, error) {
+            return;
+        }
+        let auth_id = {
+            let mut circuit = processor.write().await;
+            let auth_id = circuit.registration(&id).map(|(_, auth)| auth).unwrap_or_default();
+            if circuit.is_registered(&id) {
+                // Release, like an unregister: the graph may be shared, and
+                // a detached owner stops receiving deltas of its own.
+                circuit.detach_subscriber(&id);
+                telemetry.gauge_add("view_count", -1);
+            }
+            auth_id
+        };
+        telemetry.counter("views_quarantined", 1);
+        error!(target: "ssp::edges", view_id = %id, auth_id = %auth_id, error = %error,
+            rounds = QUARANTINE_AFTER_REFUSED_ROUNDS,
+            "Edge publication keeps being refused; view quarantined. Its registrations are refused until its \
+             _00_query row is deleted, which needs its edges repaired first");
+        if let Err(e) = query_retrying(db,
+            "UPDATE type::record('_00_query', $key) SET quarantinedAt = time::now(), quarantineError = $error RETURN NONE",
+            &[("key", json!(incantation_key(&id))), ("error", json!(error))]).await {
+            warn!(target: "ssp::edges", view_id = %id, error = %e,
+                "Could not persist the quarantine; a restart registers the view again");
+        }
     }
     /// Enqueue at the circuit mutation/snapshot point, while its lock is held.
     /// A registration passes `metadata_pending`; complete the returned guard
@@ -565,6 +712,13 @@ impl EdgePublisher {
     /// A batch publishes only after every surviving source row is visible.
     pub fn enqueue_sources(&self, permit: PublicationPermit, deltas: Vec<ViewDelta>, circuit: &Circuit,
         sources: Vec<(String, i64)>, metadata_pending: bool, cleanup: Vec<PublicationCleanup>) -> Option<PublicationReady> {
+        let mut deltas = deltas;
+        {
+            let state = self.0.state.lock().unwrap();
+            if !state.quarantined.is_empty() {
+                deltas.retain(|d| !state.quarantined.contains_key(&ssp::canonical_query_id(&d.query_id)));
+            }
+        }
         if deltas.is_empty() && cleanup.is_empty() { return None; }
         let source = if sources.is_empty() { None } else { Some(sources) };
         if self.is_standby() {
@@ -612,7 +766,8 @@ impl EdgePublisher {
         let generation = permit.generation;
         state.queue.push_back(PublicationWork { permit: Arc::new(permit), deltas, versions: CapturedVersions(versions), epochs: epochs.clone(),
             source_ready: Arc::new(std::sync::atomic::AtomicBool::new(source.is_none())),
-            source_cancel: Arc::new(tokio::sync::Notify::new()), source, cleanup, ready: ready.clone(), retry_at: None });
+            source_cancel: Arc::new(tokio::sync::Notify::new()), source, cleanup, ready: ready.clone(), retry_at: None,
+            cleanup_strikes: 0, solo: false });
         drop(state);
         self.0.wake.notify_one();
         if let Some(telemetry) = self.0.telemetry.get() {
@@ -801,12 +956,25 @@ impl EdgePublisher {
                 continue;
             }
             let publish = web_time::Instant::now();
+            // The views this round writes, so the ones that land lose their
+            // strikes.
+            let attempted: HashSet<String> = round.iter().flat_map(|work| &work.deltas)
+                .map(|d| ssp::canonical_query_id(&d.query_id)).collect();
+            let mut failures: HashMap<String, WriteFailure> = HashMap::new();
             let cleanups: Vec<&[PublicationCleanup]> = round.iter().map(|work| work.cleanup.as_slice()).collect();
-            if run_cleanup(db.as_ref(), mode, &cleanups).await {
+            let cleanup_failure = run_cleanup(db.as_ref(), mode, &cleanups).await.err();
+            if cleanup_failure.is_none() {
                 for work in &mut round { work.cleanup.clear(); }
                 let mut tables_ready = true;
                 for delta in round.iter().flat_map(|work| &work.deltas).filter(|d| d.initial) {
-                    if crate::tables::ensure_user_tables(db.as_ref(), mode, &delta.auth_id).await.is_err() {
+                    if let Err(e) = crate::tables::ensure_user_tables(db.as_ref(), mode, &delta.auth_id).await {
+                        // Nothing of this user's can land without the table:
+                        // the refusal counts against each of their views.
+                        let failure = WriteFailure::of_anyhow(&e);
+                        let user = delta.auth_id.clone();
+                        for d in round.iter().flat_map(|work| &work.deltas).filter(|d| d.auth_id == user) {
+                            failures.insert(ssp::canonical_query_id(&d.query_id), failure.clone());
+                        }
                         tables_ready = false; break;
                     }
                 }
@@ -828,7 +996,8 @@ impl EdgePublisher {
                         }
                     }
                     let failed: HashSet<usize> = write_delta_positions(db.as_ref(), &deltas, (0..deltas.len()).collect(),
-                        &CapturedVersions(versions), mode, telemetry.as_ref(), &mut HashSet::new()).await.into_iter().collect();
+                        &CapturedVersions(versions), mode, telemetry.as_ref(), &mut HashSet::new(), &mut failures)
+                        .await.into_iter().collect();
                     for (position, delta) in deltas.into_iter().enumerate() {
                         if failed.contains(&position) { round[owners[position]].deltas.push(delta); }
                     }
@@ -836,27 +1005,77 @@ impl EdgePublisher {
             }
             telemetry.histogram_ms("edge_publish", publish.elapsed().as_secs_f64() * 1000.0);
             drop(publication);
-            let (done, parked): (Vec<_>, Vec<_>) = round.into_iter()
+            let (done, mut parked): (Vec<_>, Vec<_>) = round.into_iter()
                 .partition(|work| work.deltas.is_empty() && work.cleanup.is_empty());
             if !done.is_empty() {
                 self.0.state.lock().unwrap().last_success = Some(crate::now_epoch_ms());
             }
             // Released outside the queue lock: a permit's drop takes it.
             drop(done);
-            if parked.is_empty() { continue; }
-            let retry_at = web_time::Instant::now() + if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(5) };
-            let mut state = self.0.state.lock().unwrap();
-            // Back to the front, in their original order. Moving ahead of
-            // disjoint earlier work is safe; overlapping work could not have
-            // been selected in the first place.
-            for mut work in parked.into_iter().rev() {
-                let failed: HashSet<_> = work.deltas.iter().map(|d| ssp::canonical_query_id(&d.query_id)).collect();
-                work.epochs.retain(|id, _| failed.contains(id));
-                work.retry_at = Some(retry_at);
-                if let Some(stats) = state.leases.get_mut(&work.permit.id) { stats.parked = true; }
-                state.queue.push_front(work);
+            let quarantine = self.count_strikes(&attempted, &parked, &failures);
+            // A refused cleanup is pinned on one item before it counts: in a
+            // merged round every item runs alone from now on.
+            if let Some(failure) = cleanup_failure.as_ref().filter(|f| f.refused) {
+                let holders = parked.iter().filter(|work| !work.cleanup.is_empty()).count();
+                for work in parked.iter_mut().filter(|work| !work.cleanup.is_empty()) {
+                    if holders == 1 { work.cleanup_strikes += 1; } else { work.solo = true; }
+                    if work.cleanup_strikes >= QUARANTINE_AFTER_REFUSED_ROUNDS {
+                        // Cleanup is a global barrier: refused for good, it
+                        // would hold every publication behind it forever.
+                        let given_up = std::mem::take(&mut work.cleanup);
+                        telemetry.counter("publication_cleanup_abandoned", 1);
+                        error!(target: "ssp::edges", items = given_up.len(), cleanup = %given_up[0].label(),
+                            error = %failure.error, rounds = work.cleanup_strikes,
+                            "Publication cleanup keeps being refused; giving it up so the queue can move");
+                        work.cleanup_strikes = 0;
+                    }
+                }
+            }
+            let (released, parked): (Vec<_>, Vec<_>) = parked.into_iter()
+                .partition(|work| work.deltas.is_empty() && work.cleanup.is_empty());
+            drop(released);
+            if !parked.is_empty() {
+                let retry_at = web_time::Instant::now() + if cfg!(test) { Duration::from_millis(10) } else { Duration::from_secs(5) };
+                let mut state = self.0.state.lock().unwrap();
+                // Back to the front, in their original order. Moving ahead of
+                // disjoint earlier work is safe; overlapping work could not have
+                // been selected in the first place.
+                for mut work in parked.into_iter().rev() {
+                    let failed: HashSet<_> = work.deltas.iter().map(|d| ssp::canonical_query_id(&d.query_id)).collect();
+                    work.epochs.retain(|id, _| failed.contains(id));
+                    work.retry_at = Some(retry_at);
+                    if let Some(stats) = state.leases.get_mut(&work.permit.id) { stats.parked = true; }
+                    state.queue.push_front(work);
+                }
+            }
+            for (view, error) in quarantine {
+                self.quarantine(&view, &error, db.as_ref(), &processor, telemetry.as_ref()).await;
             }
         }
+    }
+
+    /// One round's verdict on each view: a view that landed loses its strikes,
+    /// one the database refused gains one. Returns the views (and errors) that
+    /// reached [`QUARANTINE_AFTER_REFUSED_ROUNDS`].
+    fn count_strikes(&self, attempted: &HashSet<String>, parked: &[PublicationWork],
+        failures: &HashMap<String, WriteFailure>) -> Vec<(String, String)> {
+        let mut state = self.0.state.lock().unwrap();
+        if !state.strikes.is_empty() {
+            let unwritten: HashSet<String> = parked.iter().flat_map(|work| &work.deltas)
+                .map(|d| ssp::canonical_query_id(&d.query_id)).collect();
+            for view in attempted.iter().filter(|view| !unwritten.contains(*view)) {
+                state.strikes.remove(view);
+            }
+        }
+        let mut reached = Vec::new();
+        for (view, failure) in failures.iter().filter(|(_, f)| f.refused) {
+            let strikes = state.strikes.entry(view.clone()).or_insert(0);
+            *strikes += 1;
+            if *strikes >= QUARANTINE_AFTER_REFUSED_ROUNDS {
+                reached.push((view.clone(), failure.error.clone()));
+            }
+        }
+        reached
     }
 
 }
@@ -1384,7 +1603,7 @@ pub async fn write_deltas_resilient(
     mode: RefMode,
     telemetry: &dyn Telemetry,
 ) -> Vec<ViewDelta> {
-    write_deltas_with_versions(db, deltas, &CircuitVersions(circuit), mode, telemetry).await
+    write_deltas_with_versions(db, deltas, &CircuitVersions(circuit), mode, telemetry).await.0
 }
 
 async fn write_deltas_with_versions(
@@ -1393,11 +1612,13 @@ async fn write_deltas_with_versions(
     versions: &(impl RecordVersions + Sync),
     mode: RefMode,
     telemetry: &dyn Telemetry,
-) -> Vec<ViewDelta> {
+) -> Unwritten {
     let positions = (0..deltas.len()).collect();
-    let failed = write_delta_positions(db, &deltas, positions, versions, mode, telemetry, &mut HashSet::new()).await;
+    let mut failures = HashMap::new();
+    let failed = write_delta_positions(db, &deltas, positions, versions, mode, telemetry,
+        &mut HashSet::new(), &mut failures).await;
     let mut slots: Vec<Option<ViewDelta>> = deltas.into_iter().map(Some).collect();
-    failed.into_iter().filter_map(|p| slots[p].take()).collect()
+    (failed.into_iter().filter_map(|p| slots[p].take()).collect(), failures)
 }
 
 /// [`write_deltas_with_versions`] over positions into `all`, which must be in
@@ -1408,6 +1629,10 @@ async fn write_deltas_with_versions(
 /// publication round carries many ingests' deltas, and letting a later
 /// removal land while the addition before it waits for a retry would bring
 /// the edge back when that retry succeeds.
+///
+/// A delta that still fails once isolated records why in `failures`, under
+/// its canonical view id.
+#[allow(clippy::too_many_arguments)]
 async fn write_delta_positions(
     db: &dyn Db,
     all: &[ViewDelta],
@@ -1416,6 +1641,7 @@ async fn write_delta_positions(
     mode: RefMode,
     telemetry: &dyn Telemetry,
     poisoned: &mut HashSet<String>,
+    failures: &mut HashMap<String, WriteFailure>,
 ) -> Vec<usize> {
     let view = |p: usize| ssp::canonical_query_id(&all[p].query_id);
     let (mut held, positions): (Vec<usize>, Vec<usize>) =
@@ -1444,7 +1670,7 @@ async fn write_delta_positions(
     // has already re-published it would duplicate every edge. Nor is any later
     // delta of a view that has failed.
     let mut failed: HashSet<usize> = HashSet::new();
-    let mut error: Option<String> = None;
+    let mut error: Option<DbError> = None;
     for plan in plan_transactions(&batch, MAX_TX_STATEMENTS) {
         if plan.deltas.iter().any(|&d| failed.contains(&d) || poisoned.contains(&view(positions[d]))) {
             poisoned.extend(plan.deltas.iter().map(|&d| view(positions[d])));
@@ -1465,7 +1691,7 @@ async fn write_delta_positions(
             warn!(target: "ssp::edges", view_id = %refs[plan.deltas[0]].query_id,
                 elapsed_ms, statement_bytes = plan.sql.len(), operations = op_count,
                 "Edge transaction failed; publication remains pending");
-            error = Some(e.to_string());
+            error = Some(e);
             poisoned.extend(plan.deltas.iter().map(|&d| view(positions[d])));
             failed.extend(plan.deltas);
         }
@@ -1501,8 +1727,8 @@ async fn write_delta_positions(
             poisoned.remove(&view(p));
         }
         let right = retry.split_off(retry.len() / 2);
-        held.extend(Box::pin(write_delta_positions(db, all, retry, versions, mode, telemetry, poisoned)).await);
-        held.extend(Box::pin(write_delta_positions(db, all, right, versions, mode, telemetry, poisoned)).await);
+        held.extend(Box::pin(write_delta_positions(db, all, retry, versions, mode, telemetry, poisoned, failures)).await);
+        held.extend(Box::pin(write_delta_positions(db, all, right, versions, mode, telemetry, poisoned, failures)).await);
         held.sort_unstable();
         return held;
     }
@@ -1519,6 +1745,7 @@ async fn write_delta_positions(
         return held;
     }
     error!(target: "ssp::edges", error = %e, view_id = %failed_delta.query_id, operations = op_count, "Edge delta not written after retries");
+    failures.insert(view(retry[0]), WriteFailure::of(&e));
     held.extend(retry);
     held.sort_unstable();
     held
@@ -1896,6 +2123,7 @@ impl EdgeSink for SurrealEdgeSink {
             self.telemetry.as_ref(),
         )
         .await
+        .0
     }
 }
 
@@ -2045,7 +2273,7 @@ mod tests {
         earlier.result_hash = "earlier".into();
         carrier.result_hash = "carrier".into();
         let left = write_deltas_with_versions(&Fails, vec![earlier, carrier], &ConstV(3), RefMode::Single,
-            &crate::ports::NoopTelemetry).await;
+            &crate::ports::NoopTelemetry).await.0;
         let held: Vec<&str> = left.iter().map(|d| d.result_hash.as_str()).collect();
         assert_eq!(held, vec!["carrier"]);
     }
@@ -2618,6 +2846,10 @@ mod publication_tests {
     use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
     use crate::ports::{DbError, NoopTelemetry, TimerKind};
 
+    /// Verbatim from whitepawn's SSP log, 2026-11-21.
+    const POISONED: &str = "A record of table '_00_list_ref_user_eb0wzu5qq1a3z666tfi9' names generation 47, \
+        outside the table's generations 48 to 48";
+
     #[derive(Default)]
     struct TestDb {
         fail: AtomicBool,
@@ -2629,6 +2861,11 @@ mod publication_tests {
         source_gates: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
         /// Fail any statement containing this, on top of `fail`.
         fail_marker: Mutex<Option<String>>,
+        /// Refuse any statement containing this, as the database refuses one
+        /// no retry can clear ([`POISONED`]).
+        refuse_marker: Mutex<Option<String>>,
+        /// Statements answered with an error, either way.
+        failed: std::sync::atomic::AtomicUsize,
         active_probes: std::sync::atomic::AtomicUsize,
         max_probes: std::sync::atomic::AtomicUsize,
         sql: Mutex<Vec<String>>,
@@ -2656,9 +2893,18 @@ mod publication_tests {
                 return Ok(vec![json!(99)]);
             }
             if sql.starts_with("SELECT VALUE id FROM ONLY") { return Ok(vec![json!("_00_query:q")]); }
-            if self.fail.load(Ordering::Acquire) && sql.contains("thread:a") { return Err(DbError::Transport("offline".into())); }
+            if self.fail.load(Ordering::Acquire) && sql.contains("thread:a") {
+                self.failed.fetch_add(1, Ordering::AcqRel);
+                return Err(DbError::Transport("offline".into()));
+            }
             if let Some(marker) = self.fail_marker.lock().unwrap().as_deref() {
                 if sql.contains(marker) { return Err(DbError::Transport("offline".into())); }
+            }
+            if let Some(marker) = self.refuse_marker.lock().unwrap().as_deref() {
+                if sql.contains(marker) {
+                    self.failed.fetch_add(1, Ordering::AcqRel);
+                    return Err(DbError::Query(POISONED.into()));
+                }
             }
             self.sql.lock().unwrap().push(sql.into());
             Ok(vec![])
@@ -3163,5 +3409,130 @@ mod publication_tests {
         drop(held);
         assert!(waiter.await.unwrap());
         assert!(started.elapsed() < Duration::from_secs(5), "woken by the release, not the deadline");
+    }
+    #[test]
+    fn only_a_statement_the_database_refused_counts_toward_quarantine() {
+        assert!(is_refusal(&DbError::Query(POISONED.into())));
+        assert!(is_refusal(&DbError::Query("Cannot execute DELETE statement using value: NONE".into())));
+        for transient in [
+            DbError::Query("Transaction conflict: Resource busy: . This transaction can be retried".into()),
+            DbError::Query("The query was not executed due to a failed transaction".into()),
+            DbError::Query("The query was not executed because it exceeded the timeout".into()),
+            DbError::Transport("SurrealDB call timed out after 15s".into()),
+            DbError::Transport("connection refused".into()),
+            DbError::Auth("token expired".into()),
+        ] {
+            assert!(!is_refusal(&transient), "{transient}");
+        }
+    }
+
+    /// The whitepawn outage: a view whose edges the database could no longer
+    /// read was parked at the front of the queue and retried forever, and the
+    /// cleanup queued behind it (a global barrier), with everything behind
+    /// that, never ran. Bounded now: the view is quarantined and the rest
+    /// lands.
+    #[tokio::test]
+    async fn publication_a_view_the_database_keeps_refusing_is_quarantined_and_frees_the_queue() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        c.write().await.add_query(ssp::operator::QueryPlan { id: "other".into(), root: ssp::operator::OperatorPlan::Scan { table: "thread".into() } }, None, None);
+        let db = Arc::new(TestDb::default());
+        *db.refuse_marker.lock().unwrap() = Some("->thread:a SET".into());
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![], &*c.read().await, None, false,
+            vec![PublicationCleanup::Statement("REMOVE TABLE lifecycle_marker".into())]);
+        let mut other = delta("thread:b", true);
+        other.query_id = "other".into();
+        p.enqueue(p.try_reserve(0).unwrap(), vec![other], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c.clone());
+        drained(&p).await;
+
+        let error = p.quarantined("q").expect("the refused view is quarantined");
+        assert!(error.contains("generation 47"), "{error}");
+        assert!(p.quarantined("_00_query:q").is_some(), "either id spelling");
+        assert!(p.quarantined("other").is_none());
+        assert_eq!(db.failed.load(Ordering::Acquire), QUARANTINE_AFTER_REFUSED_ROUNDS as usize,
+            "one refused write per round, and no more rounds after the bound");
+        assert!(!c.read().await.is_registered("q"), "released from the circuit");
+        assert!(c.read().await.is_registered("other"));
+        let sql = db.sql.lock().unwrap().clone();
+        let at = |needle: &str| sql.iter().position(|s| s.contains(needle))
+            .unwrap_or_else(|| panic!("no statement contains {needle}: {sql:#?}"));
+        assert!(at("SET quarantinedAt = time::now()") < at("REMOVE TABLE lifecycle_marker"),
+            "the verdict is persisted, then the barrier behind the view runs");
+        assert!(at("REMOVE TABLE lifecycle_marker") < at("thread:b"), "and the other view after it");
+
+        // Nothing more is admitted for it.
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:c", true)], &*c.read().await, None, false, vec![]);
+        assert_eq!(p.snapshot().pending_batches, 0, "a quarantined view's delta is dropped at the door");
+        // Until its row is deleted.
+        p.release_quarantine("_00_query:q");
+        assert!(p.quarantined("q").is_none());
+        task.abort();
+    }
+
+    /// A database that is away (or slow) fails every view alike, and must not
+    /// quarantine any of them: the work waits and lands once it is back.
+    #[tokio::test]
+    async fn publication_a_database_outage_never_quarantines_a_view() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        db.fail.store(true, Ordering::Release);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c.clone());
+        let rounds = 3 * QUARANTINE_AFTER_REFUSED_ROUNDS as usize;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while db.failed.load(Ordering::Acquire) < rounds { tokio::task::yield_now().await; }
+        }).await.expect("the write keeps being retried");
+        assert!(p.quarantined("q").is_none(), "a transport failure is no verdict on the view");
+        assert!(c.read().await.is_registered("q"));
+        db.fail.store(false, Ordering::Release);
+        drained(&p).await;
+        assert!(statements(&db).iter().any(|s| s.contains("->thread:a SET")));
+        task.abort();
+    }
+
+    /// Cleanup is a global barrier, so one the database refuses for good used
+    /// to hold every publication behind it forever. It is given up after the
+    /// same bound, and the work behind it lands.
+    #[tokio::test]
+    async fn publication_a_cleanup_the_database_keeps_refusing_is_given_up() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        *db.refuse_marker.lock().unwrap() = Some("poisoned_marker".into());
+        p.enqueue(p.try_reserve(0).unwrap(), vec![], &*c.read().await, None, false,
+            vec![PublicationCleanup::Statement("DELETE poisoned_marker".into())]);
+        p.enqueue(p.try_reserve(0).unwrap(), vec![delta("thread:a", true)], &*c.read().await, None, false, vec![]);
+        let task = start(p.clone(), db.clone(), c.clone());
+        drained(&p).await;
+        assert_eq!(db.failed.load(Ordering::Acquire), QUARANTINE_AFTER_REFUSED_ROUNDS as usize);
+        assert!(statements(&db).iter().any(|s| s.contains("->thread:a SET")), "the delta behind it landed");
+        assert!(p.quarantined("q").is_none(), "a refused cleanup quarantines no view");
+        task.abort();
+    }
+
+    /// Edge drops of many rows fold into one statement, so one refused row
+    /// refuses the fold. Each item then runs alone: the refusal is pinned on
+    /// the row that causes it, and the others land.
+    #[tokio::test]
+    async fn publication_a_refused_edge_drop_is_isolated_from_the_ones_folded_with_it() {
+        let p = EdgePublisher::default();
+        let c = circuit();
+        let db = Arc::new(TestDb::default());
+        *db.refuse_marker.lock().unwrap() = Some("thread:bad".into());
+        for record in ["thread:bad", "thread:ok"] {
+            p.enqueue(p.try_reserve(0).unwrap(), vec![], &*c.read().await, None, false,
+                vec![PublicationCleanup::DropEdgesTo { table: "_00_list_ref".into(), record: record.into() }]);
+        }
+        let task = start(p.clone(), db.clone(), c.clone());
+        drained(&p).await;
+        assert_eq!(db.failed.load(Ordering::Acquire), 1 + QUARANTINE_AFTER_REFUSED_ROUNDS as usize,
+            "the folded statement once, then the bad drop alone until it is given up");
+        let sql = db.sql.lock().unwrap().clone();
+        assert!(sql.iter().any(|s| s.contains("FROM [thread:ok]<-_00_list_ref")), "{sql:#?}");
+        assert!(!sql.iter().any(|s| s.contains("thread:bad")));
+        task.abort();
     }
 }

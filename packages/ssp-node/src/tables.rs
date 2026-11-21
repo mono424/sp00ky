@@ -137,7 +137,18 @@ DEFINE FIELD OVERWRITE parent_rel ON TABLE {tbl} TYPE option<string>;
 /// instead would hide a reconnected client's own older edges from its
 /// membership reads.
 pub async fn ensure_anon_table(db: &dyn Db) -> Result<()> {
+    ensure_anon_table_with(db, None).await
+}
+
+async fn ensure_anon_table_with(db: &dyn Db, gate: Option<&tokio::sync::Mutex<()>>) -> Result<()> {
     use std::sync::atomic::Ordering;
+    if ENSURED_ANON_TABLE.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _publication = match gate {
+        Some(gate) => Some(gate.lock().await),
+        None => None,
+    };
     if ENSURED_ANON_TABLE.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -150,7 +161,7 @@ pub async fn ensure_anon_table(db: &dyn Db) -> Result<()> {
         tbl = tbl,
         fields = list_ref_fields(tbl),
     );
-    query_retrying(db, &ddl, &[])
+    query_retrying(db, &in_one_transaction(&ddl), &[])
         .await
         .context("Failed to ensure anonymous list_ref table")?;
     ENSURED_ANON_TABLE.store(true, Ordering::Release);
@@ -185,15 +196,54 @@ pub fn user_list_ref_ddl(tbl: &str, uid: &str) -> String {
     )
 }
 
+/// A table's DDL as one transaction: the table, its rule and its fields
+/// appear (or change) together. Run as separate statements, a fresh table
+/// existed for a moment without its fields or its rule, and each statement
+/// gave it a layout generation of its own while edge writes were landing.
+fn in_one_transaction(ddl: &str) -> String {
+    format!("BEGIN TRANSACTION;\n{ddl}\nCOMMIT TRANSACTION;")
+}
+
 /// Issue idempotent `DEFINE TABLE OVERWRITE` + field DDL for the per-user
 /// `_00_list_ref_user_<id>` table. No-op in `RefMode::Single`, and when
 /// `auth_id` doesn't sanitize cleanly (falls back to the global table, logged
 /// at the call site). Idempotent via `OVERWRITE`.
+///
+/// For a caller that already holds the publication gate (the publisher, and
+/// the cleanup it runs). Everyone else uses [`ensure_user_tables_gated`].
 pub async fn ensure_user_tables(db: &dyn Db, mode: RefMode, auth_id: &str) -> Result<()> {
+    ensure_user_tables_with(db, mode, auth_id, None).await
+}
+
+/// [`ensure_user_tables`] that takes the publication `gate` before any DDL,
+/// so the DDL never runs beside a publication round writing to the table.
+/// Free when the table is already defined: the gate is only taken when there
+/// is DDL to issue.
+///
+/// DDL on an edge table racing edge writes to it is what left rows SurrealDB
+/// 4.0.1 could no longer read or delete ("names generation 47, outside the
+/// table's generations 48 to 48", whitepawn 2026-11-21): a table removed and
+/// defined again starts a new generation ring, and a write that was already
+/// in flight lands its rows in the generation that just left it.
+pub async fn ensure_user_tables_gated(
+    db: &dyn Db,
+    mode: RefMode,
+    auth_id: &str,
+    gate: &tokio::sync::Mutex<()>,
+) -> Result<()> {
+    ensure_user_tables_with(db, mode, auth_id, Some(gate)).await
+}
+
+async fn ensure_user_tables_with(
+    db: &dyn Db,
+    mode: RefMode,
+    auth_id: &str,
+    gate: Option<&tokio::sync::Mutex<()>>,
+) -> Result<()> {
     // Anonymous clients share the dedicated `_00_list_ref_anon` table in both
     // ref modes (the handler only ever passes the sentinel when the flag is on).
     if auth_id == ANON_AUTH_ID {
-        return ensure_anon_table(db).await;
+        return ensure_anon_table_with(db, gate).await;
     }
     if mode == RefMode::Single {
         return Ok(());
@@ -223,6 +273,12 @@ pub async fn ensure_user_tables(db: &dyn Db, mode: RefMode, auth_id: &str) -> Re
     if user_table_ensured(&uid) {
         return Ok(());
     }
+    // Gate first, then the per-user lock: the publisher calls in holding the
+    // gate, so the other order could deadlock against it.
+    let _publication = match gate {
+        Some(gate) => Some(gate.lock().await),
+        None => None,
+    };
     let lock = ensure_lock(&uid);
     let _in_flight = lock.lock().await;
     // A concurrent registration for the same user may have defined it while
@@ -240,7 +296,7 @@ pub async fn ensure_user_tables(db: &dyn Db, mode: RefMode, auth_id: &str) -> Re
     // optimistic-concurrency race 500'd the registration outright and the
     // client's view never came up. Seen on whitepawn: twelve of these inside
     // one second during a re-registration storm.
-    query_retrying(db, &ddl, &[])
+    query_retrying(db, &in_one_transaction(&ddl), &[])
         .await
         .with_context(|| format!("Failed to ensure per-user list_ref table for {}", auth_id))?;
     mark_user_table_ensured(&uid);
@@ -295,8 +351,27 @@ pub async fn drop_user_table_if_unused(db: &dyn Db, mode: RefMode, auth_id: &str
 /// Best-effort: drop every `_00_list_ref_user_<id>` table whose owner has no
 /// live query in `_00_query`. No-op in `RefMode::Single`.
 pub async fn drop_orphaned_user_tables(db: &dyn Db, mode: RefMode) -> Result<()> {
+    for uid in orphaned_user_tables(db, mode).await? {
+        remove_user_table(db, &uid).await;
+    }
+    Ok(())
+}
+
+/// Forget and remove `_00_list_ref_user_<uid>`, logging a failure.
+pub async fn remove_user_table(db: &dyn Db, uid: &str) {
+    forget_user_table(uid);
+    let tbl = format!("_00_list_ref_user_{uid}");
+    if let Err(e) = db.query(&format!("REMOVE TABLE IF EXISTS {tbl};"), &[]).await {
+        warn!(target: "ssp::tables", table = %tbl, error = %e, "drop orphaned per-user table failed");
+    }
+}
+
+/// The sanitized uids of the `_00_list_ref_user_<uid>` tables whose owner has
+/// no query in `_00_query`, for [`drop_orphaned_user_tables`]. Empty in
+/// `RefMode::Single`.
+pub async fn orphaned_user_tables(db: &dyn Db, mode: RefMode) -> Result<Vec<String>> {
     if mode == RefMode::Single {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Flattened JSON: INFO FOR DB → { "tables": { name: "DEFINE ..." } }.
@@ -313,7 +388,7 @@ pub async fn drop_orphaned_user_tables(db: &dyn Db, mode: RefMode) -> Result<()>
         })
         .unwrap_or_default();
     if per_user.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Sanitized uids that still back a live query.
@@ -332,16 +407,11 @@ pub async fn drop_orphaned_user_tables(db: &dyn Db, mode: RefMode) -> Result<()>
         })
         .unwrap_or_default();
 
-    for tbl in per_user {
-        let uid = tbl.trim_start_matches("_00_list_ref_user_");
-        if !live_uids.contains(uid) {
-            forget_user_table(uid);
-            if let Err(e) = db.query(&format!("REMOVE TABLE IF EXISTS {tbl};"), &[]).await {
-                warn!(target: "ssp::tables", table = %tbl, error = %e, "drop orphaned per-user table failed");
-            }
-        }
-    }
-    Ok(())
+    Ok(per_user
+        .iter()
+        .map(|tbl| tbl.trim_start_matches("_00_list_ref_user_").to_string())
+        .filter(|uid| !live_uids.contains(uid))
+        .collect())
 }
 
 /// Extract a leading integer from a flattened query result (`GROUP ALL count()`
@@ -523,5 +593,53 @@ mod ensure_once_tests {
         let db = RecordingDb::default();
         ensure_user_tables(&db, RefMode::Dedicated, auth_id).await.unwrap();
         assert_eq!(ddl_count(&db, "DEFINE TABLE OVERWRITE _00_list_ref_user_ensureonce_failed_x9"), 1);
+    }
+
+    /// The DDL never runs beside a publication round: while a round holds
+    /// the gate, a registration that has a table to define waits for it. A
+    /// table this process already defined needs no gate at all, so the
+    /// registrations that follow are not held behind rounds.
+    #[tokio::test]
+    async fn the_define_waits_for_the_publication_gate_and_a_defined_table_does_not() {
+        let gate = tokio::sync::Mutex::new(());
+        let db = RecordingDb::default();
+        let auth_id = "user:gated_ddl_k7";
+        let round = gate.lock().await;
+        let define = ensure_user_tables_gated(&db, RefMode::Dedicated, auth_id, &gate);
+        tokio::pin!(define);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut define).await.is_err(),
+            "no DDL while a round holds the gate"
+        );
+        assert_eq!(ddl_count(&db, "_00_list_ref_user_gated_ddl_k7"), 0);
+        drop(round);
+        define.await.unwrap();
+        assert_eq!(ddl_count(&db, "_00_list_ref_user_gated_ddl_k7"), 1);
+
+        let _round = gate.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            ensure_user_tables_gated(&db, RefMode::Dedicated, auth_id, &gate),
+        )
+        .await
+        .expect("a defined table takes no gate")
+        .unwrap();
+    }
+
+    /// The table, its rule and its fields land together: a table defined in
+    /// separate statements was briefly there without its fields or its rule.
+    #[tokio::test]
+    async fn the_table_and_its_fields_are_defined_in_one_transaction() {
+        let db = RecordingDb::default();
+        ensure_user_tables(&db, RefMode::Dedicated, "user:one_tx_m3").await.unwrap();
+        let statements = db.statements.lock().unwrap();
+        let ddl = statements
+            .iter()
+            .find(|s| s.contains("_00_list_ref_user_one_tx_m3"))
+            .expect("the DDL ran");
+        assert!(ddl.starts_with("BEGIN TRANSACTION;"), "{ddl}");
+        assert!(ddl.trim_end().ends_with("COMMIT TRANSACTION;"), "{ddl}");
+        assert!(ddl.contains("DEFINE TABLE OVERWRITE _00_list_ref_user_one_tx_m3"));
+        assert!(ddl.contains("DEFINE FIELD OVERWRITE parent_rel ON TABLE _00_list_ref_user_one_tx_m3"));
     }
 }

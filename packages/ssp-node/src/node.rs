@@ -538,6 +538,7 @@ impl SspNode {
             return Ok(());
         }
         let started = web_time::Instant::now();
+        self.set_aside_quarantined_views().await;
         let (views, deltas): (usize, Vec<ViewDelta>) = {
             let circuit = self.processor.read().await;
             let ids = circuit.view_ids();
@@ -553,11 +554,31 @@ impl SspNode {
                 .map_err(|e| anyhow::anyhow!("view metadata repair failed: {e}"))?;
         }
         let delta_count = deltas.len();
-        let left = crate::edges::write_deltas_unlocked(
+        let (left, failures) = crate::edges::write_deltas_unlocked(
             self.platform.db.as_ref(), deltas, &self.processor, &self.publication_gate, self.ref_mode,
             self.platform.telemetry.as_ref(),
         ).await;
-        anyhow::ensure!(left.is_empty(), "restored view membership repair failed");
+        // A view whose membership the database refuses is quarantined instead
+        // of failing the boot: one such view (edges in a retired generation,
+        // whitepawn 2026-11-21) otherwise keeps the whole SSP out of service.
+        // Anything else left unwritten (a conflict, the database away) still
+        // fails it, to be retried.
+        let mut refused: Vec<(String, String)> = Vec::new();
+        for delta in &left {
+            let id = ssp::canonical_query_id(&delta.query_id);
+            match failures.get(&id) {
+                Some(f) if f.refused => {
+                    if !refused.iter().any(|(r, _)| *r == id) {
+                        refused.push((id, f.error.clone()));
+                    }
+                }
+                _ => anyhow::bail!("restored view membership repair failed"),
+            }
+        }
+        for (id, error) in &refused {
+            self.edge_update_tx.quarantine(id, error, self.platform.db.as_ref(), &self.processor,
+                self.platform.telemetry.as_ref()).await;
+        }
         info!(
             views,
             deltas = delta_count,
@@ -566,6 +587,41 @@ impl SspNode {
             "Republished restored views"
         );
         Ok(())
+    }
+
+    /// Views an earlier process quarantined (`_00_query.quarantinedAt`, see
+    /// [`crate::edges::EdgePublisher::quarantine`]): the publisher learns them,
+    /// so their registrations are refused, and they leave the circuit, which a
+    /// snapshot restore brings them back into. A cold boot never registered
+    /// them (`register_views_from_db` skips the flag). Views this process
+    /// quarantined leave it too, should their flag not have been written.
+    async fn set_aside_quarantined_views(&self) {
+        let rows = match self.platform.db.query(
+            "SELECT VALUE [<string>id, <string>(quarantineError ?? '')] FROM _00_query WHERE quarantinedAt != NONE",
+            &[],
+        ).await {
+            Ok(rows) => rows.into_iter().next().and_then(|v| v.as_array().cloned()).unwrap_or_default(),
+            Err(e) => {
+                warn!(target: "ssp::edges", error = %e, "Could not read quarantined views");
+                Vec::new()
+            }
+        };
+        for row in &rows {
+            let Some(id) = row.get(0).and_then(|v| v.as_str()) else { continue };
+            let error = row.get(1).and_then(|v| v.as_str()).unwrap_or_default();
+            self.edge_update_tx.mark_quarantined(id, error);
+            warn!(target: "ssp::edges", view_id = %id, error = %error, "View stays quarantined");
+        }
+        let quarantined = self.edge_update_tx.quarantined_ids();
+        if quarantined.is_empty() {
+            return;
+        }
+        let mut circuit = self.processor.write().await;
+        for id in quarantined {
+            if circuit.is_registered(&id) {
+                circuit.detach_subscriber(&id);
+            }
+        }
     }
 
     /// Take the node out of service for a warm re-bootstrap: no ingest, no
@@ -1202,6 +1258,12 @@ impl SspNode {
         // A standby follows the registration set (the scheduler forwards it a
         // shadow of every unregister) but the edges are its predecessor's.
         let permit = (!self.is_standby()).then(|| self.cleanup_admission());
+        // Its row is gone, so whatever kept a quarantined view's edges
+        // unwritable has been dealt with: a new registration of the id starts
+        // afresh. The row's delete took its edges, and the quarantine already
+        // released it from the circuit.
+        let quarantined = self.edge_update_tx.quarantined(&view_key).is_some();
+        self.edge_update_tx.release_quarantine(&view_key);
         // No publication gate and no database call here. The caller is the
         // `_00_query` row's delete event (TIMEOUT 10s): behind a slow
         // publication round it timed out, the delete failed, and the TTL sweep
@@ -1220,7 +1282,7 @@ impl SspNode {
             // was the last holder. With merging disabled there is never more
             // than one holder, so this is exactly `remove_query`.
             circuit.detach_subscriber(&view_key);
-            if let Some(permit) = permit {
+            if let Some(permit) = permit.filter(|_| !quarantined) {
                 let cleanup = crate::edges::PublicationCleanup::DropViewEdges {
                     table: crate::tables::list_ref_table(self.ref_mode, &auth_id),
                     view: crate::edges::format_incantation_id(&payload.id),
@@ -1229,7 +1291,9 @@ impl SspNode {
             }
         }
         self.view_metrics.write().await.remove(&view_key);
-        self.platform.telemetry.gauge_add("view_count", -1);
+        if !quarantined {
+            self.platform.telemetry.gauge_add("view_count", -1);
+        }
 
         Some(ok_json(Value::Null))
     }
@@ -1748,6 +1812,18 @@ impl SspNode {
         stages.parse_ms = data.parse_ms;
         data.plan.id = ssp::canonical_query_id(&data.plan.id);
 
+        // A view the publisher quarantined: its edges cannot be written, and
+        // admitting it again would only park the same work at the front of
+        // the queue. The client gets a definite answer for this one view.
+        if let Some(error) = self.edge_update_tx.quarantined(&data.plan.id) {
+            warn!(target: "ssp::edges", view_id = %data.plan.id, "Refusing a registration of a quarantined view");
+            return Some(err_json(
+                409,
+                "view_quarantined",
+                format!("This view's edges cannot be written ({error}). It stays out of sync until its _00_query row is repaired and deleted."),
+            ));
+        }
+
         // Query allowlist: refuse (or log) a shape the app does not ship.
         // Decided on the pre-injection shape, before any DB write, so a
         // refused registration leaves no `_00_query` row behind.
@@ -1793,10 +1869,14 @@ impl SspNode {
 
         // Lazy-define per-user tables (idempotent; no-op in Single mode).
         let tables_start = web_time::Instant::now();
+        // Under the publication gate when it issues DDL, so it never runs
+        // beside a round writing that table's edges.
         let tables = if standby {
             Ok(())
         } else {
-            crate::tables::ensure_user_tables(self.platform.db.as_ref(), self.ref_mode, &auth_id).await
+            crate::tables::ensure_user_tables_gated(
+                self.platform.db.as_ref(), self.ref_mode, &auth_id, &self.publication_gate,
+            ).await
         };
         stages.tables_ms = tables_start.elapsed().as_secs_f64() * 1000.0;
         if let Err(e) = tables {
@@ -2640,18 +2720,56 @@ pub async fn ttl_cleanup_sweep_gated(
         }
     }
 
+    // A per-user table is removed only under the publication gate, and only
+    // while this circuit holds no view of its user. A removal racing an edge
+    // write leaves rows SurrealDB can no longer read or delete once the table
+    // is defined again (a new generation ring; whitepawn 2026-11-21), and a
+    // registration that has already defined the table can be on its way to
+    // the circuit while its `_00_query` row does not exist yet. One that gets
+    // there after the removal has its initial publish define the table again,
+    // under the gate, before writing.
     for auth_id in &cleaned {
+        let _publication = match gate {
+            Some(g) => Some(g.lock().await),
+            None => None,
+        };
+        if circuit_serves_user(processor, auth_id).await {
+            continue;
+        }
         if let Err(e) = crate::tables::drop_user_table_if_unused(db, ref_mode, auth_id).await {
             warn!(auth_id = %auth_id, error = %e, "TTL cleanup: drop_user_table_if_unused failed");
         }
     }
-    if let Err(e) = crate::tables::drop_orphaned_user_tables(db, ref_mode).await {
-        warn!(error = %e, "TTL cleanup: drop_orphaned_user_tables failed");
+    match crate::tables::orphaned_user_tables(db, ref_mode).await {
+        Ok(uids) => {
+            for uid in uids {
+                let _publication = match gate {
+                    Some(g) => Some(g.lock().await),
+                    None => None,
+                };
+                if circuit_serves_user(processor, &uid).await {
+                    continue;
+                }
+                crate::tables::remove_user_table(db, &uid).await;
+            }
+        }
+        Err(e) => warn!(error = %e, "TTL cleanup: drop_orphaned_user_tables failed"),
     }
     if count > 0 {
         info!(count, "TTL cleanup sweep completed");
     }
     count
+}
+
+/// Whether the circuit holds a registration (view or merged subscriber) of the
+/// user behind `auth_id`, given as `user:<id>` or as the bare id a per-user
+/// table is named after (`ssp_protocol::sanitize_user_id` strips the same prefix).
+async fn circuit_serves_user(processor: &Arc<RwLock<Circuit>>, auth_id: &str) -> bool {
+    let uid = auth_id.strip_prefix("user:").unwrap_or(auth_id);
+    if uid.is_empty() {
+        return false;
+    }
+    processor.read().await.any_registration_of(|a| a.strip_prefix("user:").unwrap_or(a) == uid)
 }
 
 /// Edges one statement of the sweep removes. Deleting a `_00_query` row purges

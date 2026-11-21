@@ -2572,6 +2572,14 @@ impl Circuit {
         self.views.keys().cloned().collect()
     }
 
+    /// Whether any registration (a view, detached or not, or a merged
+    /// subscriber) belongs to an identity `owned_by` accepts. Allocation-free,
+    /// for a check made under the SSP's publication gate.
+    pub fn any_registration_of(&self, owned_by: impl Fn(&str) -> bool) -> bool {
+        self.views.values().any(|v| owned_by(&v.auth_id))
+            || self.subscribers.values().flatten().any(|s| owned_by(&s.auth_id))
+    }
+
     /// Every registration that receives publications, owners and merged
     /// subscribers alike, by canonical id (`<hash>`, the form `ViewDelta`
     /// carries). A detached owner is not listed: it publishes nothing.

@@ -102,6 +102,7 @@ body.landing-page { padding-top: 0; }
   .landing-intro-copy { gap: 24px; }
   .landing-intro .hero-headline { font-size: clamp(40px, 8.1vw, 60px); }
   .landing-intro .hero-btn { font-size: 13px; padding: 11px 20px; }
-  /* Too small to read whole: cover crops to the left part (sidebar + round trip). */
+  /* The phone cut of the console: full width, cropped at the bottom. */
   .hero-console { margin-top: 32px; }
+  .hero-console-img { object-position: center top; }
 }

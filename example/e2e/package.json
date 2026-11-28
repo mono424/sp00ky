@@ -1,6 +1,6 @@
 {
   "name": "@example/e2e",
-  "version": "1.0.0-beta.12",
+  "version": "1.0.0-beta.13",
   "private": true,
   "scripts": {
     "test": "playwright test",

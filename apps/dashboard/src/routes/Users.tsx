@@ -5,6 +5,8 @@ import { confirm, toast } from '../components/Actions';
 import { PageHead } from '../components/Chrome';
 import { CopyText, DataError, FieldInput, Pager, ValueCell, enc, useCanWrite } from '../components/DataParts';
 import { FxCell, Sheet, SheetSection, Sq } from '../components/Frame';
+import { Sk } from '../components/Skeleton';
+import { UsersSkeleton } from '../skeletons/Users';
 import { formatStamp, relativeStamp } from '../lib/format';
 import {
   draftOf,
@@ -144,6 +146,8 @@ export function Users() {
           </Show>
         }
       />
+      {/* Until the first page answers, the page's shape rather than an empty list. */}
+      <Show when={listResult.latest} fallback={<UsersSkeleton />}>
       <div class="fx-page">
         <Show when={listResult.latest && !listResult.latest.ok}>
           <section class="fx-row"><FxCell><DataError message={(listResult.latest as { ok: false; message: string }).message} /></FxCell></section>
@@ -161,15 +165,15 @@ export function Users() {
         >
           <section class="fx-row dx-stats">
             <FxCell label="Users">
-              <div class="fx-big">{stats()?.total?.toLocaleString() ?? '—'}</div>
+              <div class="fx-big"><Show when={statsResult.latest} fallback={<Sk w="1.2em" />}>{stats()?.total?.toLocaleString() ?? '—'}</Show></div>
               <div class="fx-sub cap"><span>{src() ? `in ${src()!.table}` : ''}</span></div>
             </FxCell>
             <FxCell label="Online now">
-              <div class="fx-big">{stats()?.online?.toLocaleString() ?? '—'}</div>
+              <div class="fx-big"><Show when={statsResult.latest} fallback={<Sk w="1.2em" />}>{stats()?.online?.toLocaleString() ?? '—'}</Show></div>
               <div class="fx-sub cap"><span>with a live view</span></div>
             </FxCell>
             <FxCell label="Admins">
-              <div class="fx-big">{stats()?.admins?.toLocaleString() ?? '—'}</div>
+              <div class="fx-big"><Show when={statsResult.latest} fallback={<Sk w="1.2em" />}>{stats()?.admins?.toLocaleString() ?? '—'}</Show></div>
               <div class="fx-sub cap"><span>on the roster</span></div>
             </FxCell>
             <FxCell label="Sign-in" meta={<Show when={(src()?.sources.length ?? 0) > 1}><span>{src()!.sources.length} methods</span></Show>}>
@@ -236,6 +240,7 @@ export function Users() {
           </section>
         </Show>
       </div>
+      </Show>
 
       {/* Keyed on the id: a refreshed list is a new source object, not a new user. */}
       <Show when={src() && query.id} keyed>

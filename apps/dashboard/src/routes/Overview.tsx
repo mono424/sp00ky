@@ -1,6 +1,7 @@
 import { For, Show, createMemo, createResource, onCleanup, type JSX } from 'solid-js';
 import { A } from '@solidjs/router';
 import { PageHead } from '../components/Chrome';
+import { OverviewSkeleton } from '../skeletons/Overview';
 import { SchedulerActions } from '../components/ClusterActions';
 import { ActivityStrip } from '../components/OpCard';
 import {
@@ -230,7 +231,7 @@ export function Overview(props: {
         </div>
       </Show>
 
-      <Show when={d()} fallback={<div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div>}>
+      <Show when={d()} fallback={<OverviewSkeleton />}>
         <div class="fx-page">
           <Show when={loose().length > 0}>
             <section class="fx-row">

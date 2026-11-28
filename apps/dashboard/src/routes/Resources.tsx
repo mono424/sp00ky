@@ -6,6 +6,7 @@ import { PageHead } from '../components/Chrome';
 import { FxCell, LineChart, Meter, Seg, Sq } from '../components/Frame';
 import { formatBytes, formatUptime, relativeStamp } from '../lib/format';
 import { containerTone } from '../lib/status';
+import { ResourcesSkeleton } from '../skeletons/Resources';
 
 /**
  * Resources: what the deployment runs on, as Sp00ky Cloud measures it.
@@ -177,7 +178,7 @@ export function Resources() {
         )}
       </Show>
 
-      <Show when={data()} fallback={<Show when={!error()}><div class="fx-empty cap" style={{ padding: '24px' }}>Loading…</div></Show>}>
+      <Show when={data()} fallback={<Show when={!error()}><ResourcesSkeleton /></Show>}>
         {(d) => (
           <div class="fx-page">
             <Show when={!d().metrics_available}>

@@ -115,9 +115,17 @@ const mobileHeroSources = await Promise.all(
                 poster={`${basePath}/hero/console-poster.webp`}
                 aria-label="The sp00ky Cloud console overview, live: sync round trip, live users, SurrealDB and scheduler health, and every running service."
               >
+                <!-- Phones get the console's own phone layout, filmed at 390 x 844. -->
+                <source media="(max-width: 760px)" src={`${basePath}/hero/console-mobile.webm`} type="video/webm" />
+                <source media="(max-width: 760px)" src={`${basePath}/hero/console-mobile.mp4`} type="video/mp4" />
                 <source src={`${basePath}/hero/console.webm`} type="video/webm" />
                 <source src={`${basePath}/hero/console.mp4`} type="video/mp4" />
               </video>
+              <script is:inline define:vars={{ mobilePoster: `${basePath}/hero/console-mobile-poster.webp` }}>
+                if (window.matchMedia('(max-width: 760px)').matches) {
+                  document.currentScript.previousElementSibling.poster = mobilePoster;
+                }
+              </script>
             </div>
           </div>
         </div>

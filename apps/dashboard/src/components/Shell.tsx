@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js';
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js';
 import { A, useLocation, useNavigate, useResolvedPath } from '@solidjs/router';
 import { currentMode, servedByNode } from '../api/client';
 import { formatCount } from '../lib/format';
@@ -262,9 +262,24 @@ function sectionsOf(links: NavLink[]): { group?: string; links: NavLink[] }[] {
   return out;
 }
 
-/** One rail link, with its count. */
+/**
+ * One rail link, with its count.
+ *
+ * The rail's lists are `<Index>`, not `<For>`: the overview ticks every second
+ * or so and every tick is new link objects, so a keyed list threw the nodes
+ * away and built new ones. The link under the pointer lost its hover each time
+ * (a flicker) and a click could land on a node that was gone. With `<Index>`
+ * the nodes stay and only what changed (a count) is written, which is why
+ * `link` is read through `props` here and never copied out.
+ */
 function NavItem(props: { link: NavLink; atRoot: () => boolean; rail?: boolean }) {
-  const link = props.link;
+  const link = {
+    get href() { return props.link.href; },
+    get label() { return props.link.label; },
+    get icon() { return props.link.icon; },
+    get count() { return props.link.count; },
+    get warn() { return props.link.warn; },
+  };
   return (
     // `activeClass` + `end` rather than comparing pathnames by hand: the
     // router applies the base ("/admin") to every href, so a hand-rolled
@@ -347,46 +362,61 @@ function ConsoleRail(props: { links: NavLink[]; workspaceLayer: boolean; atRoot:
       <div
         class={`nav cx-layer ${dir}`}
         ref={(el) => {
-          // Keep the page you are on in view when the rail is taller than the screen.
+          // Keep the page you are on in view when the rail is taller than the
+          // screen: only the rail moves, and only when the link is out of its
+          // view. `scrollIntoView` also scrolled every scrolling ancestor and
+          // counted a link half under the rail's edge as out of view, so
+          // picking an item near the edge could shift the list under the pointer.
+          let timer: ReturnType<typeof setTimeout> | undefined;
           createEffect(() => {
             location.pathname;
-            setTimeout(() => el.querySelector('.nav-link.active')?.scrollIntoView({ block: 'nearest' }), 60);
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+              const a = el.querySelector<HTMLElement>('.nav-link.active');
+              if (!a) return;
+              const box = el.getBoundingClientRect();
+              const r = a.getBoundingClientRect();
+              // Any part showing counts: the operator can see where they are.
+              if (r.bottom > box.top && r.top < box.bottom) return;
+              el.scrollTop += r.top < box.top ? r.top - box.top - 8 : r.bottom - box.bottom + 8;
+            }, 60);
           });
+          onCleanup(() => clearTimeout(timer));
         }}
       >
-        <For each={quick()}>
+        <Index each={quick()}>
           {(section) => (
             <div class="nav-section cx-quick">
-              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} rail />}</For>
+              <Index each={section().links}>{(link) => <NavItem link={link()} atRoot={props.atRoot} rail />}</Index>
             </div>
           )}
-        </For>
+        </Index>
         <Show when={props.workspaceLayer && ws()}>
           {(w) => (
             <Section group="Projects" count={w().projects.length}>
-              <For each={w().projects}>
+              <Index each={w().projects}>
                 {(p) => (
-                  <button class="nav-link cx-pl" title={`${p.slug} · ${projectLine(p)}`} onClick={() => cx.go(`/${w().slug}/${p.slug}`)}>
+                  <button class="nav-link cx-pl" title={`${p().slug} · ${projectLine(p())}`} onClick={() => cx.go(`/${w().slug}/${p().slug}`)}>
                     <span class="row" style={{ gap: '10px', 'min-width': '0' }}>
-                      <span class="rail-sq"><span class={`fx-sq ${projectTone(p)}`} /></span>
-                      <span class="cx-pl-name nav-label">{p.slug}</span>
+                      <span class="rail-sq"><span class={`fx-sq ${projectTone(p())}`} /></span>
+                      <span class="cx-pl-name nav-label">{p().slug}</span>
                     </span>
                     <span class="cx-pl-r">
-                      <Show when={p.platform === 'cloudflare'}><span class="cx-tag cf">CF</span></Show>
+                      <Show when={p().platform === 'cloudflare'}><span class="cx-tag cf">CF</span></Show>
                     </span>
                   </button>
                 )}
-              </For>
+              </Index>
             </Section>
           )}
         </Show>
-        <For each={grouped()}>
+        <Index each={grouped()}>
           {(section) => (
-            <Section group={section.group!}>
-              <For each={section.links}>{(link) => <NavItem link={link} atRoot={props.atRoot} rail />}</For>
+            <Section group={section().group!}>
+              <Index each={section().links}>{(link) => <NavItem link={link()} atRoot={props.atRoot} rail />}</Index>
             </Section>
           )}
-        </For>
+        </Index>
       </div>
       <div class="sb-foot cx-foot">
         <WorkspaceMenu />
@@ -611,16 +641,16 @@ export function Shell(props: {
         </button>
 
         <div class="nav">
-          <For each={sections()}>
+          <Index each={sections()}>
             {(section) => (
               <div class="nav-section">
-                <Show when={section.group}>
-                  <div class="nav-heading">{section.group}</div>
+                <Show when={section().group}>
+                  <div class="nav-heading">{section().group}</div>
                 </Show>
-                <For each={section.links}>{(link) => <NavItem link={link} atRoot={atRoot} />}</For>
+                <Index each={section().links}>{(link) => <NavItem link={link()} atRoot={atRoot} />}</Index>
               </div>
             )}
-          </For>
+          </Index>
         </div>
 
         {/* The foot of the rail: the version, pinned to the bottom. */}

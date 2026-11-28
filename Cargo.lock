@@ -4368,6 +4368,7 @@ dependencies = [
  "serde_json",
  "ssp-protocol",
  "surrealdb",
+ "surrealdb-rpc",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.28.0",

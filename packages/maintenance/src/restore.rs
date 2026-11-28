@@ -507,8 +507,7 @@ async fn execute_restore(
         .await
         .context("Failed to connect to main SurrealDB after the replay")?;
     let export = tempfile::NamedTempFile::new().context("Failed to create tempfile for export")?;
-    remote
-        .export(export.path())
+    crate::export::export_database(&remote, export.path())
         .await
         .context("Failed to export main SurrealDB after the replay")?;
     drop(remote);

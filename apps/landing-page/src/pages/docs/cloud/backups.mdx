@@ -131,6 +131,10 @@ Every restore, on VMs and on pay as you go, gives each record `DEFINE ACCESS` a 
 
 Two kinds of access cannot get their key back. Admin impersonation (`_00_impersonate`) works again after your next `spky deploy`, which sets its key. An access that verifies tokens of an outside issuer with a shared key is removed by the restore: run its `DEFINE ACCESS` statement again afterwards (the restore's metadata names it).
 
+### Edge tables SurrealDB will not export
+
+SurrealDB 4.0.1 can leave rows in a table that it still reads but refuses to export, and its export then stops partway. When that happens to one of sp00ky's own edge tables (`_00_list_ref*`), the backup keeps the table's definition and leaves its rows out, and the scheduler log names the table. Nothing is lost: the SSP writes those rows again from the registered views when it registers after a restore. A table of your own that SurrealDB refuses to export still fails the backup.
+
 <Note>
 If the main database gets wiped but the snapshot replica fails to import, the scheduler stays in the `restoring` state on purpose. That blocks reads until someone re-runs the restore. Serving traffic from a half-restored cluster would give back wrong data.
 </Note>

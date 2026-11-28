@@ -9,7 +9,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::{connect_http, DbConfig};
 use crate::host::MaintenanceHost;
@@ -260,10 +260,16 @@ async fn execute_backup(
     let remote = connect_http(db_config)
         .await
         .context("Failed to connect to main SurrealDB for backup export")?;
-    remote
-        .export(export.path())
+    let rows_left_out = crate::export::export_database(&remote, export.path())
         .await
         .context("Failed to export main SurrealDB")?;
+    if !rows_left_out.is_empty() {
+        warn!(
+            backup_id = %job.backup_id,
+            tables = ?rows_left_out,
+            "Backup holds these edge tables without their rows: SurrealDB refuses to export them"
+        );
+    }
 
     // 3. Gzip file to file. A large project's export is several GB, more than
     //    the host's memory limit, so it must never be read into RAM whole.

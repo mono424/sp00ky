@@ -12,6 +12,7 @@ pub mod backup;
 pub mod changefeed;
 pub mod db;
 pub mod doorbell;
+pub mod export;
 pub mod host;
 pub mod log_ring;
 pub mod restore;
